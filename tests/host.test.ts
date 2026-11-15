@@ -111,6 +111,7 @@ function reviewOptions(overrides: Partial<TestGenerateOptions> = {}): TestGenera
     system: REVIEW_SYSTEM,
     messages: [{ role: 'user', content: [{ type: 'text', text: 'PENDING_ACTION' }] }],
     temperature: 0,
+    purpose: 'auto-review',
     ...overrides,
   };
 }
@@ -187,6 +188,13 @@ function createHarness({ config = {}, modelInfo = () => ({}) }: HarnessOptions =
       registrations.push({ event, listener, options });
       return () => {};
     },
+    inject(_services, callback) {
+      callback({
+        sessionLogDeepSeek: {
+          registerExclusion: () => () => {},
+        },
+      });
+    },
     llm: {
       stream(options: TestGenerateOptions): AsyncIterable<unknown> {
         streamCalls.push(options);
@@ -250,7 +258,7 @@ function fireAdaptersUpdate(harness: Harness): void {
 
 test('plugin metadata follows the shared loader contract', () => {
   assert.equal(name, 'auto-review-model');
-  assert.deepEqual(inject, ['llm']);
+  assert.deepEqual(inject, ['llm', 'sessionLogDeepSeek']);
   assert.equal(typeof apply, 'function');
 });
 
@@ -272,13 +280,15 @@ test('marker recognition accepts only the fixed auto-review prompt', () => {
     'You are the final authorization reviewer for exactly one pending tool call.',
   );
   assert.equal(isAutoReviewRequest(reviewOptions()), true);
+  assert.equal(isAutoReviewRequest(reviewOptions({ purpose: undefined })), false, 'prompt-only decoys must not be rerouted');
+  assert.equal(isAutoReviewRequest(reviewOptions({ purpose: 'session-title' })), false, 'other purposes must not be rerouted');
   assert.equal(__testing.isAutoReviewRequest, isAutoReviewRequest);
   assert.equal(
-    isAutoReviewRequest({ system: `${REVIEW_POLICY_PREFIX}header\n${REVIEW_POLICY_MARKER}` }),
+    isAutoReviewRequest({ purpose: 'auto-review', system: `${REVIEW_POLICY_PREFIX}header\n${REVIEW_POLICY_MARKER}` }),
     true,
     'the marker only has to appear after the fixed prefix',
   );
-  assert.equal(isAutoReviewRequest({ system: `${REVIEW_POLICY_PREFIX}${REVIEW_POLICY_MARKER}` }), true);
+  assert.equal(isAutoReviewRequest({ purpose: 'auto-review', system: `${REVIEW_POLICY_PREFIX}${REVIEW_POLICY_MARKER}` }), true);
   assert.equal(
     isAutoReviewRequest({ system: `${REVIEW_POLICY_PREFIX}${REVIEW_POLICY_MARKER.slice(0, -1)}` }),
     false,

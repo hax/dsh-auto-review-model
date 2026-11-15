@@ -64,6 +64,11 @@ interface ListenerOptions {
   prepend?: boolean;
 }
 
+/** Session-log exclusion service required to keep rerouted reviews free of conversation-log uploads. */
+interface SessionLogDeepSeek {
+  registerExclusion(exclude: (request: { purpose?: string }) => boolean): unknown;
+}
+
 /** The subset of the host context used by this plugin. */
 interface HostContext {
   llm: LlmService;
@@ -72,13 +77,17 @@ interface HostContext {
     listener: (...args: any[]) => any,
     options?: ListenerOptions,
   ): unknown;
+  inject(
+    services: readonly string[],
+    callback: (child: { sessionLogDeepSeek: SessionLogDeepSeek }) => void,
+  ): unknown;
 }
 
 /** Loader line id used by the host entry. */
 export const name = 'auto-review-model';
 
 /** Host services required before the listener may be installed. */
-export const inject = ['llm'];
+export const inject = ['llm', 'sessionLogDeepSeek'];
 
 /**
  * Review-model settings. All fields are volatile so the settings UI can update
@@ -230,6 +239,12 @@ async function* rewriteAutoReviewStream(
  * @param {ReviewerConfig} config - injected volatile settings.
  */
 export function apply(ctx: HostContext, config: ReviewerConfig): void {
+  // A rerouted review carries the original Session id. Exclude it explicitly so
+  // the DeepSeek request cannot upload the conversation's canonical Session log.
+  ctx.inject(['sessionLogDeepSeek'], (child) => {
+    child.sessionLogDeepSeek.registerExclusion(request => request.purpose === 'auto-review');
+  });
+
   /** Requests already rewritten by this listener, so re-entry is a no-op. */
   const patchedRequests = new WeakSet<object>();
 

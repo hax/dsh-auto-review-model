@@ -48,10 +48,19 @@ interface ListenerOptions {
     global?: boolean;
     prepend?: boolean;
 }
+/** Session-log exclusion service required to keep rerouted reviews free of conversation-log uploads. */
+interface SessionLogDeepSeek {
+    registerExclusion(exclude: (request: {
+        purpose?: string;
+    }) => boolean): unknown;
+}
 /** The subset of the host context used by this plugin. */
 interface HostContext {
     llm: LlmService;
     on(event: string, listener: (...args: any[]) => any, options?: ListenerOptions): unknown;
+    inject(services: readonly string[], callback: (child: {
+        sessionLogDeepSeek: SessionLogDeepSeek;
+    }) => void): unknown;
 }
 /** Loader line id used by the host entry. */
 export declare const name = "auto-review-model";

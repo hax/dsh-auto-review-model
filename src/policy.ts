@@ -58,6 +58,7 @@ export function isAutoReviewRequest(options: unknown): boolean {
   if (options === null || typeof options !== 'object') return false;
   const system = (options as { system?: unknown }).system;
   return (
+    (options as { purpose?: unknown }).purpose === 'auto-review' &&
     typeof system === 'string' &&
     system.startsWith(REVIEW_POLICY_PREFIX) &&
     system.includes(REVIEW_POLICY_MARKER)
