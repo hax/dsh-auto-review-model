@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { Config, ReviewerCapabilityError, __testing, apply, inject, name } from '@aghost-prj/dsh-auto-review-model';
+import { TYPERT } from '@aghost-prj/dsh-auto-review-model/typert';
 import {
   REVIEW_POLICY_MARKER,
   REVIEW_POLICY_PREFIX,
@@ -83,10 +84,19 @@ interface StreamChunk {
   [key: string]: unknown;
 }
 
+/** Mocked provider-directory entry used by the saved-route probe. */
+interface TestProviderInfo {
+  provider: string;
+  displayName?: string;
+  settingsNs?: string;
+  nativeAuth?: { env?: readonly string[]; oauth?: boolean };
+}
+
 /** Options for harness creation. */
 interface HarnessOptions {
   config?: Partial<HarnessState>;
   modelInfo?: ModelInfoFn;
+  providers?: TestProviderInfo[];
 }
 
 /** Fake host environment returned by createHarness. */
@@ -100,6 +110,9 @@ interface Harness {
   resolveCalls: ResolveCall[];
   warnings: unknown[][];
   baseChunks: StreamChunk[];
+  provided: Map<string, unknown>;
+  serviceDisposers: Map<string, () => void>;
+  disposedServices: string[];
   emitWithFilter: (event: string, filter: (target: unknown) => boolean, ...args: unknown[]) => void;
 }
 
@@ -153,7 +166,7 @@ async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
  * Fake host: config refs, listener registration, and a minimal `llm` service.
  * `state` is mutated by tests to simulate a live settings ref change.
  */
-function createHarness({ config = {}, modelInfo = () => ({}) }: HarnessOptions = {}): Harness {
+function createHarness({ config = {}, modelInfo = () => ({}), providers = [] }: HarnessOptions = {}): Harness {
   const state: HarnessState = {
     enabled: true,
     provider: 'review-provider',
@@ -173,6 +186,9 @@ function createHarness({ config = {}, modelInfo = () => ({}) }: HarnessOptions =
   const baseCalls: TestGenerateOptions[] = [];
   const resolveCalls: ResolveCall[] = [];
   const warnings: unknown[][] = [];
+  const provided = new Map<string, unknown>();
+  const serviceDisposers = new Map<string, () => void>();
+  const disposedServices: string[] = [];
   const baseChunks: StreamChunk[] = [
     { type: 'text-delta', text: '{"risk":"low","decision":"allow"}' },
     { type: 'finish', reason: { kind: 'stop' } },
@@ -195,6 +211,18 @@ function createHarness({ config = {}, modelInfo = () => ({}) }: HarnessOptions =
         },
       });
     },
+    provide(name: string, value: unknown) {
+      provided.set(name, value);
+      const dispose = () => {
+        if (provided.get(name) === value) {
+          provided.delete(name);
+          serviceDisposers.delete(name);
+          disposedServices.push(name);
+        }
+      };
+      serviceDisposers.set(name, dispose);
+      return dispose;
+    },
     llm: {
       stream(options: TestGenerateOptions): AsyncIterable<unknown> {
         streamCalls.push(options);
@@ -213,6 +241,9 @@ function createHarness({ config = {}, modelInfo = () => ({}) }: HarnessOptions =
         resolveCalls.push({ provider, model, signal });
         return modelInfo(provider, model, signal);
       },
+      listConfigurableProviders() {
+        return providers;
+      },
     },
   };
 
@@ -227,6 +258,9 @@ function createHarness({ config = {}, modelInfo = () => ({}) }: HarnessOptions =
     resolveCalls,
     warnings,
     baseChunks,
+    provided,
+    serviceDisposers,
+    disposedServices,
     emitWithFilter(event: string, filter: (target: unknown) => boolean, ...args: unknown[]) {
       const listeners = registrations
         .filter((r) => r.event === event && (r.options?.global || filter(ctx)))
@@ -1034,4 +1068,105 @@ test('pre-aborted request rejects without querying and without caching a failure
   await collect(harness.ctx.llm.stream(reviewOptions()));
   assert.equal(calls, 1);
   assert.equal(harness.baseCalls[0].reasoningEffort, 'high');
+});
+
+/* ============================================================
+ * Saved review-route test endpoint: Host integration with the
+ * hand-written Typert manifest.
+ *
+ * The endpoint's exhaustive behavior suite lives in route-test.test.ts; these
+ * checks cover the seam this entry owns: the published service, its Gateway
+ * binding, and the strict wire contract the manifest declares.
+ * ============================================================ */
+
+/** Provider directory entry describing a DeepSeek-Account-style OAuth route. */
+const ACCOUNT_PROVIDER = {
+  provider: 'review-provider',
+  displayName: 'Review Provider',
+  settingsNs: 'review-provider',
+  nativeAuth: { env: [], oauth: true },
+};
+
+test('apply publishes the autoReviewModel service the Typert manifest declares', () => {
+  const harness = createHarness({ providers: [ACCOUNT_PROVIDER] });
+  const endpoint = harness.provided.get('autoReviewModel') as
+    | { testReviewRoute: (...args: unknown[]) => Promise<unknown>; typertRemote?: Record<string, unknown> }
+    | undefined;
+  assert.ok(endpoint, 'apply must publish the autoReviewModel endpoint with ctx.provide');
+  assert.equal(typeof endpoint.testReviewRoute, 'function');
+  // The single declared parameter is the transport cancellation signal the
+  // Gateway appends; the wire carries no business arguments.
+  assert.equal(endpoint.testReviewRoute.length, 1);
+
+  const invocation = TYPERT.invocations[0];
+  assert.deepEqual(invocation.parameters, [], 'the manifest must declare no wire parameters');
+  assert.equal(invocation.service, 'autoReviewModel');
+  assert.equal(invocation.namespace, 'autoReviewModel');
+  assert.equal(invocation.method, 'testReviewRoute');
+
+  // The Gateway's validateBinding requires exactly this visible binding shape.
+  assert.ok(endpoint.typertRemote, 'the endpoint must expose a typertRemote binding');
+  assert.equal(endpoint.typertRemote.service, endpoint);
+  assert.equal(endpoint.typertRemote.serviceKey, invocation.service);
+  assert.equal(endpoint.typertRemote.namespace, invocation.namespace);
+  assert.ok(Object.isFrozen(endpoint.typertRemote), 'the binding must be frozen');
+});
+
+test('unloading the plugin withdraws the published endpoint service', () => {
+  const harness = createHarness();
+  assert.ok(harness.provided.has('autoReviewModel'));
+  const dispose = harness.serviceDisposers.get('autoReviewModel');
+  assert.equal(typeof dispose, 'function');
+  dispose?.();
+  assert.equal(harness.provided.has('autoReviewModel'), false, 'the endpoint service must be withdrawn');
+  assert.deepEqual(harness.disposedServices, ['autoReviewModel']);
+});
+
+test('the published endpoint probes the saved route with a strict prose-free contract', async () => {
+  const harness = createHarness({ providers: [ACCOUNT_PROVIDER] });
+  const endpoint = harness.provided.get('autoReviewModel') as {
+    testReviewRoute: (signal?: AbortSignal) => Promise<Record<string, unknown>>;
+  };
+
+  const result = await endpoint.testReviewRoute();
+
+  // The strict codec the Client mounts accepts the Host result unchanged.
+  const invocation = TYPERT.invocations[0] as {
+    result: { create: () => { parse(value: unknown): Record<string, unknown> } };
+  };
+  const parsed = invocation.result.create().parse(result);
+  assert.equal(parsed.code, 'OK');
+  assert.equal(parsed.status, 'ok');
+  assert.deepEqual(parsed.route, {
+    provider: 'review-provider',
+    model: 'review-model',
+    reasoningEffort: '',
+  });
+  assert.equal(parsed.authKind, 'account', 'the OAuth provider directory entry must classify as an account route');
+  assert.equal(parsed.detail, '');
+  assert.ok(!('prose' in parsed), 'the result declares no prose field');
+
+  // The probe is one hand-built request: fixed prompt, bounded output, no
+  // session id, no purpose, no tools and no conversation history.
+  assert.equal(harness.streamCalls.length, 1, 'the probe must issue exactly one model request');
+  const probe = harness.streamCalls[0];
+  assert.deepEqual(Object.keys(probe).sort(), [
+    'maxTokens',
+    'messages',
+    'model',
+    'provider',
+    'signal',
+    'system',
+    'temperature',
+  ], 'the probe request must carry only the fixed harmless fields');
+  assert.equal(probe.provider, 'review-provider');
+  assert.equal(probe.model, 'review-model');
+  assert.ok(typeof probe.maxTokens === 'number' && probe.maxTokens > 0 && probe.maxTokens <= 16);
+  assert.deepEqual(probe.messages, [{ role: 'user', content: [{ type: 'text', text: 'Reply with OK' }] }]);
+  assert.ok(typeof probe.system === 'string' && probe.system.length > 0);
+  for (const forbidden of ['sessionId', 'purpose', 'tools', 'toolHistory']) {
+    assert.ok(!(forbidden in probe), `the probe must not send ${forbidden}`);
+  }
+  assert.equal(harness.baseCalls.length, 1, 'the fixed non-reviewer request must reach the base stream unmodified');
+  assert.equal(harness.baseCalls[0].purpose, undefined, 'the probe must not masquerade as an auto-review request');
 });

@@ -23,6 +23,7 @@ DSH 的 Auto review 在每次受支持的工具调用执行前，用当前会话
 - **思考等级能力查询**：在传递配置的 `reasoningEffort` 前，插件通过 `resolveModelInfo` 查询该路由的能力，并将审查请求的 `AbortSignal` 与 300000ms（5 分钟）超时组合后传入。只有当目标模型声明支持该等级时才传递；若查询成功但未声明该等级，则不显式传递并回退到 provider 默认值。若查询失败或超时，审查会以包含实际 route、超时时间和修复建议的可操作错误直接失败（fail-closed），不会把失败当成“不支持”，也不会静默降级。
 - **缓存失效**：仅缓存成功的能力查询结果，按路由进行内存缓存，并采用 generation / epoch 计数机制，防止在缓存失效前在途的查询结果以过时数据错误写回。失败或超时的查询不会被缓存，下一次审查会重新查询。宿主侧监听 `loader/volatile-update` 时使用 `global: true`，以确保能够可靠接收到 provider 的局部配置变更通知；当收到 `llm/adapters-updated` 或 `loader/volatile-update` 事件时，缓存会及时失效。
 - **Fail-closed 安全机制**：若配置的模型不存在、网络不可达或审查执行失败，工具调用按审查失败处理，不会执行（fail-closed）。
+- **已保存路由测试端点**：同一宿主插件还提供一个小的 Typert Remote 方法 `autoReviewModel/testReviewRoute`，由手写的 generated-style `./typert` manifest 声明，浏览器侧从本包 `./remote` contribution 挂载。设置页提供「测试审查路由」操作，用固定无害 prompt 探测已保存的 provider/model/推理等级。宿主自己读取已保存设置，因此页面不传 route、不传凭证、不传 session id、不传 purpose、不传 tools、不传对话历史。探测有界（16 输出 token、20 秒总超时、每分钟 5 次、同一时刻 1 次），不写设置、不改主模型、不执行工具、不返回模型输出。
 
 ## 安装
 
@@ -37,6 +38,8 @@ dsh plugin --profile web add /home/aghost/workspace/dsh-auto-approval-model-fix
 该命令把包作为依赖与 bundle 层加入 `web` profile。DSH loader 通过包内的 `dsh.bundle.patch` 读取 `cordis.patch.yml`，把插件插入为 `auto-review-model` 层。
 
 安装插件或重新构建客户端后，需要按 DSH 常规方式重新加载 Web profile 并刷新页面，配置页才会出现。保存设置本身对下一次审查生效，不需要重启会话。
+
+宿主侧接口由 Typert Loader 从包的 `./typert` export 自动发现；因此请在启动 DSH 前完成安装或升级，或在包文件变化后重启 DSH，以便注册新的 export。设置页加载时浏览器侧会自动挂载 `./remote` contribution。
 
 ## 配置
 
@@ -60,6 +63,14 @@ dsh plugin --profile web add /home/aghost/workspace/dsh-auto-approval-model-fix
 - 在配置界面中，若既有配置包含未知或当前模型未声明的 `reasoningEffort`，客户端会如实保留并明确显示，不伪装成默认值，并允许用户显式清除。
 - **生效时机：保存设置后立即对下一次审查生效。** 已经在进行中的审查不会被改写；不需要重启会话或重新加载 profile。
 
+### 测试已保存的审查路由
+
+配置面板提供「测试审查路由」（Test saved route）。它始终测试当前**已保存**的路由——提示文本会写明该路由——因此表单里未保存的修改不会被测试，有 dirty 草稿时也不会被误认为探测所用的路由。探测有独立的进行中/结果状态，不复用「保存中」的 busy 状态。
+
+探测固定发送一次无害请求（一条固定 user 消息、固定单词级 system 指令、`temperature: 0`、`maxTokens: 16`），总超时 20 秒，并在宿主侧限流（同一时刻最多 1 次、每 60 秒最多 5 次、最小间隔 3 秒）。请求不携带 `sessionId`、不携带 `purpose`（尤其不是 `auto-review`）、不携带 tools、不携带对话历史；不读取浏览器凭证、不保存设置、不修改主模型、不执行工具、不上传 Session log。
+
+结果会被分类，并渲染为本地化消息与可操作修复建议。DeepSeek Account 的登录 / 授权 / 连接问题与 API-key 的 `MISSING_CREDENTIAL`、`INVALID_CREDENTIAL`、`AUTH` 分开；`NO_ADAPTER`、超时、provider 速率限制、配额、路由不完整/已关闭、并发探测、空补全与未知失败各有独立结果。界面只展示分类元数据与一段简短脱敏诊断，模型的回答文本不会返回浏览器。
+
 ### 示例
 
 假设你的 DSH 环境（如 `cordis.patch.yml`）中配置了以下 provider，可以直接在配置下拉框中选择：
@@ -82,15 +93,16 @@ dsh plugin --profile web add /home/aghost/workspace/dsh-auto-approval-model-fix
 
 ## 验证状态
 
-截至 2026-10-25，最终全量自动化集成回归验证已执行完毕并通过：
-- **自动化命令**：四条 npm 脚本串行执行且退出码均为 0：`npm run typecheck`、`npm test`、`npm run check` 与 `npm run verify`。
-- **测试与静态检查计数**：56 项测试全部通过（0 失败；涵盖 host 25 项、client helper 17 项、client-component 10 项、packaging 4 项）；静态校验 15 项全部通过（15/15）。
-- **产物一致性**：交付分发产物（`lib/index.js`、`lib/policy.js`、`lib/index.d.ts`、`lib/policy.d.ts`、`client/client.js`）与独立 TypeScript 重新编译输出 5/5 逐字节一致。
-- **Runtime 场景**：在真实本机 Cordis 与 LlmRuntime 场景脚本中（针对 provider 局部失效、延迟写入防污染等），场景全部通过。
+截至 2026-11-16，已保存路由测试功能通过以下自动化证据验证：
+- **自动化命令**：`npm run typecheck`、`npm test`、`npm run check` 与 `npm run verify` 退出码均为 0。
+- **测试**：127 项单元测试全部通过（0 失败）：host 33、route-test 34、client 25、client-component 19、Typert contract/产物 9、packaging 7。
+- **静态校验**：`npm run verify` 25/25 项通过，覆盖 exports、Loader 可接受的 `./typert` manifest、Host/Client descriptor 一致性、`./remote` 内嵌与 `$mount` 接线、手写 Typert 产物零运行时依赖，以及所有入口的语法。Desktop 环境下，已安装 experimental-auto-review 策略检查通过 `DSH_NODE_EXECUTABLE` 读取运行中的 `app.asar`；若存在 `DSH_INSTALL_DIR` 但无法读取官方源码，检查会失败而不是静默跳过。只有没有已安装 DSH 包树的源码检出环境才允许报告 SKIP。
+- **已断言的安全不变量**：探测请求只包含 provider/model/[reasoningEffort]/固定 prompt/maxTokens/temperature/signal（绝不含 `sessionId`、`purpose`、`tools`、`toolHistory` 或对话历史）；不写设置；不返回模型输出、凭证材料或任意传输错误文本；Account 与 API-key 故障分类可区分；限流、single-flight、有界超时、有界输出，以及已保存路由变化后的过期结果失效均有覆盖。
 
 **验证边界与未验证事项**：
-- **未调用真实模型**：所有自动化测试与 Cordis runtime 场景均采用内存 fake adapter，未调用任何真实 LLM API 或进行外部网络请求。
-- **未在 Web GUI 中实际安装并在真实浏览器中打开配置页进行端到端验证。** 详情页描述与组件之间的渲染位置、界面表单交互提交以及审查请求链路拦截，尚未在真实运行的 Web GUI 界面中实测，因此本文档不声称 GUI 端到端已通过验证。
+- **未调用真实模型**：自动化测试均采用内存 fake adapter，未调用真实 LLM API 或网络，也未对真实已保存路由（例如 `deepseek-account/deepseek-flash`）发起探测。
+- **未做浏览器视觉验证**：本环境没有浏览器控制能力，因此按钮的实际渲染位置、可发现性、明暗主题外观与实时结果渲染尚未经过视觉验证。已执行一次只读 UI/UX 源码审查；其中证据充分的问题（过期结果失效、仅数据诊断、live region 范围、限流文案）已修复并复测，但浏览器验证仍然不可用。
+- **真实 Gateway 分发未验证**：单元测试只在本地验证已发布端点，未覆盖「已安装 Typert Loader + Gateway RPC」链路；该端到端链路需要在运行中的 DSH 会话里完成安装验证（task-4）。
 
 ## 开发
 
@@ -117,7 +129,7 @@ npm install
 ### 常用命令
 
 ```sh
-npm run build        # 构建宿主 (src/ -> lib/) 与客户端 (src/client/ -> client/client.js)
+npm run build        # 构建宿主 (src/ -> lib/)、客户端 (src/client/ -> client/)，并把共享 Typert contract 内嵌进 client/client.js (scripts/build-client.cjs)
 npm run build:tests  # 编译测试与脚本 (tests/*.test.ts, scripts/verify.ts -> .build/)
 npm run typecheck    # 对源码、客户端及测试执行全量 TypeScript 类型检查
 npm run check        # 对构建出的 JS 产物执行 node --check 语法校验
@@ -127,8 +139,12 @@ npm run verify       # 编译并运行静态校验脚本 (node .build/scripts/ve
 
 ### 目录结构
 
-- `src/policy.ts`、`src/index.ts`：服务端插件与配置 schema 源码；
-- `src/client/client.ts`：Web 配置面板客户端源码；
+- `src/index.ts`、`src/policy.ts`：宿主插件、配置 schema 与审查请求拦截；
+- `src/route-test.ts`：宿主「已保存路由测试」端点（限流、错误分类、结果构造）；
+- `src/typert.contract.ts`：两个 generated-style 面共享的零依赖 Typert 契约；
+- `src/typert.host.ts`、`src/typert.remote-client.ts`：`./typert` 与 `./remote` 产物入口；
+- `scripts/build-client.cjs`：把契约内嵌进浏览器 bundle 并注册 `./remote` chunk；
+- `src/client/client.ts`：Web 配置面板客户端源码，含已保存路由测试操作；
 - `tests/*.test.ts`：单元测试源码；
 - `scripts/verify.ts`：静态与冒烟校验脚本源码；
 - `lib/`、`client/client.js`：编译分发产物（请勿手改）；

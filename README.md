@@ -23,6 +23,7 @@ Regular chat, subagents, title generation, compaction, and other LLM requests ar
 - **Reasoning capability lookup**: Before forwarding a configured reasoning effort, the plugin queries the route's capabilities via `resolveModelInfo`, combining the review request's `AbortSignal` with a 300000 ms (5 min) timeout. If the target model advertises support for that effort tier, it is applied; if the successful lookup advertises other or no efforts, the effort is omitted so the provider default applies. A failed or timed-out lookup fails the review closed with an actionable error that names the exact route, the 300000 ms (5 min) timeout, and repair steps; a lookup failure is never treated as "unsupported" and never silently degrades to the default effort.
 - **Cache invalidation**: Only successful capability lookups are cached per route, using a generation/epoch counter to prevent in-flight lookup completions from writing back stale data across invalidations. Failed or timed-out lookups are never cached, so the next review retries them. The cache is invalidated whenever `llm/adapters-updated` or `loader/volatile-update` (listened globally with `global: true` to reliably receive local provider configuration updates) fires.
 - **Fail-closed security**: If the specified review route is misconfigured, unavailable, or encounters an error during the review, the review fails and the pending tool call is not executed (fail-closed).
+- **Saved-route test endpoint**: the same Host plugin contributes one small Typert Remote method, `autoReviewModel/testReviewRoute`, declared by the hand-written generated-style `./typert` manifest and mounted by the browser half from the package's `./remote` contribution. The settings page exposes it as a **Test saved route** action that probes the saved provider/model/effort with one fixed harmless prompt. The Host reads the saved settings itself, so the page sends no route, no credential, no session id, no purpose, no tools and no conversation history. Probes are bounded (16 output tokens, 20 s deadline, 5 per minute, one in flight), never write settings, never change the main model, never execute tools and never return model output.
 
 ## Install
 
@@ -37,6 +38,8 @@ dsh plugin --profile web add /home/aghost/workspace/dsh-auto-approval-model-fix
 The command adds the package as a dependency and bundle layer for the `web` profile. The DSH loader reads `cordis.patch.yml` through the package's `dsh.bundle.patch` and inserts the plugin as the `auto-review-model` layer.
 
 After installing or rebuilding the client, reload the Web profile in the usual DSH way and refresh the page for the configuration panel to appear. Saving settings takes effect on the next review without requiring a session restart.
+
+Because the Host face is discovered by the Typert Loader from the package's `./typert` export, install or upgrade the package before starting DSH, or restart DSH after the package files change, so the new export is registered. The browser half then mounts the `./remote` contribution automatically when the settings page loads.
 
 ## Configuration
 
@@ -60,6 +63,14 @@ The **Auto review model** (自动审查模型) configuration section renders dir
 - In the configuration UI, if an existing configuration contains an unrecognized or unadvertised `reasoningEffort`, the client preserves and explicitly displays it without disguising it as the provider default, allowing the user to inspect it or explicitly clear it.
 - **Takes effect immediately on the next review after saving.** In-flight reviews are not rewritten, and no session restart or profile reload is required.
 
+### Test the saved review route
+
+The configuration panel includes **Test saved route** (测试审查路由). It always tests the route currently **saved** — the hint names that route — so unsaved edits in the form are never exercised, and a dirty draft cannot be mistaken for what the probe used. The probe has its own progress/result state; it does not reuse the Save busy state.
+
+The probe sends one fixed harmless prompt (one user message, a fixed one-word system instruction, `temperature: 0`, `maxTokens: 16`), has a 20 s overall deadline, and is throttled Host-wide (at most one probe in flight, 5 probes per 60 s, 3 s minimum gap). It carries no `sessionId`, no `purpose` (in particular not `auto-review`), no tools and no conversation history; it does not read browser credentials, save settings, change the main model, execute tools or upload Session logs.
+
+Results are classified and rendered as a localised message plus an actionable hint. DeepSeek Account sign-in / authorization / connection problems are distinguished from API-key `MISSING_CREDENTIAL`, `INVALID_CREDENTIAL` and `AUTH`; `NO_ADAPTER`, provider timeout, provider rate limit, quota, route incomplete/disabled, concurrent probe, empty completion and unknown failures each have their own outcome. Only classification metadata and a short sanitized diagnostic are displayed: the model's answer text is never returned to the browser.
+
 ### Examples
 
 Assuming the following providers are configured in your DSH environment (e.g., in `cordis.patch.yml`), they can be selected on the configuration page:
@@ -82,15 +93,16 @@ These are machine-specific examples; available options depend on your DSH setup.
 
 ## Verification status
 
-As of 2026-10-25, the final automated integration regression suite was executed and passed completely:
-- **Automated commands**: All four npm scripts ran serially and exited with code 0: `npm run typecheck`, `npm test`, `npm run check`, and `npm run verify`.
-- **Tests and static checks**: 56 unit tests all passed (0 failures; covering host 25, client helper 17, client component 10, packaging 4); static verification passed all 15 checks (15/15).
-- **Artifact consistency**: Distribution artifacts (`lib/index.js`, `lib/policy.js`, `lib/index.d.ts`, `lib/policy.d.ts`, `client/client.js`) are 5/5 byte-for-byte identical to independent TypeScript recompilation outputs.
-- **Runtime scenarios**: Scenarios on live local Cordis and LlmRuntime instances (testing provider-scoped cache invalidation, deferred settling guards against cache pollution, etc.) all passed.
+As of 2026-11-16, the saved-route test feature was verified with the following automated evidence:
+- **Automated commands**: `npm run typecheck`, `npm test`, `npm run check`, and `npm run verify` all exited with code 0.
+- **Tests**: 127 unit tests passed (0 failures): host 33, route-test 34, client 25, client component 19, Typert contract/artifacts 9, packaging 7.
+- **Static verification**: 25 of 25 checks passed (`npm run verify`), covering exports, the Loader-valid `./typert` manifest, Host/Client descriptor alignment, `./remote` embedding and `$mount` wiring, dependency-free hand-written Typert artifacts, and syntax of every entry. On Desktop, the installed experimental-auto-review policy check reads the running `app.asar` through `DSH_NODE_EXECUTABLE`; a missing `DSH_INSTALL_DIR` combined with an unreadable source fails the check instead of silently skipping it. SKIP is reserved for source checkouts with no installed DSH package tree.
+- **Safety invariants asserted**: the probe request carries only provider/model/[reasoningEffort]/fixed prompt/maxTokens/temperature/signal (never `sessionId`, `purpose`, `tools`, `toolHistory` or conversation history); settings are never written; no model output, credential material or arbitrary transport error text is returned or rendered; Account versus API-key failures classify distinctly; throttle, single-flight, bounded timeout, bounded output, and stale-result invalidation after a saved-route change are covered.
 
 **Validation boundaries and unverified items**:
-- **No live model calls**: All automated tests and Cordis runtime scenarios use in-memory fake adapters; no live LLM APIs or external network calls were executed.
-- **This plugin has not been installed in the Web GUI or interactively verified by opening the configuration page in a live browser session.** Visual placement between bundle sections, GUI form submission, and live end-to-end review interception have not been validated in a running Web GUI, so no end-to-end GUI verification is claimed.
+- **No live model calls**: Automated tests use in-memory fake adapters; neither real LLM APIs nor network calls were executed, and the real saved route (for example `deepseek-account/deepseek-flash`) was not probed by this suite.
+- **No browser verification**: no browser control was available, so the action's rendered placement, discoverability, light/dark appearance and live result rendering have not been visually verified. A read-only UI/UX source review was performed; its substantiated findings (stale-result invalidation, data-only diagnostics, live-region scope, retry copy) were fixed and re-tested, but browser verification remains unavailable.
+- **Live Gateway dispatch remains unverified**: unit tests exercise the published endpoint locally, not the installed Typert Loader + Gateway RPC path. That end-to-end path requires installation verification in a running DSH session (task-4).
 
 ## Development
 
@@ -117,7 +129,7 @@ npm install
 ### Commands
 
 ```sh
-npm run build        # Build host (src/ -> lib/) and client (src/client/ -> client/client.js)
+npm run build        # Build host (src/ -> lib/), client (src/client/ -> client/), and embed the shared Typert contract into client/client.js (scripts/build-client.cjs)
 npm run build:tests  # Compile tests and scripts (tests/*.test.ts, scripts/verify.ts -> .build/)
 npm run typecheck    # Run TypeScript type check across host, client, and tests
 npm run check        # Syntax check compiled JS files with node --check
@@ -127,8 +139,12 @@ npm run verify       # Compile and run static verification (.build/scripts/verif
 
 ### Layout
 
-- `src/policy.ts`, `src/index.ts`: Server-side plugin and config schema sources;
-- `src/client/client.ts`: Web configuration UI client source;
+- `src/index.ts`, `src/policy.ts`: Host plugin, config schema, and review-request interception;
+- `src/route-test.ts`: Host saved-route probe endpoint (limits, error classification, result builder);
+- `src/typert.contract.ts`: dependency-free Typert contract shared by both generated-style faces;
+- `src/typert.host.ts`, `src/typert.remote-client.ts`: `./typert` and `./remote` artifact entry modules;
+- `scripts/build-client.cjs`: embeds the contract into the browser bundle and registers the `./remote` chunk;
+- `src/client/client.ts`: Web configuration UI client source, including the saved-route test action;
 - `tests/*.test.ts`: Unit tests;
 - `scripts/verify.ts`: Static and smoke verification script;
 - `lib/`, `client/client.js`: Compiled distribution artifacts (do not edit);

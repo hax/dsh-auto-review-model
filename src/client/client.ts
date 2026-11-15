@@ -102,6 +102,55 @@ interface RemoteResponse<T> {
   revision?: number;
 }
 
+/**
+ * Wire result of one saved review-route probe.
+ *
+ * Mirrors the strict `ReviewRouteTestResult` codec in `src/typert.contract.ts`.
+ * It carries classification metadata only: the Host never returns model output,
+ * so no result field can hold provider prose.
+ */
+interface ReviewRouteTestResult {
+  status: 'ok' | 'warning' | 'error' | 'blocked';
+  code: string;
+  route: { provider: string; model: string; reasoningEffort: string };
+  authKind: 'account' | 'api-key' | 'unknown';
+  providerName: string;
+  settingsNs: string;
+  credentialEnv: string[];
+  effortUsed: string;
+  effortNotAdvertised: boolean;
+  latencyMs: number;
+  retryAfterMs: number;
+  failureCode: string;
+  detail: string;
+}
+
+/** One call of the mounted `remote.autoReviewModel.testReviewRoute` endpoint. */
+interface TestRouteEndpoint {
+  testReviewRoute(signal?: AbortSignal): Promise<RemoteResponse<ReviewRouteTestResult>>;
+}
+
+/** Mountable Host-for-Client contribution this package's `./remote` export carries. */
+interface RemoteContributionLike {
+  package: string;
+  descriptors: readonly unknown[];
+}
+
+/** Localized presentation of one saved-route test outcome. */
+interface TestOutcome {
+  tone: 'ok' | 'warning' | 'error' | 'blocked';
+  /** Localized outcome message. */
+  message: string;
+  /** Localized description of the route the Host actually probed. */
+  route: string;
+  /** Localized actionable repair hint. */
+  hint: string;
+  /** Data-only diagnostic: the tested route and/or a safe failure code. */
+  detail: string;
+  /** Extra note, such as the saved-effort fallback explanation. */
+  note: string;
+}
+
 interface SettingsNamespace {
   ns?: string;
   value?: unknown;
@@ -120,11 +169,21 @@ interface RemoteFacade {
   session: {
     modelCatalog(): Promise<RemoteResponse<{ groups?: unknown }>>;
   };
+  /**
+   * Mount this package's `./remote` contribution. The server registers the
+   * `remote.autoReviewModel` namespace service, which the settings body reads
+   * through `ctx.get`.
+   */
+  $mount(contribution: RemoteContributionLike): Promise<() => Promise<void>>;
 }
 
 interface ClientContext {
   get(service: string): any;
   effect(effect: () => (() => void) | void, label?: string): void;
+  inject?(
+    services: readonly string[],
+    callback: (child: ClientContext) => (() => void) | void,
+  ): { dispose(): void | Promise<void> };
 }
 
 interface SelectProps {
@@ -140,6 +199,8 @@ interface ConfigProps {
   view: 'summary' | 'page';
   remote: RemoteFacade;
   t: (key: string) => string;
+  /** Mounted saved-route probe endpoint; absent when its contribution failed to mount. */
+  testRoute?: TestRouteEndpoint;
 }
 
 type LoadResult =
@@ -176,6 +237,12 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
 
   const NS = 'auto-review-model';
   const BUNDLE = '@deepseek-ai/dsh-experimental-auto-review';
+  /**
+   * Module id the generated client prelude registers this package's `./remote`
+   * contribution under. The prelude and this require are emitted from the same
+   * contract source by `scripts/build-client.cjs`.
+   */
+  const REMOTE_CONTRIBUTION_SPECIFIER = '@aghost-prj/dsh-auto-review-model/client.remote.js';
   const STYLE_ID = 'dsh_arm_styles';
   const FIELDS: readonly (keyof ReviewerSettings)[] = [
     'enabled',
@@ -226,6 +293,74 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     unavailable: '（不可用）',
     unverified: '（未验证）',
     notAdvertised: '（未声明）',
+    // Saved-route test action. Every string here is what the settings page
+    // renders; provider output is never displayed as prose, only classified
+    // outcomes plus a short technical detail.
+    test: '测试审查路由',
+    testing: '正在测试审查路由…',
+    testLabel: '审查路由测试',
+    testHint: '仅测试已保存的路由：{route}。未保存的更改不会被测试。',
+    testHintDirty: '你有未保存的更改；测试不会使用它们。',
+    testRouteDisabled: '覆盖已关闭',
+    testRouteIncomplete: '提供商或模型尚未保存',
+    testUnavailableHint: '审查路由测试不可用：Remote 端点未能挂载。请刷新页面或重启 DSH 后重试。',
+    testResultPrefix: '测试结果',
+    testTransportFailed: '测试未能运行',
+    testUnknownResult: '审查路由测试返回了无法识别的结果。',
+    testDetail: '详情',
+    testEffortNote: '已保存的推理等级“{effort}”未被该路由声明；自动审查会回退到提供商默认值。',
+    testSeconds: '{seconds} 秒',
+    testNoEnvVar: '提供商凭证设置',
+    testResultRoute: '测试路由',
+    testFailureCode: '失败代码',
+    testTransportHint: '请重试测试；若持续失败，请刷新页面或重启 DSH。',
+    testLoadingHint: '设置尚未加载完成；请刷新页面后再测试。',
+    testOkMessage: '路由可用。',
+    testRouteDisabledMessage: '已保存的设置中，自动审查覆盖处于关闭状态。',
+    testRouteIncompleteMessage: '已保存的审查路由不完整。',
+    testBusyMessage: '已有一个路由测试在运行。',
+    testRateLimitedMessage: '路由测试启动过于频繁。',
+    testCancelledMessage: '路由测试已取消。',
+    testTimeoutMessage: '已保存的路由未能及时响应。',
+    testNoAdapterMessage: '已保存的提供商没有注册的适配器。',
+    testUnknownModelMessage: '该路由不提供已保存的模型。',
+    testMissingCredentialMessage: '该提供商未配置凭证。',
+    testInvalidCredentialMessage: '该提供商保存的凭证格式无效。',
+    testNoCredentialStoreMessage: '凭证存储不可用。',
+    testAuthMessage: '提供商拒绝了该凭证。',
+    testAccountSignInMessage: 'DeepSeek 账号路由需要登录。',
+    testAccountAuthFailedMessage: 'DeepSeek 账号的授权被拒绝。',
+    testAccountConnectionMessage: '无法连接 DeepSeek 账号服务。',
+    testConnectionMessage: '无法连接该提供商。',
+    testRateLimitMessage: '提供商对测试请求做了速率限制。',
+    testQuotaMessage: '提供商账号的配额或余额已用尽。',
+    testContextWindowMessage: '测试请求超出了模型上下文窗口。',
+    testUnsupportedEffortMessage: '该模型不支持已保存的推理等级。',
+    testEmptyResponseMessage: '路由有响应，但返回了空内容。',
+    testUnknownMessage: '路由测试因未知原因失败。',
+    testOkHint: '',
+    testRouteDisabledHint: '开启覆盖并保存提供商与模型，然后重新测试。',
+    testRouteIncompleteHint: '先在设置中保存提供商和模型，然后重新测试。',
+    testBusyHint: '等待当前测试完成后再试。',
+    testRateLimitedHint: '请等待 {seconds} 后再测试。',
+    testCancelledHint: '重新运行测试。',
+    testTimeoutHint: '检查网络与提供商状态后重试；若持续出现，请更换提供商或模型。',
+    testNoAdapterHint: '在“设置 → 提供商”中配置 {provider}，或改选一个已有适配器的提供商；必要时重启 DSH 后重试。',
+    testUnknownModelHint: '为 {provider} 选择另一个模型并保存，然后重新测试。',
+    testMissingCredentialHint: '在“设置 → 提供商”中为 {provider} 添加凭证（环境变量：{env}），然后重新测试。',
+    testInvalidCredentialHint: '在“设置 → 提供商”中修正 {provider} 的凭证，然后重新测试。',
+    testNoCredentialStoreHint: '重启 DSH 或先配置凭证存储，然后重新测试。',
+    testAuthHint: '在“设置 → 提供商”中检查 {provider} 的 API key，然后重新测试。',
+    testAccountSignInHint: '打开“设置 → DeepSeek 账号”重新登录，然后重新测试。',
+    testAccountAuthFailedHint: '打开“设置 → DeepSeek 账号”重新登录；若仍失败，请确认该账号可使用 {provider}。',
+    testAccountConnectionHint: '检查网络后重试；若账号服务不可用，请改选其他提供商路由。',
+    testConnectionHint: '检查网络与提供商的端点/Base URL，然后重试。',
+    testRateLimitHint: '等待提供商速率限制重置后重试，或降低测试频率。',
+    testQuotaHint: '为 {provider} 充值账户余额，或改选其他路由。',
+    testContextWindowHint: '固定最小提示不应触发此问题；请更换模型，若仍出现请报告。',
+    testUnsupportedEffortHint: '为 {provider} / {model} 选择其他推理等级（或默认值）并保存，然后重新测试。',
+    testEmptyResponseHint: '连接可用，但模型返回了空补全；可重新测试或更换模型/推理等级。',
+    testUnknownHint: '查看详情并核对提供商设置后重试；若持续出现，请更换提供商或模型。',
   };
 
   const en = {
@@ -262,6 +397,73 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     unavailable: '(unavailable)',
     unverified: '(unverified)',
     notAdvertised: '(not advertised)',
+    // Saved-route test action. Only classified outcomes and a short technical
+    // detail are rendered; the provider's response text never reaches the page.
+    test: 'Test saved route',
+    testing: 'Testing saved route…',
+    testLabel: 'Review route test',
+    testHint: 'Tests the saved route only: {route}. Unsaved changes are not tested.',
+    testHintDirty: 'You have unsaved changes; they are not tested.',
+    testRouteDisabled: 'override disabled',
+    testRouteIncomplete: 'provider or model not saved',
+    testUnavailableHint: 'The route test is unavailable because its Remote endpoint did not mount. Refresh the page or restart DSH and try again.',
+    testResultPrefix: 'Test result',
+    testTransportFailed: 'The test could not run',
+    testUnknownResult: 'The route test returned an unrecognized result.',
+    testDetail: 'Detail',
+    testEffortNote: 'The saved reasoning effort "{effort}" is not advertised by this route; auto review falls back to the provider default.',
+    testSeconds: '{seconds}s',
+    testNoEnvVar: 'the provider credential setting',
+    testResultRoute: 'Tested route',
+    testFailureCode: 'Failure code',
+    testTransportHint: 'Retry the test. If it keeps failing, reload the page or restart DSH.',
+    testLoadingHint: 'Settings are not loaded yet; reload the page before testing.',
+    testOkMessage: 'The route works.',
+    testRouteDisabledMessage: 'The auto-review override is disabled in the saved settings.',
+    testRouteIncompleteMessage: 'The saved review route is incomplete.',
+    testBusyMessage: 'A route test is already running.',
+    testRateLimitedMessage: 'Route tests were started too frequently.',
+    testCancelledMessage: 'The route test was cancelled.',
+    testTimeoutMessage: 'The saved route did not respond in time.',
+    testNoAdapterMessage: 'The saved provider has no registered adapter.',
+    testUnknownModelMessage: 'The saved model is not available on this route.',
+    testMissingCredentialMessage: 'No credential is configured for this provider.',
+    testInvalidCredentialMessage: 'The stored credential for this provider is malformed.',
+    testNoCredentialStoreMessage: 'The credential store is not available.',
+    testAuthMessage: 'The provider rejected the credential.',
+    testAccountSignInMessage: 'The DeepSeek Account route requires a sign-in.',
+    testAccountAuthFailedMessage: 'The DeepSeek Account authorization was rejected.',
+    testAccountConnectionMessage: 'The DeepSeek Account service could not be reached.',
+    testConnectionMessage: 'The provider could not be reached.',
+    testRateLimitMessage: 'The provider rate-limited the test request.',
+    testQuotaMessage: 'The provider account has no remaining quota or balance.',
+    testContextWindowMessage: 'The test request exceeded the model context window.',
+    testUnsupportedEffortMessage: 'The saved reasoning effort is not supported by this model.',
+    testEmptyResponseMessage: 'The route answered but returned no content.',
+    testUnknownMessage: 'The route test failed for an unexpected reason.',
+    testOkHint: '',
+    testRouteDisabledHint: 'Enable the override and save a provider and model, then test again.',
+    testRouteIncompleteHint: 'Save both a provider and a model in Settings, then test again.',
+    testBusyHint: 'Wait for the current test to finish, then try again.',
+    testRateLimitedHint: 'Wait {seconds} before testing again.',
+    testCancelledHint: 'Run the test again.',
+    testTimeoutHint: 'Check the network and provider status, then retry. If it repeats, choose another provider or model.',
+    testNoAdapterHint: 'Configure {provider} in Settings → Providers, or choose a provider that has an adapter; restart DSH if needed, then test again.',
+    testUnknownModelHint: 'Choose another model for {provider}, save the settings, then test again.',
+    testMissingCredentialHint: 'Add a credential for {provider} in Settings → Providers (environment variable: {env}), then test again.',
+    testInvalidCredentialHint: 'Correct the credential for {provider} in Settings → Providers, then test again.',
+    testNoCredentialStoreHint: 'Restart DSH or configure the credential store, then test again.',
+    testAuthHint: 'Check the API key for {provider} in Settings → Providers, then test again.',
+    testAccountSignInHint: 'Open Settings → DeepSeek Account, sign in again, then test again.',
+    testAccountAuthFailedHint: 'Open Settings → DeepSeek Account and sign in again; if it still fails, confirm that {provider} is available for this account.',
+    testAccountConnectionHint: 'Check the network and retry. If the account service is unavailable, choose another provider route.',
+    testConnectionHint: 'Check the network and the provider endpoint/base URL, then retry.',
+    testRateLimitHint: 'Wait for the provider rate limit to reset, then test again, or reduce test frequency.',
+    testQuotaHint: 'Replenish the balance for {provider} or choose another route.',
+    testContextWindowHint: 'A fixed minimal prompt should not trigger this; choose another model and report it if it repeats.',
+    testUnsupportedEffortHint: 'Choose another reasoning effort (or the default) for {provider} / {model}, save, then test again.',
+    testEmptyResponseHint: 'The connection works but the model returned an empty completion. Test again or pick another model/effort.',
+    testUnknownHint: 'Review the detail and the provider settings, then retry. If it repeats, choose another provider or model.',
   };
 
   const cssText = `
@@ -301,6 +503,16 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
 .dsh_arm_statusError{color:var(--dsw-alias-state-error-primary)}
 .dsh_arm_summary{color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}
 .dsh_arm_hint{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.dsh_arm_test{display:flex;flex-direction:column;gap:6px;min-width:0;padding-top:12px;border-top:1px solid var(--dsw-alias-border-l2)}
+.dsh_arm_testHeader{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;min-width:0}
+.dsh_arm_testTitle{color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px;font-weight:600}
+.dsh_arm_testStatus{margin:0;font-size:13px;line-height:20px;overflow-wrap:anywhere}
+.dsh_arm_testOk{color:var(--dsw-alias-label-secondary)}
+.dsh_arm_testWarn{color:var(--dsw-alias-state-warn-label)}
+.dsh_arm_testError{color:var(--dsw-alias-state-error-primary)}
+.dsh_arm_testBlocked{color:var(--dsw-alias-label-tertiary)}
+.dsh_arm_testFeedback{display:flex;flex-direction:column;gap:6px;min-width:0}
+.dsh_arm_testDetail{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;overflow-wrap:anywhere}
 `;
 
   /** Inject the component stylesheet once; a no-op without a document. */
@@ -737,6 +949,285 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     );
   }
 
+  /* ============================================================
+   * Saved-route test presentation
+   *
+   * The Host returns a classified outcome and a short diagnostic only; the
+   * model's response text never reaches this half. Every user-visible string is
+   * composed from the locale table below, interpolating route facts (provider,
+   * model, effort, credential environment variables) as data.
+   * ============================================================ */
+
+  /** Outcome code → locale key for the result message. */
+  const TEST_MESSAGE_KEYS: Readonly<Record<string, string>> = {
+    OK: 'testOkMessage',
+    ROUTE_DISABLED: 'testRouteDisabledMessage',
+    ROUTE_INCOMPLETE: 'testRouteIncompleteMessage',
+    BUSY: 'testBusyMessage',
+    RATE_LIMITED: 'testRateLimitedMessage',
+    CANCELLED: 'testCancelledMessage',
+    TIMEOUT: 'testTimeoutMessage',
+    NO_ADAPTER: 'testNoAdapterMessage',
+    UNKNOWN_MODEL: 'testUnknownModelMessage',
+    MODEL_UNSUPPORTED: 'testUnknownModelMessage',
+    MISSING_CREDENTIAL: 'testMissingCredentialMessage',
+    INVALID_CREDENTIAL: 'testInvalidCredentialMessage',
+    NO_CREDENTIAL_STORE: 'testNoCredentialStoreMessage',
+    AUTH: 'testAuthMessage',
+    ACCOUNT_SIGN_IN_REQUIRED: 'testAccountSignInMessage',
+    ACCOUNT_AUTH_FAILED: 'testAccountAuthFailedMessage',
+    ACCOUNT_CONNECTION: 'testAccountConnectionMessage',
+    CONNECTION: 'testConnectionMessage',
+    RATE_LIMIT: 'testRateLimitMessage',
+    QUOTA: 'testQuotaMessage',
+    CONTEXT_WINDOW_EXCEEDED: 'testContextWindowMessage',
+    UNSUPPORTED_REASONING_EFFORT: 'testUnsupportedEffortMessage',
+    EMPTY_RESPONSE: 'testEmptyResponseMessage',
+    UNKNOWN: 'testUnknownMessage',
+  };
+
+  /** Outcome code → locale key for the actionable repair hint. */
+  const TEST_HINT_KEYS: Readonly<Record<string, string>> = {
+    OK: 'testOkHint',
+    ROUTE_DISABLED: 'testRouteDisabledHint',
+    ROUTE_INCOMPLETE: 'testRouteIncompleteHint',
+    BUSY: 'testBusyHint',
+    RATE_LIMITED: 'testRateLimitedHint',
+    CANCELLED: 'testCancelledHint',
+    TIMEOUT: 'testTimeoutHint',
+    NO_ADAPTER: 'testNoAdapterHint',
+    UNKNOWN_MODEL: 'testUnknownModelHint',
+    MODEL_UNSUPPORTED: 'testUnknownModelHint',
+    MISSING_CREDENTIAL: 'testMissingCredentialHint',
+    INVALID_CREDENTIAL: 'testInvalidCredentialHint',
+    NO_CREDENTIAL_STORE: 'testNoCredentialStoreHint',
+    AUTH: 'testAuthHint',
+    ACCOUNT_SIGN_IN_REQUIRED: 'testAccountSignInHint',
+    ACCOUNT_AUTH_FAILED: 'testAccountAuthFailedHint',
+    ACCOUNT_CONNECTION: 'testAccountConnectionHint',
+    CONNECTION: 'testConnectionHint',
+    RATE_LIMIT: 'testRateLimitHint',
+    QUOTA: 'testQuotaHint',
+    CONTEXT_WINDOW_EXCEEDED: 'testContextWindowHint',
+    UNSUPPORTED_REASONING_EFFORT: 'testUnsupportedEffortHint',
+    EMPTY_RESPONSE: 'testEmptyResponseHint',
+    UNKNOWN: 'testUnknownHint',
+  };
+
+  /**
+   * Fill `{name}` placeholders in one locale template with route facts.
+   * @param template - localized template from the dictionary.
+   * @param values - placeholder values; unknown placeholders are left alone.
+   * @returns the localized text.
+   */
+  function formatText(template: string, values: Readonly<Record<string, string>>): string {
+    return template.replace(/\{([a-zA-Z0-9_]+)\}/g, (match, name: string) => (
+      Object.hasOwn(values, name) ? values[name] : match
+    ));
+  }
+
+  /**
+   * Describe the route the test actually probes: the SAVED settings, never the
+   * draft. An incomplete or disabled saved route is named explicitly so the
+   * page never implies a draft is being tested.
+   * @param saved - last accepted Host settings.
+   * @param t - locale bind function.
+   * @returns localized saved-route description.
+   */
+  function savedRouteText(saved: ReviewerSettings, t: (key: string) => string): string {
+    if (!saved.enabled) return t('testRouteDisabled');
+    if (saved.provider === '' || saved.model === '') return t('testRouteIncomplete');
+    let route = saved.provider + ' / ' + saved.model;
+    if (saved.reasoningEffort !== '') route += ' · ' + saved.reasoningEffort;
+    return route;
+  }
+
+  /**
+   * Explain which route the test button probes and whether unsaved edits exist.
+   * @param saved - last accepted Host settings.
+   * @param dirty - whether the draft differs from the saved settings.
+   * @param available - whether the Remote endpoint mounted.
+   * @param loaded - whether the saved settings were read successfully.
+   * @param t - locale bind function.
+   * @returns localized hint text.
+   */
+  function savedRouteHintText(
+    saved: ReviewerSettings,
+    dirty: boolean,
+    available: boolean,
+    loaded: boolean,
+    t: (key: string) => string,
+  ): string {
+    if (!available) return t('testUnavailableHint');
+    if (!loaded) return t('testLoadingHint');
+    let hint = formatText(t('testHint'), { route: savedRouteText(saved, t) });
+    if (dirty) hint += ' ' + t('testHintDirty');
+    return hint;
+  }
+
+  /**
+   * Render a throttle delay with locale-appropriate units.
+   * @param milliseconds - delay reported by the Host, or 0.
+   * @param fallbackSeconds - locale-rendered fallback when the Host reported none.
+   * @param t - locale bind function.
+   * @returns localized duration text.
+   */
+  function delayText(
+    milliseconds: number,
+    fallbackSeconds: number,
+    t: (key: string) => string,
+  ): string {
+    const seconds = typeof milliseconds === 'number' && Number.isFinite(milliseconds) && milliseconds > 0
+      ? Math.max(1, Math.ceil(milliseconds / 1000))
+      : fallbackSeconds;
+    return formatText(t('testSeconds'), { seconds: String(seconds) });
+  }
+
+  /**
+   * Keep only a machine-shaped failure code from a Remote/Gateway error.
+   *
+   * A Remote rejection may carry arbitrary message text, which could include
+   * provider or credential detail; the page therefore never renders
+   * `error.message`. Only a bounded identifier-shaped `code` (for example
+   * `gateway/cancelled`) is treated as data.
+   * @param error - thrown or returned Remote error.
+   * @returns the safe code, or `''`.
+   */
+  function safeErrorCode(error: unknown): string {
+    if (error === null || error === undefined || typeof error !== 'object') return '';
+    const code = (error as Record<string, unknown>).code;
+    return typeof code === 'string' && /^[A-Za-z0-9_./-]{1,80}$/.test(code) ? code : '';
+  }
+
+  /**
+   * Describe one probed route for display beside its outcome.
+   * @param result - strict Host outcome.
+   * @returns `provider / model` plus an explicit effort when one was used.
+   */
+  function testedRouteText(result: ReviewRouteTestResult): string {
+    const route = result.route !== null && typeof result.route === 'object' ? result.route : undefined;
+    const provider = trimString(result.providerName) || (route === undefined ? '' : trimString(route.provider));
+    const model = route === undefined ? '' : trimString(route.model);
+    const effort = route === undefined ? '' : trimString(route.reasoningEffort);
+    if (provider === '' && model === '') return '';
+    let text = (provider === '' ? trimString(route?.provider ?? '') : provider) + ' / ' + model;
+    if (effort !== '') text += ' · ' + effort;
+    return text;
+  }
+
+  /**
+   * Map one Host outcome to localized presentation text.
+   *
+   * Never displays a model response: the message and hint come from the locale
+   * dictionary keyed by the stable outcome code, route facts are interpolated as
+   * data, and the diagnostic line carries only the tested route plus a
+   * machine-shaped failure code (the Host's English advisory table is not
+   * rendered, because the localized hint already owns the repair advice).
+   * @param result - strict Host outcome.
+   * @param t - locale bind function.
+   * @returns localized outcome.
+   */
+  function mapTestResult(
+    result: ReviewRouteTestResult,
+    t: (key: string) => string,
+  ): TestOutcome {
+    const code = typeof result.code === 'string' && result.code !== '' ? result.code : 'UNKNOWN';
+    const tone: TestOutcome['tone'] = result.status === 'ok'
+      ? 'ok'
+      : result.status === 'warning'
+        ? 'warning'
+        : result.status === 'blocked'
+          ? 'blocked'
+          : 'error';
+    const route = result.route !== null && typeof result.route === 'object' ? result.route : undefined;
+    const provider = trimString(result.providerName) || (route === undefined ? '' : trimString(route.provider));
+    const model = route === undefined ? '' : trimString(route.model);
+    const effort = route === undefined ? '' : trimString(route.reasoningEffort);
+    const credentialEnv = Array.isArray(result.credentialEnv)
+      ? result.credentialEnv.filter((entry): entry is string => typeof entry === 'string')
+      : [];
+    const values: Record<string, string> = {
+      provider: provider === '' ? t('provider') : provider,
+      model,
+      effort,
+      env: credentialEnv.length > 0 ? credentialEnv.join(' / ') : t('testNoEnvVar'),
+      seconds: delayText(result.retryAfterMs, 30, t),
+    };
+    const messageKey = TEST_MESSAGE_KEYS[code] ?? 'testUnknownMessage';
+    const hintKey = TEST_HINT_KEYS[code] ?? 'testUnknownHint';
+    const hintTemplate = t(hintKey);
+    const failureCode = trimString(result.failureCode);
+    const hostDetail = trimString(result.detail);
+    // Classified outcomes already have localized repair advice; only an
+    // unclassified failure shows the Host's sanitized diagnostic, so the page
+    // never repeats English advisory prose on the localized UI.
+    const diagnostics = code === 'UNKNOWN'
+      ? [hostDetail === '' ? '' : t('testDetail') + ': ' + hostDetail]
+      : [failureCode === '' ? '' : t('testFailureCode') + ': ' + failureCode];
+    return {
+      tone,
+      message: t(messageKey),
+      route: testedRouteText(result),
+      hint: hintTemplate === '' ? '' : formatText(hintTemplate, values),
+      detail: diagnostics.filter((entry) => entry !== '').join(' · '),
+      note: result.effortNotAdvertised === true && tone === 'ok'
+        ? formatText(t('testEffortNote'), { effort })
+        : '',
+    };
+  }
+
+  /**
+   * Map a transport failure (the call itself did not produce a Host outcome) to
+   * localized presentation text. Only a machine-shaped error code crosses into
+   * the page; arbitrary error messages are never rendered.
+   * @param error - thrown or returned Remote error.
+   * @param t - locale bind function.
+   * @returns localized outcome.
+   */
+  function mapTestTransportFailure(error: unknown, t: (key: string) => string): TestOutcome {
+    const code = safeErrorCode(error);
+    return {
+      tone: 'error',
+      message: t('testTransportFailed'),
+      route: '',
+      hint: t('testTransportHint'),
+      detail: code === '' ? '' : t('testFailureCode') + ': ' + code,
+      note: '',
+    };
+  }
+
+  /**
+   * Localize the "unrecognized result" case when the Host value is malformed.
+   * @param t - locale bind function.
+   * @returns localized outcome.
+   */
+  function mapTestUnknownResult(t: (key: string) => string): TestOutcome {
+    return {
+      tone: 'error',
+      message: t('testUnknownResult'),
+      route: '',
+      hint: '',
+      detail: '',
+      note: '',
+    };
+  }
+
+  /**
+   * Theme-token class for one outcome tone.
+   * @param tone - presentation tone.
+   * @returns the status element class list.
+   */
+  function testStatusClass(tone: TestOutcome['tone']): string {
+    const modifier = tone === 'ok'
+      ? 'dsh_arm_testOk'
+      : tone === 'warning'
+        ? 'dsh_arm_testWarn'
+        : tone === 'blocked'
+          ? 'dsh_arm_testBlocked'
+          : 'dsh_arm_testError';
+    return 'dsh_arm_testStatus ' + modifier;
+  }
+
   function summaryLine(
     draft: ReviewerSettings,
     loading: boolean,
@@ -754,6 +1245,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     const view = props.view;
     const remote = props.remote;
     const t = props.t;
+    const testRoute = props.testRoute;
 
     // `saved` is the last accepted Host value; `draft` is the edited form.
     // Nothing is written until Save, and Save re-reads the namespace so the
@@ -767,6 +1259,33 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     const [loaded, setLoaded] = React.useState(false);
     const [busy, setBusy] = React.useState(false);
     const [status, setStatus] = React.useState<StatusLine | null>(null);
+    // The saved-route test is independent from Save: it has its own in-flight
+    // flag and its own result line, so it never reuses the save `busy` state or
+    // overwrites the save status text.
+    const [testing, setTesting] = React.useState(false);
+    const [testStatus, setTestStatus] = React.useState<TestOutcome | null>(null);
+    const aliveRef = React.useRef(true);
+    // Every started probe gets a sequence number; changing the saved route, or
+    // starting another probe, advances it so a late response can never be shown
+    // beside a different saved route. A synchronous ref also prevents two
+    // handler invocations in the same render from issuing two Remote calls.
+    const probeSeqRef = React.useRef(0);
+    const activeProbeRef = React.useRef<number | null>(null);
+    // Cancellation for the one in-flight probe: the Host applies its own
+    // deadline, but unmounting this page or changing the saved route must stop
+    // the probe (and its provider request) promptly instead of letting it run
+    // up to the 20 s deadline.
+    const probeAbortRef = React.useRef<AbortController | null>(null);
+    React.useEffect(() => {
+      // Re-arm on setup so a StrictMode effect replay cannot ignore responses.
+      aliveRef.current = true;
+      return () => {
+        aliveRef.current = false;
+        const controller = probeAbortRef.current;
+        probeAbortRef.current = null;
+        controller?.abort();
+      };
+    }, []);
 
     const reloadSettings = React.useCallback(async () => {
       setLoading(true);
@@ -785,6 +1304,8 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
         setCatalogError(result.catalogError);
         setLoaded(true);
         setLoading(false);
+        // A reloaded saved route invalidates any earlier probe result.
+        invalidateProbe();
         if (result.catalogError !== '') {
           setStatus({
             kind: 'error',
@@ -818,6 +1339,8 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
         setCatalogError(result.catalogError);
         setLoaded(true);
         setLoading(false);
+        // A reloaded saved route invalidates any earlier probe result.
+        invalidateProbe();
         if (result.catalogError !== '') {
           setStatus({
             kind: 'error',
@@ -889,6 +1412,78 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
       setStatus(null);
     };
 
+    /**
+     * Drop any in-flight probe's authority and its displayed outcome.
+     *
+     * Called whenever the saved route changes: a result must never appear beside
+     * a different route than the one the Host actually probed.
+     */
+    const invalidateProbe = (): void => {
+      probeSeqRef.current += 1;
+      const controller = probeAbortRef.current;
+      probeAbortRef.current = null;
+      // Saved-route change: cancel the probe for the previous route so no work
+      // (or provider request) continues for a route the page no longer shows.
+      controller?.abort();
+      setTestStatus(null);
+    };
+
+    /**
+     * Probe the SAVED review route through the mounted Remote endpoint.
+     *
+     * The endpoint takes no arguments: the Host reads the saved settings itself,
+     * so a draft is never transmitted, no browser credential is read, and no
+     * route can be injected from the page. An independent `testing` flag (not
+     * the save `busy` flag) plus a synchronous sequence/lock guard duplicate
+     * taps, and a response is accepted only while its sequence is still current.
+     * The call receives a component-owned AbortSignal; unmounting the page or
+     * changing the saved route aborts it, so the Host stops the provider probe
+     * early. Results are classified text; provider prose is never requested or
+     * shown.
+     */
+    const runRouteTest = async () => {
+      if (testing || formBusy || !loaded || testRoute === undefined) return;
+      if (activeProbeRef.current !== null) return;
+      // Defensive: a probe may never share the page with a second one, so a
+      // controller still present here belongs to a retired probe.
+      probeAbortRef.current?.abort();
+      const controller = new AbortController();
+      probeAbortRef.current = controller;
+      const sequence = probeSeqRef.current + 1;
+      probeSeqRef.current = sequence;
+      activeProbeRef.current = sequence;
+      setTesting(true);
+      setTestStatus(null);
+      try {
+        const response = await testRoute.testReviewRoute(controller.signal);
+        if (!aliveRef.current || activeProbeRef.current !== sequence) return;
+        if (sequence !== probeSeqRef.current) return;
+        if (response === null || response === undefined || response.ok !== true) {
+          setTestStatus(mapTestTransportFailure(
+            response === null || response === undefined ? undefined : response.error,
+            t,
+          ));
+          return;
+        }
+        const value = response.value;
+        if (value === null || value === undefined || typeof value !== 'object' || typeof value.code !== 'string') {
+          setTestStatus(mapTestUnknownResult(t));
+          return;
+        }
+        setTestStatus(mapTestResult(value, t));
+      } catch (error) {
+        if (aliveRef.current && activeProbeRef.current === sequence && sequence === probeSeqRef.current) {
+          setTestStatus(mapTestTransportFailure(error, t));
+        }
+      } finally {
+        if (probeAbortRef.current === controller) probeAbortRef.current = null;
+        if (activeProbeRef.current === sequence) {
+          activeProbeRef.current = null;
+          if (aliveRef.current) setTesting(false);
+        }
+      }
+    };
+
     const handleSave = async () => {
       if (busy || loading || !loaded || !dirty) return;
       setBusy(true);
@@ -910,6 +1505,8 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
           setGroups(refreshed.groups);
           setRevision(refreshed.revision);
           setCatalogError(refreshed.catalogError);
+          // A saved route change invalidates any earlier probe result.
+          invalidateProbe();
           if (refreshed.catalogError !== '') {
             setStatus({ kind: 'ok', text: withDetail(t('savedCatalogFailed'), refreshed.catalogError) });
           } else {
@@ -925,6 +1522,9 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
         const fallback = reconcileDraft(normalizeSettings(rawSection), groups);
         setSaved(fallback);
         setDraft(fallback);
+        // The saved route moved even though the re-read failed: drop a result
+        // that belongs to the previous route.
+        invalidateProbe();
         let fallbackRevision: number | undefined = undefined;
         if (
           view !== null
@@ -1039,6 +1639,67 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
         }, busy ? t('saving') : t('save')),
       ),
 
+      // Saved-route probe: an independent action with its own state and result
+      // text. It always names the saved route, so a dirty draft is never mistaken
+      // for what the test exercises.
+      React.createElement('div', {
+        className: 'dsh_arm_test',
+        'data-arm-test': 'true',
+        'aria-busy': testing,
+      },
+        React.createElement('div', { className: 'dsh_arm_testHeader' },
+          React.createElement('span', { className: 'dsh_arm_testTitle' }, t('testLabel')),
+          React.createElement('button', {
+            type: 'button',
+            className: 'dsh_arm_button dsh_arm_buttonSecondary',
+            disabled: formBusy || !loaded || testing || testRoute === undefined,
+            onClick: () => {
+              void runRouteTest();
+            },
+          }, testing ? t('testing') : t('test')),
+        ),
+        React.createElement(
+          'p',
+          { className: 'dsh_arm_hint' },
+          savedRouteHintText(saved, dirty, testRoute !== undefined, loaded, t),
+        ),
+        // One persistent polite live region announces progress, the outcome,
+        // its tested route, and the actionable hint together.
+        React.createElement('div', {
+          className: 'dsh_arm_testFeedback',
+          role: 'status',
+          'aria-live': 'polite',
+          'aria-atomic': 'true',
+        },
+          testing
+            ? React.createElement('p', { className: 'dsh_arm_testStatus dsh_arm_testBlocked' }, t('testing'))
+            : null,
+          testStatus !== null
+            ? React.createElement(
+                'p',
+                { className: testStatusClass(testStatus.tone) },
+                t('testResultPrefix') + ': ' + testStatus.message,
+              )
+            : null,
+          testStatus !== null && testStatus.route !== ''
+            ? React.createElement(
+                'p',
+                { className: 'dsh_arm_hint' },
+                t('testResultRoute') + ': ' + testStatus.route,
+              )
+            : null,
+          testStatus !== null && testStatus.hint !== ''
+            ? React.createElement('p', { className: 'dsh_arm_hint' }, testStatus.hint)
+            : null,
+          testStatus !== null && testStatus.note !== ''
+            ? React.createElement('p', { className: 'dsh_arm_hint' }, testStatus.note)
+            : null,
+          testStatus !== null && testStatus.detail !== ''
+            ? React.createElement('p', { className: 'dsh_arm_testDetail' }, testStatus.detail)
+            : null,
+        ),
+      ),
+
       loading
         ? React.createElement('p', { className: 'dsh_arm_status', role: 'status' }, t('loading'))
         : null,
@@ -1048,7 +1709,21 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     );
   }
 
-  function apply(ctx: ClientContext): void {
+  /**
+   * Mount this package's `./remote` contribution, then register the settings
+   * body and its independent saved-route test endpoint.
+   *
+   * The browser bundle requires the contribution's package-local module (the
+   * generated prelude registers it from the same contract source), mounts it
+   * through `ctx.remote.$mount()`, and reads the namespaced endpoint back by its
+   * Cordis service key. The settings body stays usable if the optional endpoint
+   * cannot mount: the page then states that the test is unavailable instead of
+   * losing the form.
+   *
+   * @param ctx - browser plugin context.
+   * @returns disposer withdrawing the UI before the Remote namespace.
+   */
+  async function apply(ctx: ClientContext): Promise<(() => Promise<void>) | void> {
     adoptStyles();
     const slots = ctx.get('slots');
     const locale = ctx.get('locale');
@@ -1058,12 +1733,49 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     ctx.effect(() => locale.register(NS, { zh, en }), 'auto-review-model: dictionaries');
     const t = locale.bind(NS);
 
-    slots.inject('plugins.bundle.config', () => slots.register({
-      name: 'plugins.bundle.config',
-      key: BUNDLE,
-      locale: NS,
-      inject: () => ({ t, remote }),
-    }, ReviewerModelConfig));
+    const contributionModule = require(REMOTE_CONTRIBUTION_SPECIFIER) as {
+      TYPERT_REMOTE?: RemoteContributionLike;
+    };
+    const contribution = contributionModule === null || contributionModule === undefined
+      ? undefined
+      : contributionModule.TYPERT_REMOTE;
+    let unmountRemote: (() => Promise<void>) | undefined;
+    let testRoute: TestRouteEndpoint | undefined;
+    if (
+      contribution !== null
+      && contribution !== undefined
+      && typeof contribution === 'object'
+      && typeof remote.$mount === 'function'
+    ) {
+      try {
+        unmountRemote = await remote.$mount(contribution);
+        testRoute = ctx.get('remote.autoReviewModel') as TestRouteEndpoint | undefined;
+      } catch {
+        // Graceful degradation: keep the settings form and say the test is
+        // unavailable rather than failing the whole configuration body.
+        unmountRemote = undefined;
+        testRoute = undefined;
+      }
+    }
+
+    const registerBody = (child: ClientContext): (() => void) | void => {
+      const childSlots = child.get('slots');
+      if (!childSlots) return;
+      childSlots.inject('plugins.bundle.config', () => childSlots.register({
+        name: 'plugins.bundle.config',
+        key: BUNDLE,
+        locale: NS,
+        inject: () => ({ t, remote, testRoute }),
+      }, ReviewerModelConfig));
+    };
+    const fiber = typeof ctx.inject === 'function'
+      ? ctx.inject(['slots', 'locale'], registerBody)
+      : undefined;
+    if (fiber === undefined) registerBody(ctx);
+    return async () => {
+      if (fiber !== undefined) await fiber.dispose();
+      if (unmountRemote !== undefined) await unmountRemote();
+    };
   }
 
   const inject = ['slots', 'locale', 'remote', 'remote.settings', 'remote.session'];
@@ -1072,6 +1784,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
   const __testing = {
     NS,
     BUNDLE,
+    REMOTE_CONTRIBUTION_SPECIFIER,
     DEFAULT_SETTINGS,
     normalizeSettings,
     namespaceSection,
@@ -1084,6 +1797,19 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     summaryLine,
     loadReviewerSettings,
     saveReviewerSettings,
+    // Saved-route test helpers (localized text composition only; no prose path).
+    formatText,
+    savedRouteText,
+    savedRouteHintText,
+    delayText,
+    mapTestResult,
+    mapTestTransportFailure,
+    mapTestUnknownResult,
+    safeErrorCode,
+    testedRouteText,
+    testStatusClass,
+    TEST_MESSAGE_KEYS,
+    TEST_HINT_KEYS,
   };
 
   exports.apply = apply;

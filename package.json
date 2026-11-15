@@ -21,6 +21,14 @@
     ".": "./lib/index.js",
     "./policy": "./lib/policy.js",
     "./client": "./client/client.js",
+    "./typert": {
+      "types": "./lib/typert.host.d.ts",
+      "default": "./lib/typert.host.js"
+    },
+    "./remote": {
+      "types": "./lib/typert.remote-client.d.ts",
+      "default": "./lib/typert.remote-client.js"
+    },
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
@@ -28,6 +36,7 @@
     "lib",
     "client",
     "src",
+    "scripts/build-client.cjs",
     "tsconfig.json",
     "tsconfig.client.json",
     "cordis.patch.yml",
@@ -36,10 +45,10 @@
     "README.zh.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json",
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/build-client.cjs",
     "build:tests": "tsc -p tsconfig.tests.json",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit && tsc -p tsconfig.tests.json --noEmit",
-    "check": "node --check lib/index.js && node --check lib/policy.js && node --check client/client.js",
+    "check": "node --check lib/index.js && node --check lib/policy.js && node --check lib/route-test.js && node --check lib/typert.host.js && node --check lib/typert.remote-client.js && node --check lib/typert.contract.js && node --check client/client.js",
     "test": "npm run build && npm run build:tests && node --test .build/tests/*.test.js",
     "verify": "npm run build && npm run build:tests && node .build/scripts/verify.js"
   },

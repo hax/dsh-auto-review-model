@@ -20,11 +20,21 @@
  * that names the exact route and repair steps; the failed lookup is not cached
  * and the review never silently degrades to the provider's default effort.
  *
+ * The same plugin instance publishes one small Typert Remote endpoint,
+ * `autoReviewModel/testReviewRoute`, so the settings page can probe the SAVED
+ * reviewer route with one fixed harmless prompt. The endpoint reads the live
+ * settings itself, accepts no browser-provided route or credential, sends no
+ * session id, purpose, tools, or conversation history, returns a classified
+ * outcome instead of model output, and throttles probes Host-wide. Its
+ * manifest and Client contribution are hand-written generated-style artifacts
+ * in `./typert.host.js` / `./typert.remote-client.js`.
+ *
  * @module @aghost-prj/dsh-auto-review-model
  */
 import z from '@deepseek-ai/schemastery';
 import { effortCacheKey, isAutoReviewRequest, normalizeEffort, readReviewerSettings, shouldOverrideRoute } from './policy.js';
 import type { ReviewerConfig } from './policy.js';
+import { installRouteTestEndpoint } from './route-test.js';
 /** One adapter-owned reasoning effort advertised for an exact route. */
 interface LlmEffortInfo {
     id?: string;
@@ -42,12 +52,23 @@ interface GenerateOptions {
     system?: string;
     reasoningEffort?: string;
     signal?: AbortSignal;
-    [key: string]: unknown;
+}
+/** One adapter-provided configurable-provider directory entry (subset). */
+interface ConfigurableProviderInfo {
+    provider: string;
+    displayName?: string;
+    settingsNs?: string;
+    nativeAuth?: {
+        env?: readonly string[];
+        oauth?: boolean;
+    };
 }
 /** The subset of the `llm` service used by this plugin. */
 interface LlmService {
     stream(options: GenerateOptions): AsyncIterable<unknown>;
     resolveModelInfo(provider: string, model: string, signal?: AbortSignal): Promise<LlmModelInfo | undefined>;
+    /** Adapter-provided provider metadata; present on the real `LlmRuntime`. */
+    listConfigurableProviders?(): readonly ConfigurableProviderInfo[];
 }
 /** Cordis listener options used by this plugin's waterfall registration. */
 interface ListenerOptions {
@@ -67,6 +88,11 @@ interface HostContext {
     inject(services: readonly string[], callback: (child: {
         sessionLogDeepSeek: SessionLogDeepSeek;
     }) => void): unknown;
+    /**
+     * Publish one Cordis service for this plugin's lifetime (used to expose the
+     * saved-route test endpoint object the Typert Gateway dispatches to).
+     */
+    provide(name: string, value: unknown): unknown;
 }
 /** Loader line id used by the host entry. */
 export declare const name = "auto-review-model";
@@ -132,5 +158,33 @@ export declare const __testing: {
     effortCacheKey: typeof effortCacheKey;
     CAPABILITY_TIMEOUT_MS: number;
     ReviewerCapabilityError: typeof ReviewerCapabilityError;
+    /** Saved-route probe helpers exported by `./route-test.js` for Host tests. */
+    routeTest: {
+        ROUTE_TEST_TIMEOUT_MS: number;
+        ROUTE_TEST_MIN_INTERVAL_MS: number;
+        ROUTE_TEST_WINDOW_MS: number;
+        ROUTE_TEST_MAX_PER_WINDOW: number;
+        ROUTE_TEST_MAX_TOKENS: number;
+        ROUTE_TEST_TEMPERATURE: number;
+        ROUTE_TEST_MAX_OUTPUT_CHARS: number;
+        ROUTE_TEST_MAX_OUTPUT_CHUNKS: number;
+        ROUTE_TEST_CLOSE_GRACE_MS: number;
+        ROUTE_TEST_SYSTEM_PROMPT: string;
+        ROUTE_TEST_USER_PROMPT: string;
+        ROUTE_TEST_DETAILS: Readonly<Record<"OK" | "ROUTE_DISABLED" | "ROUTE_INCOMPLETE" | "BUSY" | "RATE_LIMITED" | "CANCELLED" | "TIMEOUT" | "NO_ADAPTER" | "UNKNOWN_MODEL" | "MODEL_UNSUPPORTED" | "MISSING_CREDENTIAL" | "INVALID_CREDENTIAL" | "NO_CREDENTIAL_STORE" | "AUTH" | "ACCOUNT_SIGN_IN_REQUIRED" | "ACCOUNT_AUTH_FAILED" | "ACCOUNT_CONNECTION" | "CONNECTION" | "RATE_LIMIT" | "QUOTA" | "CONTEXT_WINDOW_EXCEEDED" | "UNSUPPORTED_REASONING_EFFORT" | "EMPTY_RESPONSE" | "UNKNOWN", string>>;
+        REMOTE_SERVICE_KEY: string;
+        REMOTE_NAMESPACE: string;
+        createRouteTestState: typeof import("./route-test.js").createRouteTestState;
+        checkRouteTestThrottle: typeof import("./route-test.js").checkRouteTestThrottle;
+        markRouteTestStarted: typeof import("./route-test.js").markRouteTestStarted;
+        classifyRouteTestFailure: typeof import("./route-test.js").classifyRouteTestFailure;
+        classifyRouteTestProvider: typeof import("./route-test.js").classifyRouteTestProvider;
+        normalizeFailureCode: typeof import("./route-test.js").normalizeFailureCode;
+        readThrownFailure: typeof import("./route-test.js").readThrownFailure;
+        readFinishFailure: typeof import("./route-test.js").readFinishFailure;
+        buildRouteTestRequest: typeof import("./route-test.js").buildRouteTestRequest;
+        routeTestStatusOf: typeof import("./route-test.js").routeTestStatusOf;
+        installRouteTestEndpoint: typeof installRouteTestEndpoint;
+    };
 };
 export {};

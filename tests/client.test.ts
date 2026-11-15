@@ -58,6 +58,7 @@ const fakeReact: ReactLike = {
 
 interface ModuleLoaderEntry {
   id: string;
+  chunk?: string;
   factory: (require: (specifier: string) => unknown) => Record<string, unknown>;
 }
 
@@ -68,13 +69,13 @@ interface WindowLike {
   [key: string]: unknown;
 }
 
-/** Captures the single bundle registration performed while importing the file. */
-let capturedEntry: ModuleLoaderEntry | null = null;
+/** Bundle registrations performed while importing the file: the ./remote chunk first, then the main factory. */
+const registrations: ModuleLoaderEntry[] = [];
 
 (globalThis as unknown as { window: WindowLike }).window = {
   __ModuleLoader__: {
     load(entry: ModuleLoaderEntry): void {
-      capturedEntry = entry;
+      registrations.push(entry);
     },
   },
 };
@@ -142,6 +143,7 @@ type LoadResult = LoadResultOk | LoadResultErr;
 interface ClientTesting {
   NS: string;
   BUNDLE: string;
+  REMOTE_CONTRIBUTION_SPECIFIER: string;
   DEFAULT_SETTINGS: ReviewerSettings;
   normalizeSettings(raw?: unknown): ReviewerSettings;
   namespaceSection(value: unknown): unknown;
@@ -154,10 +156,38 @@ interface ClientTesting {
   summaryLine(draft: ReviewerSettings, loading: boolean, t: (key: string) => string): string;
   loadReviewerSettings(remote: unknown, ns: string): Promise<LoadResult>;
   saveReviewerSettings(remote: unknown, ns: string, draft: unknown, revision?: number): Promise<RemoteResponse>;
+  formatText(template: string, values: Record<string, string>): string;
+  savedRouteText(saved: ReviewerSettings, t: (key: string) => string): string;
+  savedRouteHintText(
+    saved: ReviewerSettings,
+    dirty: boolean,
+    available: boolean,
+    loaded: boolean,
+    t: (key: string) => string,
+  ): string;
+  delayText(milliseconds: number, fallbackSeconds: number, t: (key: string) => string): string;
+  mapTestResult(result: unknown, t: (key: string) => string): TestOutcome;
+  mapTestTransportFailure(error: unknown, t: (key: string) => string): TestOutcome;
+  mapTestUnknownResult(t: (key: string) => string): TestOutcome;
+  safeErrorCode(error: unknown): string;
+  testedRouteText(result: unknown): string;
+  testStatusClass(tone: string): string;
+  TEST_MESSAGE_KEYS: Record<string, string>;
+  TEST_HINT_KEYS: Record<string, string>;
+}
+
+/** Localized outcome shape returned by the client test helpers. */
+interface TestOutcome {
+  tone: 'ok' | 'warning' | 'error' | 'blocked';
+  message: string;
+  route: string;
+  hint: string;
+  detail: string;
+  note: string;
 }
 
 interface ClientExports {
-  apply(ctx: unknown): void;
+  apply(ctx: unknown): Promise<(() => Promise<void>) | void> | void;
   inject: string[];
   name: string;
   __testing: ClientTesting;
@@ -172,14 +202,24 @@ test.before(() => {
     null,
     `client failed to import: ${importError?.stack ?? ''}`,
   );
-  assert.ok(capturedEntry, 'client did not call window.__ModuleLoader__.load');
-  const entry = capturedEntry as ModuleLoaderEntry;
-  assert.equal(entry.id, '@aghost-prj/dsh-auto-review-model');
-  assert.equal(typeof entry.factory, 'function');
-  client = entry.factory((specifier: string): unknown => {
-    assert.equal(specifier, 'react', 'the bundle may only require react');
-    return fakeReact;
-  }) as unknown as ClientExports;
+  assert.equal(registrations.length, 2, 'the bundle must register the ./remote chunk and the main factory');
+  const chunkEntry = registrations.find((entry) => entry.chunk !== undefined);
+  const mainEntry = registrations.find((entry) => entry.id === '@aghost-prj/dsh-auto-review-model' && entry.chunk === undefined);
+  assert.ok(chunkEntry, 'the generated prelude must register the ./remote contribution chunk');
+  assert.ok(mainEntry, 'the bundle must register its main factory');
+  assert.equal(typeof mainEntry.factory, 'function');
+  const factories = new Map<string, ModuleLoaderEntry['factory']>();
+  for (const entry of registrations) {
+    const id = entry.chunk === undefined ? entry.id : `${entry.id}/${entry.chunk}`;
+    factories.set(id, entry.factory);
+  }
+  const requireFromTable = (specifier: string): unknown => {
+    if (specifier === 'react') return fakeReact;
+    const factory = factories.get(specifier);
+    if (factory === undefined) throw new Error(`module table missed ${specifier}`);
+    return factory(requireFromTable);
+  };
+  client = mainEntry.factory(requireFromTable) as unknown as ClientExports;
 });
 
 function testing(): ClientTesting {
@@ -239,9 +279,24 @@ test('exports the plugin surface expected by the client loader', () => {
     'summaryLine',
     'loadReviewerSettings',
     'saveReviewerSettings',
+    'formatText',
+    'savedRouteText',
+    'savedRouteHintText',
+    'delayText',
+    'mapTestResult',
+    'mapTestTransportFailure',
+    'mapTestUnknownResult',
+    'testStatusClass',
   ] as const) {
     assert.equal(typeof client.__testing[helper], 'function', `__testing.${helper} is missing`);
   }
+  assert.equal(
+    client.__testing.REMOTE_CONTRIBUTION_SPECIFIER,
+    '@aghost-prj/dsh-auto-review-model/client.remote.js',
+    'the bundle must require its own ./remote contribution module',
+  );
+  assert.ok(client.__testing.TEST_MESSAGE_KEYS.OK === 'testOkMessage');
+  assert.ok(client.__testing.TEST_HINT_KEYS.ACCOUNT_SIGN_IN_REQUIRED === 'testAccountSignInHint');
 });
 
 interface Registration {
@@ -249,23 +304,50 @@ interface Registration {
     name: string;
     key: string;
     locale: string;
-    inject: () => { t: unknown; remote: unknown };
+    inject: () => { t: unknown; remote: unknown; testRoute?: unknown };
   };
   render: unknown;
 }
 
+/** One fake saved-route test endpoint and its recorded calls. */
+interface FakeEndpoint {
+  calls: number;
+  lastSignal: AbortSignal | undefined;
+  testReviewRoute(signal?: AbortSignal): Promise<{ ok: boolean; value?: unknown; error?: unknown }>;
+}
+
+interface ApplyHarnessOptions {
+  /** Make the fake `remote.$mount` reject, exercising graceful degradation. */
+  mountFails?: boolean;
+  /** Response returned by the fake mounted endpoint. */
+  response?: { ok: boolean; value?: unknown; error?: unknown };
+}
+
 /**
- * Fake Cordis context plus slots/locale/remote services. `slots.inject` is
- * invoked synchronously, matching how the settings page installs keyed
- * contributions.
+ * Fake Cordis context plus slots/locale/remote services. `slots.inject` and
+ * `ctx.inject` are invoked synchronously, matching how the settings page
+ * installs keyed contributions, and every mount/inject/dispose step is recorded
+ * so ordering and cleanup can be asserted.
  */
-function createApplyHarness() {
+function createApplyHarness(options: ApplyHarnessOptions = {}) {
   const registrations: Registration[] = [];
   const injectedKeys: string[] = [];
+  const injectedDeps: string[][] = [];
   const localeRegistrations: { ns: string; dictionaries: unknown }[] = [];
   const localeBinds: string[] = [];
   const effects: (string | undefined)[] = [];
+  const events: string[] = [];
+  const mounted: unknown[] = [];
   const t = (key: string) => `t:${key}`;
+  const endpoint: FakeEndpoint = {
+    calls: 0,
+    lastSignal: undefined,
+    async testReviewRoute(signal?: AbortSignal) {
+      endpoint.calls += 1;
+      endpoint.lastSignal = signal;
+      return options.response ?? { ok: true, value: validTestResult() };
+    },
+  };
   const remote = {
     settings: {
       describe: async () => ({ ok: true, value: { namespaces: [] } }),
@@ -273,6 +355,16 @@ function createApplyHarness() {
     },
     session: {
       modelCatalog: async () => ({ ok: true, value: { groups: [] } }),
+    },
+    async $mount(contribution: unknown) {
+      events.push('mount');
+      mounted.push(contribution);
+      if (options.mountFails === true) throw new Error('endpoint mount failed');
+      services['remote.autoReviewModel'] = endpoint;
+      return async () => {
+        events.push('unmount');
+        delete services['remote.autoReviewModel'];
+      };
     },
   };
   const slots = {
@@ -303,6 +395,11 @@ function createApplyHarness() {
     'remote.settings': remote.settings,
     'remote.session': remote.session,
   };
+  const childContext = {
+    get(service: string) {
+      return services[service];
+    },
+  };
   const ctx = {
     get(service: string) {
       return services[service];
@@ -312,22 +409,64 @@ function createApplyHarness() {
       const result = callback();
       return typeof result === 'function' ? result : () => {};
     },
+    inject(deps: readonly string[], callback: (child: typeof childContext) => unknown) {
+      events.push('inject');
+      injectedDeps.push([...deps]);
+      const disposer = callback(childContext);
+      return {
+        dispose() {
+          events.push('ui-dispose');
+          if (typeof disposer === 'function') disposer();
+        },
+      };
+    },
   };
   return {
     ctx,
     remote,
     t,
+    endpoint,
     registrations,
     injectedKeys,
+    injectedDeps,
     localeRegistrations,
     localeBinds,
     effects,
+    events,
+    mounted,
   };
 }
 
-test('apply registers the auto-review bundle configuration page', () => {
+/** Healthy saved-route test result used by the fake endpoint. */
+function validTestResult(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    status: 'ok',
+    code: 'OK',
+    route: { provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' },
+    authKind: 'api-key',
+    providerName: 'Provider A',
+    settingsNs: 'provider-a',
+    credentialEnv: ['PROVIDER_A_API_KEY'],
+    effortUsed: 'high',
+    effortNotAdvertised: false,
+    latencyMs: 42,
+    retryAfterMs: 0,
+    failureCode: '',
+    detail: '',
+    ...overrides,
+  };
+}
+
+test('apply mounts the ./remote contribution and registers the configuration page', async () => {
   const harness = createApplyHarness();
-  client.apply(harness.ctx);
+  const dispose = await client.apply(harness.ctx);
+
+  assert.deepEqual(harness.events.slice(0, 2), ['mount', 'inject'], 'apply must mount the endpoint before registering the UI');
+  assert.equal(harness.mounted.length, 1, 'apply must mount exactly one contribution');
+  const contribution = harness.mounted[0] as { package?: string; descriptors?: unknown[] };
+  assert.equal(contribution.package, '@aghost-prj/dsh-auto-review-model');
+  assert.ok(Array.isArray(contribution.descriptors) && contribution.descriptors.length === 1);
+  assert.deepEqual(harness.injectedDeps[0], ['slots', 'locale']);
 
   assert.ok(
     harness.injectedKeys.includes('plugins.bundle.config'),
@@ -344,6 +483,7 @@ test('apply registers the auto-review bundle configuration page', () => {
   const injected = registration.meta.inject();
   assert.equal(injected.t, harness.t);
   assert.equal(injected.remote, harness.remote);
+  assert.equal(injected.testRoute, harness.endpoint, 'the settings body must receive the mounted endpoint');
 
   assert.ok(
     harness.localeRegistrations.some(({ ns }) => ns === SETTINGS_NS),
@@ -365,6 +505,209 @@ test('apply registers the auto-review bundle configuration page', () => {
   assert.equal(zhKeys.includes('summaryModelFallback'), false, 'dead key summaryModelFallback must be removed');
   assert.ok(zhKeys.includes('unverified'), 'unverified key must exist');
   assert.ok(zhKeys.includes('notAdvertised'), 'notAdvertised key must exist');
+
+  // Resource cleanup: UI first, then the mounted Remote namespace.
+  assert.equal(typeof dispose, 'function');
+  await (dispose as () => Promise<void>)();
+  assert.deepEqual(harness.events.slice(-2), ['ui-dispose', 'unmount'], 'disposal must withdraw the UI before the Remote namespace');
+});
+
+test('apply keeps the settings body usable when the endpoint cannot mount', async () => {
+  const harness = createApplyHarness({ mountFails: true });
+  const dispose = await client.apply(harness.ctx);
+
+  assert.equal(harness.mounted.length, 1, 'apply attempts the mount');
+  assert.equal(harness.registrations.length, 1, 'the settings body must still be registered');
+  const injected = harness.registrations[0].meta.inject();
+  assert.equal(injected.testRoute, undefined, 'no endpoint is exposed when the mount failed');
+  assert.equal(typeof dispose, 'function', 'apply still returns a disposer');
+  await (dispose as () => Promise<void>)();
+  assert.ok(!harness.events.includes('unmount'), 'nothing is unmounted when the mount failed');
+});
+
+test('savedRouteText names the saved route instead of the draft', () => {
+  const { savedRouteText } = testing();
+  const t = (key: string) => `[${key}]`;
+  assert.equal(
+    savedRouteText({ enabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: '' }, t),
+    'provider-a / model-a1',
+  );
+  assert.equal(
+    savedRouteText({ enabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' }, t),
+    'provider-a / model-a1 · high',
+  );
+  assert.equal(
+    savedRouteText({ enabled: false, provider: 'provider-a', model: 'model-a1', reasoningEffort: '' }, t),
+    '[testRouteDisabled]',
+  );
+  assert.equal(
+    savedRouteText({ enabled: true, provider: 'provider-a', model: '', reasoningEffort: '' }, t),
+    '[testRouteIncomplete]',
+  );
+});
+
+test('savedRouteHintText always states that the saved route is tested', () => {
+  const { savedRouteHintText } = testing();
+  const t = (key: string) => (key === 'testHint' ? 'the saved route {route}' : `[${key}]`);
+  const saved = { enabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' };
+  assert.equal(
+    savedRouteHintText(saved, false, true, true, t),
+    'the saved route provider-a / model-a1 · high',
+  );
+  const dirty = savedRouteHintText(saved, true, true, true, t);
+  assert.ok(dirty.includes('[testHintDirty]'), 'a dirty draft must say it is not tested');
+  assert.equal(savedRouteHintText(saved, false, false, true, t), '[testUnavailableHint]');
+  assert.equal(savedRouteHintText(saved, false, true, false, t), '[testLoadingHint]');
+});
+
+test('formatText interpolates route facts and leaves unknown placeholders alone', () => {
+  const { formatText } = testing();
+  assert.equal(formatText('a {provider} b {env}', { provider: 'p', env: 'E' }), 'a p b E');
+  assert.equal(formatText('{unknown}', {}), '{unknown}');
+  assert.equal(formatText('static', { provider: 'p' }), 'static');
+});
+
+test('mapTestResult localizes successes and failures with actionable hints', () => {
+  const { mapTestResult } = testing();
+  // Fake dictionary carrying the placeholders the real locale templates use.
+  const templates: Record<string, string> = {
+    testOkHint: '',
+    testSeconds: '{seconds}s',
+    testNoEnvVar: 'THE_PROVIDER_SETTING',
+    testDetail: 'Detail',
+    testAccountSignInHint: 'Open Settings → DeepSeek Account and sign in ({provider})',
+    testMissingCredentialHint: 'Add a credential for {provider} ({env})',
+    testInvalidCredentialHint: 'Correct the credential for {provider}',
+    testTimeoutHint: 'Check the network for {provider}',
+    testUnknownHint: 'Review the detail',
+    testRateLimitedHint: 'Wait for the provider rate limit to reset',
+    testFailureCode: 'Failure code',
+    testTransportHint: 'Retry the test',
+    testEffortNote: 'The saved effort {effort} is not advertised',
+  };
+  const t = (key: string): string => (key in templates ? templates[key] : `[${key}]`);
+
+  const ok = mapTestResult(validTestResult(), t);
+  assert.equal(ok.tone, 'ok');
+  assert.equal(ok.message, '[testOkMessage]');
+  assert.equal(ok.hint, '');
+  assert.equal(ok.detail, '');
+  assert.equal(ok.note, '');
+
+  const account = mapTestResult(validTestResult({
+    status: 'error',
+    code: 'ACCOUNT_SIGN_IN_REQUIRED',
+    authKind: 'account',
+    providerName: 'DeepSeek Account',
+    credentialEnv: [],
+  }), t);
+  assert.equal(account.tone, 'error');
+  assert.equal(account.message, '[testAccountSignInMessage]');
+  assert.match(account.hint, /DeepSeek Account/);
+  assert.match(account.hint, /\(DeepSeek Account\)/);
+
+  const missing = mapTestResult(validTestResult({
+    status: 'error',
+    code: 'MISSING_CREDENTIAL',
+    credentialEnv: ['PROVIDER_A_API_KEY'],
+  }), t);
+  assert.equal(missing.message, '[testMissingCredentialMessage]');
+  assert.match(missing.hint, /Provider A/);
+  assert.match(missing.hint, /PROVIDER_A_API_KEY/);
+
+  const diagnosed = mapTestResult(validTestResult({
+    status: 'error',
+    code: 'AUTH',
+    failureCode: 'HTTP_401',
+    detail: 'Host advisory sentence that must not be duplicated',
+  }), t);
+  assert.match(diagnosed.detail, /HTTP_401/);
+  assert.ok(!diagnosed.detail.includes('Host advisory sentence'), 'classified outcomes must not duplicate host prose');
+
+  const invalid = mapTestResult(validTestResult({ status: 'error', code: 'INVALID_CREDENTIAL' }), t);
+  assert.equal(invalid.message, '[testInvalidCredentialMessage]');
+  assert.match(invalid.hint, /Provider A/);
+
+  const noAdapter = mapTestResult(validTestResult({ status: 'error', code: 'NO_ADAPTER' }), t);
+  assert.equal(noAdapter.message, '[testNoAdapterMessage]');
+
+  const throttled = mapTestResult(validTestResult({
+    status: 'blocked',
+    code: 'RATE_LIMITED',
+    retryAfterMs: 4000,
+  }), t);
+  assert.equal(throttled.tone, 'blocked');
+  assert.match(throttled.hint, /provider rate limit/);
+  assert.ok(ok.route.includes('Provider A'), 'the outcome must name the tested route');
+  assert.equal(ok.route, 'Provider A / model-a1 · high');
+
+  const timedOut = mapTestResult(validTestResult({ status: 'error', code: 'TIMEOUT' }), t);
+  assert.equal(timedOut.message, '[testTimeoutMessage]');
+  assert.match(timedOut.hint, /Check the network for Provider A/);
+
+  const unknown = mapTestResult(validTestResult({ code: 'SOMETHING_NEW', status: 'error' }), t);
+  assert.equal(unknown.message, '[testUnknownMessage]');
+  assert.equal(unknown.hint, 'Review the detail');
+
+  // The note explains the saved-effort fallback without changing the tone.
+  const fallback = mapTestResult(validTestResult({
+    effortUsed: '',
+    effortNotAdvertised: true,
+    route: { provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' },
+  }), t);
+  assert.equal(fallback.tone, 'ok');
+  assert.match(fallback.note, /high/);
+});
+
+test('mapTestResult never renders provider output as prose', () => {
+  const { mapTestResult } = testing();
+  const t = (key: string) => `[${key}]`;
+  const outcome = mapTestResult(validTestResult({
+    status: 'error',
+    code: 'UNKNOWN',
+    detail: 'provider returned 503',
+    prose: 'the model wrote this sentence',
+  }) as never, t);
+  const rendered = [outcome.message, outcome.hint, outcome.detail, outcome.note].join('\n');
+  assert.ok(!rendered.includes('the model wrote this sentence'), 'model prose must never be displayed');
+  assert.match(outcome.detail, /provider returned 503/);
+});
+
+test('mapTestTransportFailure and mapTestUnknownResult localize local failures', () => {
+  const { mapTestTransportFailure, mapTestUnknownResult, safeErrorCode } = testing();
+  const templates: Record<string, string> = {
+    testFailureCode: 'Failure code',
+    testTransportHint: 'Retry the test',
+  };
+  const t = (key: string): string => (key in templates ? templates[key] : `[${key}]`);
+
+  // Arbitrary error messages (which may contain credentials or URLs) never
+  // reach the page; only an identifier-shaped code does.
+  const transport = mapTestTransportFailure(new Error('offline sk-live-SECRET'), t);
+  assert.equal(transport.tone, 'error');
+  assert.equal(transport.message, '[testTransportFailed]');
+  assert.equal(transport.hint, 'Retry the test');
+  assert.equal(transport.detail, '');
+  assert.equal(transport.route, '');
+
+  const coded = mapTestTransportFailure({ code: 'gateway/cancelled', message: 'secret sk-live-X' }, t);
+  assert.equal(coded.detail, 'Failure code: gateway/cancelled');
+  assert.ok(!coded.detail.includes('sk-live-X'), 'error messages must not be rendered');
+  assert.equal(safeErrorCode({ code: 'a b' }), '');
+  assert.equal(safeErrorCode({ code: 'gateway/internal' }), 'gateway/internal');
+  assert.equal(safeErrorCode(undefined), '');
+
+  const unknown = mapTestUnknownResult(t);
+  assert.equal(unknown.message, '[testUnknownResult]');
+  assert.equal(unknown.tone, 'error');
+});
+
+test('client retry delay text is locale-driven', () => {
+  const { delayText } = testing();
+  const t = (key: string) => (key === 'testSeconds' ? '{seconds}s' : `[${key}]`);
+  assert.equal(delayText(4000, 30, t), '4s');
+  assert.equal(delayText(0, 5, t), '5s');
+  assert.equal(delayText(500, 30, t), '1s');
 });
 
 test('normalizeSettings supplies the four defaults for missing input', () => {

@@ -20,6 +20,15 @@
  * that names the exact route and repair steps; the failed lookup is not cached
  * and the review never silently degrades to the provider's default effort.
  *
+ * The same plugin instance publishes one small Typert Remote endpoint,
+ * `autoReviewModel/testReviewRoute`, so the settings page can probe the SAVED
+ * reviewer route with one fixed harmless prompt. The endpoint reads the live
+ * settings itself, accepts no browser-provided route or credential, sends no
+ * session id, purpose, tools, or conversation history, returns a classified
+ * outcome instead of model output, and throttles probes Host-wide. Its
+ * manifest and Client contribution are hand-written generated-style artifacts
+ * in `./typert.host.js` / `./typert.remote-client.js`.
+ *
  * @module @aghost-prj/dsh-auto-review-model
  */
 import z from '@deepseek-ai/schemastery';
@@ -31,6 +40,7 @@ import {
   shouldOverrideRoute,
 } from './policy.js';
 import type { ReviewerConfig, ReviewerSettings } from './policy.js';
+import { installRouteTestEndpoint, __testing as routeTestTesting } from './route-test.js';
 
 /** One adapter-owned reasoning effort advertised for an exact route. */
 interface LlmEffortInfo {
@@ -51,7 +61,17 @@ interface GenerateOptions {
   system?: string;
   reasoningEffort?: string;
   signal?: AbortSignal;
-  [key: string]: unknown;
+}
+
+/** One adapter-provided configurable-provider directory entry (subset). */
+interface ConfigurableProviderInfo {
+  provider: string;
+  displayName?: string;
+  settingsNs?: string;
+  nativeAuth?: {
+    env?: readonly string[];
+    oauth?: boolean;
+  };
 }
 
 /** The subset of the `llm` service used by this plugin. */
@@ -62,6 +82,8 @@ interface LlmService {
     model: string,
     signal?: AbortSignal,
   ): Promise<LlmModelInfo | undefined>;
+  /** Adapter-provided provider metadata; present on the real `LlmRuntime`. */
+  listConfigurableProviders?(): readonly ConfigurableProviderInfo[];
 }
 
 /** Cordis listener options used by this plugin's waterfall registration. */
@@ -87,6 +109,11 @@ interface HostContext {
     services: readonly string[],
     callback: (child: { sessionLogDeepSeek: SessionLogDeepSeek }) => void,
   ): unknown;
+  /**
+   * Publish one Cordis service for this plugin's lifetime (used to expose the
+   * saved-route test endpoint object the Typert Gateway dispatches to).
+   */
+  provide(name: string, value: unknown): unknown;
 }
 
 /** Loader line id used by the host entry. */
@@ -456,6 +483,14 @@ export function apply(ctx: HostContext, config: ReviewerConfig): void {
     },
     { global: true, prepend: true },
   );
+
+  // Publish the saved-route test endpoint as the `autoReviewModel` Cordis service
+  // this package's `./typert` manifest declares. The Typert Gateway dispatches
+  // `autoReviewModel/testReviewRoute` to it; the endpoint reads the same volatile
+  // settings as the listener and never writes them. `ctx.provide` is owned by this
+  // plugin's fiber, so unmounting the plugin withdraws both the service and the
+  // Typert registration (the Loader withdraws the latter with the entry).
+  installRouteTestEndpoint(ctx, config);
 }
 
 /** Stable surface for host tests; not part of the plugin contract. */
@@ -467,4 +502,6 @@ export const __testing = {
   effortCacheKey,
   CAPABILITY_TIMEOUT_MS,
   ReviewerCapabilityError,
+  /** Saved-route probe helpers exported by `./route-test.js` for Host tests. */
+  routeTest: routeTestTesting,
 };

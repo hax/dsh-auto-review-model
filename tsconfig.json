@@ -12,5 +12,12 @@
     "forceConsistentCasingInFileNames": true,
     "noEmitOnError": true
   },
-  "include": ["src/policy.ts", "src/index.ts"]
+  "include": [
+    "src/policy.ts",
+    "src/route-test.ts",
+    "src/typert.contract.ts",
+    "src/typert.host.ts",
+    "src/typert.remote-client.ts",
+    "src/index.ts"
+  ]
 }

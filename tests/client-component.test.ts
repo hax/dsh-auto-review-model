@@ -32,6 +32,7 @@ interface ReactLike {
 
 interface ModuleLoaderEntry {
   id: string;
+  chunk?: string;
   factory: (require: (specifier: string) => unknown) => Record<string, unknown>;
 }
 
@@ -42,11 +43,11 @@ interface WindowLike {
   [key: string]: unknown;
 }
 
-let capturedEntry: ModuleLoaderEntry | null = null;
+const registrations: ModuleLoaderEntry[] = [];
 (globalThis as unknown as { window: WindowLike }).window = {
   __ModuleLoader__: {
     load(entry: ModuleLoaderEntry): void {
-      capturedEntry = entry;
+      registrations.push(entry);
     },
   },
 };
@@ -159,7 +160,7 @@ function findNodeByClass(
 }
 
 interface ClientPluginExports {
-  apply(ctx: unknown): void;
+  apply(ctx: unknown): unknown;
   inject: string[];
   name: string;
   __testing: Record<string, any>;
@@ -169,11 +170,23 @@ let clientPlugin: ClientPluginExports;
 
 test.before(() => {
   assert.equal(importError, null, `client failed to import: ${importError?.stack ?? ''}`);
-  assert.ok(capturedEntry, 'client did not register bundle');
-  clientPlugin = capturedEntry.factory((specifier: string): unknown => {
-    assert.equal(specifier, 'react');
-    return driverReact;
-  }) as unknown as ClientPluginExports;
+  assert.equal(registrations.length, 2, 'the bundle must register the ./remote chunk and the main factory');
+  const mainEntry = registrations.find(
+    (entry) => entry.id === '@aghost-prj/dsh-auto-review-model' && entry.chunk === undefined,
+  );
+  assert.ok(mainEntry, 'client did not register its main factory');
+  const factories = new Map<string, ModuleLoaderEntry['factory']>();
+  for (const entry of registrations) {
+    const id = entry.chunk === undefined ? entry.id : `${entry.id}/${entry.chunk}`;
+    factories.set(id, entry.factory);
+  }
+  const requireFromTable = (specifier: string): unknown => {
+    if (specifier === 'react') return driverReact;
+    const factory = factories.get(specifier);
+    if (factory === undefined) throw new Error(`module table missed ${specifier}`);
+    return factory(requireFromTable);
+  };
+  clientPlugin = mainEntry.factory(requireFromTable) as unknown as ClientPluginExports;
 });
 
 interface SetupTestEnvOptions {
@@ -187,9 +200,60 @@ interface SetupTestEnvOptions {
   catalogAvailable?: boolean;
   catalogGroups?: any[];
   lang?: 'zh' | 'en';
+  /** Response returned by the mounted saved-route test endpoint. */
+  testResponse?: { ok: boolean; value?: unknown; error?: unknown };
+  /** Simulate the Remote endpoint failing to mount (optional action unavailable). */
+  endpointUnavailable?: boolean;
+  /** Simulate the Remote call itself rejecting. */
+  testRejects?: boolean;
+  /** Hold the Remote call open until this promise settles (independent testing state). */
+  testPending?: Promise<{ ok: boolean; value?: unknown; error?: unknown }>;
 }
 
-function setupComponent(options: SetupTestEnvOptions = {}) {
+/** Healthy wire result of one saved-route probe. */
+function testResult(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    status: 'ok',
+    code: 'OK',
+    route: { provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' },
+    authKind: 'api-key',
+    providerName: 'Provider A',
+    settingsNs: 'provider-a',
+    credentialEnv: ['PROVIDER_A_API_KEY'],
+    effortUsed: 'high',
+    effortNotAdvertised: false,
+    latencyMs: 42,
+    retryAfterMs: 0,
+    failureCode: '',
+    detail: '',
+    ...overrides,
+  };
+}
+
+/**
+ * Reject with the caller's signal as soon as it aborts, like a real Remote call.
+ * The pending promise still settles later, but its result is ignored.
+ */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason ?? new Error('aborted'));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason ?? new Error('aborted'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function setupComponent(options: SetupTestEnvOptions = {}) {
   resetDriver();
   const saved = {
     enabled: true,
@@ -202,6 +266,27 @@ function setupComponent(options: SetupTestEnvOptions = {}) {
   const writes: any[] = [];
   let currentSettings = { ...saved };
   let currentRevision = revision;
+
+  const endpoint = {
+    calls: [] as Array<{ signal?: AbortSignal }>,
+    /** Signals passed by the component, one per probe call. */
+    signals: [] as Array<AbortSignal | undefined>,
+    /** Reasons collected from abort events, proving the probe was cancelled. */
+    aborts: [] as unknown[],
+    async testReviewRoute(signal?: AbortSignal) {
+      endpoint.calls.push({ signal });
+      endpoint.signals.push(signal);
+      if (signal !== undefined) {
+        signal.addEventListener('abort', () => {
+          endpoint.aborts.push(signal.reason);
+        }, { once: true });
+      }
+      if (options.testPending !== undefined) return await raceAbort(options.testPending, signal);
+      if (options.testRejects === true) throw new Error('remote call failed');
+      return options.testResponse ?? { ok: true, value: testResult() };
+    },
+  };
+  let mountedContributions = 0;
 
   const remote = {
     settings: {
@@ -263,6 +348,13 @@ function setupComponent(options: SetupTestEnvOptions = {}) {
         };
       },
     },
+    async $mount() {
+      mountedContributions += 1;
+      if (options.endpointUnavailable === true) throw new Error('endpoint unavailable');
+      return async () => {
+        mountedContributions -= 1;
+      };
+    },
   };
 
   const registeredLocale: Record<string, Record<string, string>> = {};
@@ -297,20 +389,31 @@ function setupComponent(options: SetupTestEnvOptions = {}) {
         };
       }
       if (name === 'remote') return remote;
+      if (name === 'remote.autoReviewModel') {
+        return options.endpointUnavailable === true ? undefined : endpoint;
+      }
       return undefined;
     },
     effect(cb: () => void) {
       cb();
     },
+    inject(_deps: readonly string[], cb: (child: unknown) => unknown) {
+      const disposer = cb(ctx);
+      return {
+        dispose() {
+          if (typeof disposer === 'function') disposer();
+        },
+      };
+    },
   };
 
-  clientPlugin.apply(ctx);
+  await clientPlugin.apply(ctx);
   const Component = slots[0].component;
 
   let lastTree: ReactElementLike | null = null;
   function render(view: 'page' | 'summary' = 'page'): ReactElementLike {
     hookIndex = 0;
-    lastTree = Component({ view, remote, t });
+    lastTree = Component({ view, remote, t, testRoute: options.endpointUnavailable === true ? undefined : endpoint });
     const pending = pendingEffects;
     pendingEffects = [];
     for (const effect of pending) effect();
@@ -324,15 +427,19 @@ function setupComponent(options: SetupTestEnvOptions = {}) {
 
   return {
     remote,
+    endpoint,
     writes,
     t,
     render,
     flush,
+    mountedContributions: () => mountedContributions,
+    /** Run the component's effect cleanups, as an actual unmount would. */
+    unmount: () => resetDriver(),
   };
 }
 
 test('unknown saved effort is displayed and preserved when model catalog fails', async () => {
-  const env = setupComponent({
+  const env = await setupComponent({
     savedSettings: {
       enabled: true,
       provider: 'provider-a',
@@ -432,7 +539,7 @@ test('unknown saved effort is displayed and preserved when model catalog fails',
 });
 
 test('unknown saved effort is displayed and preserved when model has no reasoning metadata or lacks effort', async () => {
-  const env = setupComponent({
+  const env = await setupComponent({
     savedSettings: {
       enabled: true,
       provider: 'provider-a',
@@ -479,7 +586,7 @@ test('unknown saved effort is displayed and preserved when model has no reasonin
 });
 
 test('user can explicitly clear an unknown effort to default when catalog fails', async () => {
-  const env = setupComponent({
+  const env = await setupComponent({
     savedSettings: {
       enabled: true,
       provider: 'provider-a',
@@ -517,7 +624,7 @@ test('user can explicitly clear an unknown effort to default when catalog fails'
 });
 
 test('saved non-empty effort with empty model can be explicitly cleared in UI', async () => {
-  const env = setupComponent({
+  const env = await setupComponent({
     savedSettings: {
       enabled: true,
       provider: 'provider-a',
@@ -580,7 +687,7 @@ test('saved non-empty effort with empty model can be explicitly cleared in UI', 
 });
 
 test('re-selecting current provider or model dropdown item is a no-op and preserves dirty state', async () => {
-  const env = setupComponent({
+  const env = await setupComponent({
     savedSettings: {
       enabled: true,
       provider: 'provider-a',
@@ -640,7 +747,7 @@ test('re-selecting current provider or model dropdown item is a no-op and preser
 });
 
 test('non-blocking notice is displayed when provider is non-empty but model is empty', async () => {
-  const env = setupComponent({
+  const env = await setupComponent({
     savedSettings: {
       enabled: true,
       provider: 'provider-a',
@@ -684,7 +791,7 @@ test('non-blocking notice is displayed when provider is non-empty but model is e
 });
 
 test('non-blocking notice localized in English', async () => {
-  const env = setupComponent({
+  const env = await setupComponent({
     savedSettings: {
       enabled: true,
       provider: 'provider-a',
@@ -708,7 +815,7 @@ test('non-blocking notice localized in English', async () => {
 });
 
 test('summaryLine correctly reports session model inherit when provider is set but model is empty', async () => {
-  const env = setupComponent({
+  const env = await setupComponent({
     savedSettings: {
       enabled: true,
       provider: 'provider-a',
@@ -739,7 +846,7 @@ test('summaryLine correctly reports session model inherit when provider is set b
 
 test('handles save, reload, discard and revision conflicts correctly', async () => {
   let conflictOnSave = true;
-  const env = setupComponent({
+  const env = await setupComponent({
     savedSettings: {
       enabled: true,
       provider: 'provider-a',
@@ -827,7 +934,7 @@ test('handles save, reload, discard and revision conflicts correctly', async () 
 test('handles save re-read failure with fallback to response snapshot and revision', async () => {
   for (const variant of ['viewRevision', 'responseRevision'] as const) {
     let reReadFails = false;
-    const env = setupComponent({
+    const env = await setupComponent({
       savedSettings: {
         enabled: true,
         provider: 'provider-a',
@@ -923,4 +1030,321 @@ test('handles save re-read failure with fallback to response snapshot and revisi
       `[${variant}] next save must carry revision recovered from response fallback (15)`,
     );
   }
+});
+
+/* ============================================================
+ * Saved review-route test action
+ * ============================================================ */
+
+/** Deferred promise helper for independent-state tests. */
+function createDeferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+/** A saved route the default fake catalog can represent. */
+const SAVED_ROUTE = {
+  enabled: true,
+  provider: 'provider-a',
+  model: 'model-a1',
+  reasoningEffort: 'high',
+} as const;
+
+/** Find one rendered string child that contains `fragment`. */
+function findTextNode(
+  nodes: Array<{ type: unknown; props: Record<string, any> }>,
+  fragment: string,
+): { type: unknown; props: Record<string, any> } | undefined {
+  return nodes.find((node) => {
+    const children = node.props?.children;
+    return typeof children === 'string' && children.includes(fragment);
+  });
+}
+
+test('saved-route test action is discoverable and always names the saved route', async () => {
+  const env = await setupComponent({ savedSettings: { ...SAVED_ROUTE } });
+  env.render();
+  let nodes = flattenNodes(await env.flush());
+
+  const section = findNodeByClass(nodes, 'dsh_arm_test');
+  assert.ok(section, 'the saved-route test section must be rendered on the settings page');
+
+  const testButton = findButton(nodes, env.t('test'));
+  assert.ok(testButton, 'the test button must be discoverable by its localized label');
+  assert.equal(testButton.type, 'button');
+  assert.equal(testButton.props.disabled, false, 'the test action must be available for a complete saved route');
+  assert.ok(
+    findTextNode(nodes, `${SAVED_ROUTE.provider} / ${SAVED_ROUTE.model} · ${SAVED_ROUTE.reasoningEffort}`),
+    'the hint must name the saved route',
+  );
+  assert.ok(
+    findTextNode(nodes, env.t('testHint').split('{')[0] ?? env.t('testHint')),
+    'the hint must explain that only the saved route is tested',
+  );
+
+  // Make the draft dirty: the hint must say the draft is not tested while the
+  // saved-route description stays the same.
+  const effortControl = nodes.find((node) => node.props?.label === env.t('effort'));
+  assert.ok(effortControl, 'effort control must exist');
+  effortControl.props.onChange('low');
+  env.render();
+  nodes = flattenNodes(await env.flush());
+
+  assert.ok(findTextNode(nodes, env.t('testHintDirty')), 'a dirty draft must be called out as not tested');
+  assert.ok(
+    findTextNode(nodes, `${SAVED_ROUTE.provider} / ${SAVED_ROUTE.model} · ${SAVED_ROUTE.reasoningEffort}`),
+    'the saved-route description must not follow the dirty draft',
+  );
+  assert.equal(
+    findButton(nodes, env.t('test'))?.props.disabled,
+    false,
+    'a dirty draft must still allow testing the saved route',
+  );
+});
+
+test('the saved-route test renders classified outcomes instead of model output', async () => {
+  const env = await setupComponent({
+    savedSettings: { ...SAVED_ROUTE },
+    testResponse: {
+      ok: true,
+      value: testResult({
+        status: 'error',
+        code: 'ACCOUNT_SIGN_IN_REQUIRED',
+        authKind: 'account',
+        providerName: 'DeepSeek Account',
+        credentialEnv: [],
+      }),
+    },
+  });
+  env.render();
+  let nodes = flattenNodes(await env.flush());
+  const testButton = findButton(nodes, env.t('test'));
+  assert.ok(testButton);
+  testButton.props.onClick();
+  nodes = flattenNodes(await env.flush());
+
+  assert.equal(env.endpoint.calls.length, 1, 'one click must issue one probe');
+  assert.ok(
+    env.endpoint.calls[0].signal instanceof AbortSignal,
+    'the component must pass its own cancellation signal to the Remote call',
+  );
+  assert.equal(env.endpoint.signals[0]?.aborted, false, 'the signal stays live while the probe runs');
+
+  const resultNode = findNodeByClass(nodes, 'dsh_arm_testError');
+  assert.ok(resultNode, 'a failed probe must render in the error tone');
+  assert.equal(
+    resultNode.props.children,
+    env.t('testResultPrefix') + ': ' + env.t('testAccountSignInMessage'),
+  );
+  assert.ok(
+    findTextNode(nodes, env.t('testAccountSignInHint').split('{')[0]),
+    'the account sign-in failure must render an actionable hint',
+  );
+  assert.equal(
+    nodes.some((node) => typeof node.props?.children === 'string' && node.props.children.includes('the model wrote')),
+    false,
+    'no model prose may be rendered',
+  );
+});
+
+test('credential failures render the provider and environment hint', async () => {
+  const env = await setupComponent({
+    savedSettings: { ...SAVED_ROUTE },
+    testResponse: {
+      ok: true,
+      value: testResult({
+        status: 'error',
+        code: 'MISSING_CREDENTIAL',
+        authKind: 'api-key',
+        providerName: 'Provider A',
+        credentialEnv: ['PROVIDER_A_API_KEY'],
+        failureCode: 'HTTP_401',
+        detail: 'Host advisory sentence that must not be duplicated',
+      }),
+    },
+  });
+  env.render();
+  const nodes = flattenNodes(await env.flush());
+  const testButton = findButton(nodes, env.t('test'));
+  testButton?.props.onClick();
+  const after = flattenNodes(await env.flush());
+  assert.ok(findTextNode(after, 'Provider A'), 'the hint must name the provider');
+  assert.ok(findTextNode(after, 'PROVIDER_A_API_KEY'), 'the hint must name the credential environment variable');
+  assert.ok(
+    findTextNode(after, env.t('testFailureCode') + ': HTTP_401'),
+    'the machine-shaped failure code must be shown as data',
+  );
+  assert.equal(
+    findTextNode(after, 'Host advisory sentence that must not be duplicated'),
+    undefined,
+    'classified outcomes must not duplicate untranslated host advice',
+  );
+});
+
+test('a transport failure is localized instead of showing raw prose', async () => {
+  const env = await setupComponent({ savedSettings: { ...SAVED_ROUTE }, testRejects: true });
+  env.render();
+  const nodes = flattenNodes(await env.flush());
+  findButton(nodes, env.t('test'))?.props.onClick();
+  const after = flattenNodes(await env.flush());
+  const failed = findNodeByClass(after, 'dsh_arm_testError');
+  assert.ok(failed);
+  assert.equal(failed.props.children, env.t('testResultPrefix') + ': ' + env.t('testTransportFailed'));
+  assert.ok(findTextNode(after, env.t('testTransportHint')), 'a transport failure must offer retry guidance');
+  assert.equal(
+    nodes.some((node) => typeof node.props?.children === 'string' && node.props.children.includes('remote call failed')),
+    false,
+    'arbitrary error messages must not be rendered',
+  );
+});
+
+test('the testing state is independent from save state and blocks duplicate probes', async () => {
+  const deferred = createDeferred<{ ok: boolean; value?: unknown }>();
+  const env = await setupComponent({
+    savedSettings: { ...SAVED_ROUTE },
+    testPending: deferred.promise,
+  });
+  env.render();
+  let nodes = flattenNodes(await env.flush());
+
+  // Dirty the draft so Save is enabled, then start a probe.
+  const effortControl = nodes.find((node) => node.props?.label === env.t('effort'));
+  assert.ok(effortControl);
+  effortControl.props.onChange('low');
+  env.render();
+  nodes = flattenNodes(await env.flush());
+  findButton(nodes, env.t('test'))?.props.onClick();
+  nodes = flattenNodes(await env.flush());
+
+  const busyButton = findButton(nodes, env.t('testing'));
+  assert.ok(busyButton, 'the probe button must show its own testing label');
+  assert.equal(busyButton?.props.disabled, true, 'the probe button must be disabled while testing');
+  const saveButton = findButton(nodes, env.t('save'));
+  assert.ok(saveButton, 'the save button must remain rendered');
+  assert.equal(
+    saveButton?.props.disabled,
+    false,
+    'the independent test state must not disable (or reuse) the save busy state',
+  );
+  const section = findNodeByClass(nodes, 'dsh_arm_section');
+  assert.ok(section);
+  assert.equal(
+    section.props['aria-busy'],
+    false,
+    'a saved-route probe must not mark the whole settings section busy',
+  );
+  const testRow = findNodeByClass(nodes, 'dsh_arm_test');
+  assert.ok(testRow);
+  assert.equal(testRow.props['aria-busy'], true, 'the probe row itself is busy while testing');
+  busyButton?.props.onClick();
+  busyButton?.props.onClick();
+  assert.equal(env.endpoint.calls.length, 1, 'repeated taps while testing must not issue more probes');
+
+  deferred.resolve({ ok: true, value: testResult() });
+  nodes = flattenNodes(await env.flush());
+  assert.ok(findButton(nodes, env.t('test')), 'the button must return to its idle label after the probe');
+  const okNode = findNodeByClass(nodes, 'dsh_arm_testOk');
+  assert.ok(okNode, 'a healthy probe must render in the success tone');
+});
+
+test('the test action is visibly unavailable when its endpoint did not mount', async () => {
+  const env = await setupComponent({ savedSettings: { ...SAVED_ROUTE }, endpointUnavailable: true });
+  env.render();
+  const nodes = flattenNodes(await env.flush());
+  const testButton = findButton(nodes, env.t('test'));
+  assert.ok(testButton);
+  assert.equal(testButton?.props.disabled, true, 'the test action must be disabled without a mounted endpoint');
+  assert.ok(findTextNode(nodes, env.t('testUnavailableHint')), 'the page must explain why the test is unavailable');
+});
+
+test('a pending probe result is dropped when the saved route changes', async () => {
+  const deferred = createDeferred<{ ok: boolean; value?: unknown }>();
+  const env = await setupComponent({
+    savedSettings: { ...SAVED_ROUTE },
+    testPending: deferred.promise,
+  });
+  env.render();
+  let nodes = flattenNodes(await env.flush());
+  findButton(nodes, env.t('test'))?.props.onClick();
+  nodes = flattenNodes(await env.flush());
+  assert.ok(findButton(nodes, env.t('testing')), 'the probe must still be in flight');
+
+  // Save a different reasoning effort for the SAME save cycle while the probe
+  // is pending; the saved route displayed by the form changes.
+  const effortControl = nodes.find((node) => node.props?.label === env.t('effort'));
+  assert.ok(effortControl);
+  effortControl.props.onChange('low');
+  env.render();
+  nodes = flattenNodes(await env.flush());
+  const saveButton = findButton(nodes, env.t('save'));
+  assert.ok(saveButton);
+  saveButton.props.onClick();
+  nodes = flattenNodes(await env.flush());
+  assert.ok(findNodeByClass(nodes, 'dsh_arm_testOk') === undefined);
+  // Saving a different saved route aborts the probe for the previous route.
+  assert.equal(env.endpoint.signals[0]?.aborted, true, 'a saved-route change must abort the pending probe');
+  assert.equal(env.endpoint.aborts.length, 1, 'the abort must reach the Remote call exactly once');
+  assert.ok(findButton(nodes, env.t('test')), 'the probe button must be idle again after the aborted probe');
+
+  // Route A's late answer must not be presented beside saved route B.
+  deferred.resolve({ ok: true, value: testResult() });
+  nodes = flattenNodes(await env.flush());
+  assert.equal(env.endpoint.calls.length, 1);
+  assert.equal(
+    findNodeByClass(nodes, 'dsh_arm_testOk'),
+    undefined,
+    'a stale success must not be rendered after the saved route moved',
+  );
+  assert.equal(
+    nodes.some((node) => typeof node.props?.children === 'string' && node.props.children.includes(env.t('testOkMessage'))),
+    false,
+    'no stale outcome text may remain visible',
+  );
+  assert.ok(findButton(nodes, env.t('test')), 'the probe button must return to idle after the late answer');
+});
+
+test('unmounting the page aborts an in-flight probe and discards its late result', async () => {
+  const deferred = createDeferred<{ ok: boolean; value?: unknown }>();
+  const env = await setupComponent({
+    savedSettings: { ...SAVED_ROUTE },
+    testPending: deferred.promise,
+  });
+  env.render();
+  let nodes = flattenNodes(await env.flush());
+  findButton(nodes, env.t('test'))?.props.onClick();
+  nodes = flattenNodes(await env.flush());
+  assert.ok(findButton(nodes, env.t('testing')), 'the probe must be in flight before unmount');
+  const signal = env.endpoint.signals[0];
+  assert.ok(signal instanceof AbortSignal);
+  assert.equal(signal.aborted, false);
+
+  env.unmount();
+  assert.equal(signal.aborted, true, 'unmount must abort the in-flight probe');
+  assert.equal(env.endpoint.aborts.length, 1, 'the abort must reach the Remote call');
+
+  // A late answer after unmount must be ignored and must not throw.
+  deferred.resolve({ ok: true, value: testResult() });
+  await new Promise((resolve) => setImmediate(resolve));
+});
+
+test('starting a probe keeps exactly one cancellation signal live', async () => {
+  const deferred = createDeferred<{ ok: boolean; value?: unknown }>();
+  const env = await setupComponent({
+    savedSettings: { ...SAVED_ROUTE },
+    testPending: deferred.promise,
+  });
+  env.render();
+  const nodes = flattenNodes(await env.flush());
+  findButton(nodes, env.t('test'))?.props.onClick();
+  await env.flush();
+  assert.equal(env.endpoint.signals.length, 1);
+  assert.equal(env.endpoint.signals[0]?.aborted, false);
+  deferred.resolve({ ok: true, value: testResult() });
+  await env.flush();
+  assert.equal(env.endpoint.signals[0]?.aborted, false, 'a completed probe is not aborted');
 });
