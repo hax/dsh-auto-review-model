@@ -209,6 +209,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     reload: '重新读取',
     saving: '保存中…',
     saved: '已保存',
+    savedCatalogFailed: '已保存，但模型目录加载失败',
     unsaved: '有未保存的更改',
     loading: '正在读取设置…',
     loadFailed: '设置加载失败',
@@ -244,6 +245,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     reload: 'Reload',
     saving: 'Saving…',
     saved: 'Saved',
+    savedCatalogFailed: 'Saved, but the model catalog could not be loaded',
     unsaved: 'You have unsaved changes',
     loading: 'Loading settings…',
     loadFailed: 'Failed to load settings',
@@ -608,17 +610,48 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
    */
   function ARMSelect(props: SelectProps): ReactElementLike {
     const [open, setOpen] = React.useState(false);
+    const [activeIndex, setActiveIndex] = React.useState(0);
     const rootRef = React.useRef<HTMLDivElement | null>(null);
+    const triggerRef = React.useRef<HTMLButtonElement | null>(null);
+    const optionRefs = React.useRef<(HTMLButtonElement | null)[]>([]);
+
+    const options = props.options;
+    const selectedIndex = options.findIndex((option) => option.value === props.value);
+    const selected = selectedIndex < 0 ? undefined : options[selectedIndex];
+    const label = selected === undefined ? props.placeholder : selected.label;
+
+    const closeMenu = (restoreFocus: boolean): void => {
+      setOpen(false);
+      if (restoreFocus) triggerRef.current?.focus();
+    };
+    const openMenu = (index: number): void => {
+      if (options.length === 0) return;
+      setActiveIndex(Math.max(0, Math.min(index, options.length - 1)));
+      setOpen(true);
+    };
+    const moveActive = (index: number): void => {
+      if (options.length === 0) return;
+      setActiveIndex((index + options.length) % options.length);
+    };
+
+    React.useEffect(() => {
+      if (!open) return undefined;
+      optionRefs.current[activeIndex]?.focus();
+      return undefined;
+    }, [open, activeIndex]);
 
     React.useEffect(() => {
       if (!open) return undefined;
       if (typeof document === 'undefined' || document === null) return undefined;
       const onMouseDown = (event: MouseEvent): void => {
         const root = rootRef.current;
-        if (root !== null && !root.contains(event.target as Node)) setOpen(false);
+        if (root !== null && !root.contains(event.target as Node)) closeMenu(false);
       };
       const onKeyDown = (event: KeyboardEvent): void => {
-        if (event.key === 'Escape') setOpen(false);
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          closeMenu(true);
+        }
       };
       document.addEventListener('mousedown', onMouseDown, true);
       document.addEventListener('keydown', onKeyDown, true);
@@ -629,14 +662,31 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     }, [open]);
 
     React.useEffect(() => {
-      if (props.disabled && open) setOpen(false);
+      if (props.disabled && open) closeMenu(true);
     }, [props.disabled, open]);
 
-    const options = props.options;
-    const selected = options.find((option) => option.value === props.value);
-    const label = selected === undefined ? props.placeholder : selected.label;
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === 'Tab') {
+        if (open) closeMenu(false);
+        return;
+      }
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        if (!open) {
+          openMenu(event.key === 'ArrowDown'
+            ? (selectedIndex < 0 ? 0 : selectedIndex)
+            : (selectedIndex < 0 ? options.length - 1 : selectedIndex));
+        } else {
+          moveActive(activeIndex + (event.key === 'ArrowDown' ? 1 : -1));
+        }
+      } else if (event.key === 'Home' || event.key === 'End') {
+        event.preventDefault();
+        if (open) moveActive(event.key === 'Home' ? 0 : options.length - 1);
+        else openMenu(event.key === 'Home' ? 0 : options.length - 1);
+      }
+    };
 
-    return React.createElement('div', { className: 'dsh_arm_select', ref: rootRef },
+    return React.createElement('div', { className: 'dsh_arm_select', ref: rootRef, onKeyDown },
       React.createElement('button', {
         type: 'button',
         className: 'dsh_arm_trigger' + (open ? ' dsh_arm_triggerOpen' : ''),
@@ -645,17 +695,26 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
         'aria-haspopup': 'listbox',
         'aria-expanded': open,
         title: label,
-        onClick: () => setOpen((prev) => !prev),
+        ref: triggerRef,
+        onClick: () => {
+          if (open) closeMenu(true);
+          else openMenu(selectedIndex < 0 ? 0 : selectedIndex);
+        },
       }, label),
       React.createElement('span', { className: 'dsh_arm_chevron', 'aria-hidden': 'true' }, open ? '▲' : '▼'),
       open
-        ? React.createElement('div', { className: 'dsh_arm_menu', role: 'listbox' },
+        ? React.createElement('div', { className: 'dsh_arm_menu', role: 'listbox', 'aria-label': props.label },
           options.map((option, index) => React.createElement('button', {
             key: String(index) + ':' + option.value,
             type: 'button',
             role: 'option',
+            tabIndex: index === activeIndex ? 0 : -1,
             'aria-selected': option.value === props.value,
-            className: 'dsh_arm_option' + (option.value === props.value ? ' dsh_arm_optionActive' : ''),
+            className: 'dsh_arm_option' + (index === activeIndex ? ' dsh_arm_optionActive' : ''),
+            ref: (element: HTMLButtonElement | null) => {
+              optionRefs.current[index] = element;
+            },
+            onMouseEnter: () => setActiveIndex(index),
             onMouseDown: (event: { stopPropagation(): void }) => {
               // Keep the document-level capture listener from closing the menu
               // before this option's click is delivered.
@@ -663,7 +722,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
             },
             onClick: () => {
               props.onChange(option.value);
-              setOpen(false);
+              closeMenu(true);
             },
           }, option.label)),
         )
@@ -852,7 +911,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
           setRevision(refreshed.revision);
           setCatalogError(refreshed.catalogError);
           if (refreshed.catalogError !== '') {
-            setStatus({ kind: 'error', text: withDetail(t('catalogFailed'), refreshed.catalogError) });
+            setStatus({ kind: 'ok', text: withDetail(t('savedCatalogFailed'), refreshed.catalogError) });
           } else {
             setStatus({ kind: 'ok', text: t('saved') });
           }
