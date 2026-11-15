@@ -20,8 +20,8 @@ DSH 的 Auto review 在每次受支持的工具调用执行前，用当前会话
 
 - **请求识别**：宿主侧插件监听 `llm/stream`，只精准匹配 `system` 提示词以 `REVIEW_POLICY\n` 开头且包含固定 reviewer marker 句子（`You are the final authorization reviewer for exactly one pending tool call.`）的自动审查请求。
 - **路由改写**：当开启 `enabled` 且 `provider` 与 `model` 成对非空时，复制冻结的请求对象并改写其 `provider`、`model` 与 `reasoningEffort`；审查提示词、风险分级与判定策略保持原样不变。
-- **思考等级能力查询**：在传递配置的 `reasoningEffort` 前，插件通过 `resolveModelInfo` 查询该路由的能力（透传 `AbortSignal`）。只有当目标模型声明支持该等级时才传递；若未声明或能力查询失败，则不显式传递并回退到 provider 默认值。
-- **缓存失效**：能力查询结果按路由进行内存缓存，并采用 generation / epoch 计数机制，防止在缓存失效前在途的查询结果（无论成功或失败）以过时数据错误写回。宿主侧监听 `loader/volatile-update` 时使用 `global: true`，以确保能够可靠接收到 provider 的局部配置变更通知；当收到 `llm/adapters-updated` 或 `loader/volatile-update` 事件时，缓存会及时失效。
+- **思考等级能力查询**：在传递配置的 `reasoningEffort` 前，插件通过 `resolveModelInfo` 查询该路由的能力，并将审查请求的 `AbortSignal` 与 300000ms（5 分钟）超时组合后传入。只有当目标模型声明支持该等级时才传递；若查询成功但未声明该等级，则不显式传递并回退到 provider 默认值。若查询失败或超时，审查会以包含实际 route、超时时间和修复建议的可操作错误直接失败（fail-closed），不会把失败当成“不支持”，也不会静默降级。
+- **缓存失效**：仅缓存成功的能力查询结果，按路由进行内存缓存，并采用 generation / epoch 计数机制，防止在缓存失效前在途的查询结果以过时数据错误写回。失败或超时的查询不会被缓存，下一次审查会重新查询。宿主侧监听 `loader/volatile-update` 时使用 `global: true`，以确保能够可靠接收到 provider 的局部配置变更通知；当收到 `llm/adapters-updated` 或 `loader/volatile-update` 事件时，缓存会及时失效。
 - **Fail-closed 安全机制**：若配置的模型不存在、网络不可达或审查执行失败，工具调用按审查失败处理，不会执行（fail-closed）。
 
 ## 安装
@@ -56,7 +56,7 @@ dsh plugin --profile web add /home/aghost/workspace/dsh-auto-approval-model-fix
 - `provider` 与 `model` 必须成对填写且均非空，同时 `enabled` 为开启状态，才会覆盖审查模型。
 - `provider` 留空表示继承当前会话模型。
 - 只填写其中一个字段不会半生效，而是整体回退为原生行为（沿用当前会话的 provider 与 model）。特别地，当 `provider` 非空而 `model` 为空时，宿主路由按既有规则整体 fallback 到会话模型，同时客户端 UI 会明确提示未启用覆盖。
-- `reasoningEffort` 为可选字段。留空表示不显式传递；只有目标模型声明支持该等级时才会传递，未声明或能力查询失败时回退到 provider 默认值。
+- `reasoningEffort` 为可选字段。留空表示不显式传递；只有目标模型声明支持该等级时才会传递，查询成功但未声明该等级时回退到 provider 默认值。能力查询失败或超时时，审查会以可操作错误直接失败（包含实际 route、300000ms（5 分钟）超时与修复建议），不会静默回退到默认等级。
 - 在配置界面中，若既有配置包含未知或当前模型未声明的 `reasoningEffort`，客户端会如实保留并明确显示，不伪装成默认值，并允许用户显式清除。
 - **生效时机：保存设置后立即对下一次审查生效。** 已经在进行中的审查不会被改写；不需要重启会话或重新加载 profile。
 
@@ -67,7 +67,7 @@ dsh plugin --profile web add /home/aghost/workspace/dsh-auto-approval-model-fix
 - `glm-coding` / `glm-5.3-flashx`：延迟较低的审查模型；
 - `codex-proxy` / `gemini-3.8-flash-high`：能力更强的审查模型。
 
-以上仅为环境示例，实际可选列表取决于你的 DSH 配置。`reasoningEffort` 的合法值由目标模型决定（例如 `low`、`medium`、`high`、`xhigh`）；如果所选模型未声明该等级，插件会忽略它并使用 provider 默认值，而不是把不受支持的值发给模型。
+以上仅为环境示例，实际可选列表取决于你的 DSH 配置。`reasoningEffort` 的合法值由目标模型决定（例如 `low`、`medium`、`high`、`xhigh`）；如果能力查询成功但所选模型未声明该等级，插件会忽略它并使用 provider 默认值，而不是把不受支持的值发给模型。能力查询失败或超时则不同：审查会以可操作错误直接失败（fail-closed），不会回退到 provider 默认值。
 
 ## 限制
 
@@ -75,7 +75,7 @@ dsh plugin --profile web add /home/aghost/workspace/dsh-auto-approval-model-fix
 - **需要启用本插件。** `enabled` 必须为开启状态，且插件层已被 DSH profile 正确加载。
 - **需要 Auto review 权限模式。** 只有会话处于自动授权审查模式时才会产生审查请求；本插件不能替代 Auto review 本身。
 - **provider / model 必须已在 DSH 配置中存在。** 填错或模型不可用时，审查请求会失败；工具调用按审查失败处理，不会执行（fail-closed）。
-- **思考等级由目标模型决定。** 只有在目标模型明确声明了该等级时才会传递；未声明或能力查询失败时会被忽略并回退到 provider 默认值。
+- **思考等级由目标模型决定。** 只有在目标模型明确声明了该等级时才会传递；查询成功但未声明时回退到 provider 默认值。若能力查询失败或超过 300000ms（5 分钟）超时，审查会以可操作错误直接失败（fail-closed），而不是静默降级到默认等级。
 - **客户端代码变化后需要刷新页面。** 配置界面由 `client/client.js` 提供；安装插件或修改客户端代码后必须重新加载 Web profile 并刷新 Web 页面，保存设置本身则直接对下一次审查生效。
 - **实验功能。** 自动审查可能误放行不安全操作或误拒绝正常操作，也会消耗额外 token。选择审查模型不能消除 Auto review 本身的安全风险，请仍然谨慎使用。
 - **不改变审查策略。** 固定的审查提示词、风险分级和放行/拒绝/转人工的判定逻辑仍完全由 DSH Auto review 决定。

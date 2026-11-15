@@ -14,6 +14,12 @@
  * rewriting it again. Each reviewer request is therefore rewritten exactly
  * once, with no recursion.
  *
+ * A configured reasoning effort is verified against the reviewer route's live
+ * capabilities before the first review. If that lookup fails or exceeds its
+ * five-minute deadline, the review rejects immediately with an actionable error
+ * that names the exact route and repair steps; the failed lookup is not cached
+ * and the review never silently degrades to the provider's default effort.
+ *
  * @module @aghost-prj/dsh-auto-review-model
  */
 import z from '@deepseek-ai/schemastery';
@@ -100,10 +106,125 @@ export const Config = z.object({
   reasoningEffort: z.string().default('').volatile(),
 });
 
+/**
+ * Hard deadline for one reviewer capability lookup.
+ *
+ * A route that cannot answer within five minutes is treated as a route that
+ * cannot serve the review, not as a route without reasoning support: the review
+ * fails closed with an actionable error instead of silently falling back to the
+ * provider's default reasoning effort.
+ */
+const CAPABILITY_TIMEOUT_MS = 300_000;
+
+/** Stable error name for capability-query failures. */
+const CAPABILITY_ERROR_NAME = 'AutoReviewModelCapabilityError';
+
+/** Error code: the reviewer route did not answer within {@link CAPABILITY_TIMEOUT_MS}. */
+const CAPABILITY_TIMEOUT_CODE = 'AUTO_REVIEW_MODEL_CAPABILITY_TIMEOUT';
+
+/** Error code: the reviewer route capability lookup failed for another reason. */
+const CAPABILITY_FAILED_CODE = 'AUTO_REVIEW_MODEL_CAPABILITY_FAILED';
+
+/** Repair advice shared by every capability failure. */
+const CAPABILITY_REPAIR_HINT =
+  'Check that the provider is configured with valid credentials, that the model is available and correctly routed for this account, and that the network can reach the provider; then update the Auto review model in Settings or retry.';
+
+/**
+ * Describe an unknown thrown value without ever throwing from the describer.
+ *
+ * The text lands in the Auto review failure reason the Agent receives, so it
+ * must stay readable even when an adapter rejects with a non-Error value.
+ *
+ * @param {unknown} error - the caught rejection reason.
+ * @returns {string} a non-empty diagnostic message.
+ */
+function errorText(error: unknown): string {
+  if (error instanceof Error && error.message !== '') return error.message;
+  if (typeof error === 'string' && error !== '') return error;
+  try {
+    const text = String(error);
+    if (text !== '' && text !== '[object Object]') return text;
+  } catch {
+    // Fall through to the generic label.
+  }
+  return 'unknown error';
+}
+
+/**
+ * Failure raised when the configured reviewer route cannot prove its reasoning
+ * capabilities.
+ *
+ * The message names the exact route, the five-minute deadline, and concrete
+ * repair steps so the Auto review failure reason stays actionable instead of a
+ * bare "review failed". The original lookup error is preserved as `cause`.
+ */
+export class ReviewerCapabilityError extends Error {
+  /** Diagnostic code: timeout versus another lookup failure. */
+  readonly code: string;
+  /** Configured provider id used in the failed lookup. */
+  readonly provider: string;
+  /** Configured model id used in the failed lookup. */
+  readonly model: string;
+  /** Exact `provider/model` route named in the message. */
+  readonly route: string;
+  /** Capability lookup deadline in milliseconds. */
+  readonly timeoutMs: number;
+  /** Whether the deadline expired rather than the lookup failing. */
+  readonly timedOut: boolean;
+
+  /**
+   * @param {string} provider - configured reviewer provider id.
+   * @param {string} model - configured reviewer model id.
+   * @param {boolean} timedOut - true when the deadline expired.
+   * @param {unknown} [cause] - the underlying lookup failure, if any.
+   */
+  constructor(provider: string, model: string, timedOut: boolean, cause?: unknown) {
+    const route = `${provider}/${model}`;
+    const detail = timedOut
+      ? `timed out after ${CAPABILITY_TIMEOUT_MS}ms (5 min)`
+      : `failed: ${errorText(cause)}. The capability query has a ${CAPABILITY_TIMEOUT_MS}ms (5 min) timeout`;
+    super(
+      `auto-review-model: capability lookup for reviewer route "${route}" ${detail}. ${CAPABILITY_REPAIR_HINT}`,
+      cause === undefined ? undefined : { cause },
+    );
+    this.name = CAPABILITY_ERROR_NAME;
+    this.code = timedOut ? CAPABILITY_TIMEOUT_CODE : CAPABILITY_FAILED_CODE;
+    this.provider = provider;
+    this.model = model;
+    this.route = route;
+    this.timeoutMs = CAPABILITY_TIMEOUT_MS;
+    this.timedOut = timedOut;
+  }
+}
+
+/**
+ * Reject as soon as `signal` aborts, even when the adapter-owned lookup ignores
+ * cancellation.
+ *
+ * The listener is removed when the lookup settles first, so a long-lived
+ * reviewer request does not accumulate abort listeners.
+ *
+ * @param {AbortSignal} signal - combined request/deadline signal.
+ * @returns {{ promise: Promise<never>, dispose: () => void }} abort rejection plus cleanup.
+ */
+function rejectWhenAborted(signal: AbortSignal): { promise: Promise<never>; dispose: () => void } {
+  let remove = (): void => {};
+  const promise = new Promise<never>((_resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason);
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+    remove = () => signal.removeEventListener('abort', onAbort);
+  });
+  return { promise, dispose: () => remove() };
+}
+
 /** Reasoning capability cache tracking generations to guard against stale writes. */
 interface CapabilityCache {
   generation: number;
-  entries: Map<string, Set<string> | null>;
+  entries: Map<string, Set<string>>;
   clear(): void;
 }
 
@@ -111,7 +232,7 @@ interface CapabilityCache {
 function createCapabilityCache(): CapabilityCache {
   return {
     generation: 0,
-    entries: new Map(),
+    entries: new Map<string, Set<string>>(),
     clear() {
       this.generation += 1;
       this.entries.clear();
@@ -120,22 +241,90 @@ function createCapabilityCache(): CapabilityCache {
 }
 
 /**
+ * Query the live reasoning capabilities of one exact reviewer route.
+ *
+ * The original reviewer request signal is combined with an
+ * `AbortSignal.timeout(300_000)` deadline, so caller cancellation still takes
+ * effect and a stuck provider cannot hold the review open indefinitely. The
+ * lookup is additionally raced against the combined signal, so the deadline
+ * rejects even if the adapter ignores cancellation.
+ *
+ * A timeout, cancellation, lookup failure, or an undefined model-info result
+ * rejects with an actionable {@link ReviewerCapabilityError}; nothing is
+ * invented and no cache entry is written here, so a transient failure is
+ * retried on the next review instead of being remembered as "unsupported".
+ *
+ * @param {HostContext} ctx - plugin context exposing `llm`.
+ * @param {string} provider - configured reviewer provider id.
+ * @param {string} model - configured reviewer model id.
+ * @param {AbortSignal} [signal] - original reviewer request cancellation signal.
+ * @returns {Promise<Set<string>>} the effort ids advertised by the route.
+ * @throws {ReviewerCapabilityError} when the route capability cannot be proven.
+ */
+async function resolveRouteEfforts(
+  ctx: HostContext,
+  provider: string,
+  model: string,
+  signal?: AbortSignal,
+): Promise<Set<string>> {
+  // A pre-aborted request must not start a lookup (or a five-minute timer).
+  signal?.throwIfAborted();
+
+  const deadline = AbortSignal.timeout(CAPABILITY_TIMEOUT_MS);
+  const querySignal = signal === undefined ? deadline : AbortSignal.any([signal, deadline]);
+  const aborted = rejectWhenAborted(querySignal);
+
+  let info: LlmModelInfo | undefined;
+  try {
+    info = await Promise.race([
+      ctx.llm.resolveModelInfo(provider, model, querySignal),
+      aborted.promise,
+    ]);
+  } catch (cause) {
+    // Caller cancellation wins over the deadline or an adapter-side failure:
+    // the request was cancelled, so blame the route only when it was not.
+    if (signal?.aborted) signal.throwIfAborted();
+    throw new ReviewerCapabilityError(provider, model, deadline.aborted, cause);
+  } finally {
+    aborted.dispose();
+  }
+
+  // The lookup may resolve even though the request or deadline was aborted
+  // between the race settling and this check; such a result is unusable.
+  if (signal?.aborted) signal.throwIfAborted();
+  if (deadline.aborted) {
+    throw new ReviewerCapabilityError(provider, model, true, deadline.reason);
+  }
+  if (info === undefined) {
+    throw new ReviewerCapabilityError(
+      provider,
+      model,
+      false,
+      new Error('the provider returned no model information for this route'),
+    );
+  }
+
+  const advertised = info.reasoning?.efforts;
+  return new Set(
+    Array.isArray(advertised)
+      ? advertised
+          .map((entry) => entry?.id)
+          .filter((id): id is string => id !== undefined)
+      : [],
+  );
+}
+
+/**
  * Ask the live LLM service whether one exact route advertises an effort.
  *
  * Capability lookups are cached per `provider\0model` because
  * `resolveModelInfo` is an async service call and reviewer requests may be
- * frequent. Both positive and failed lookups are cached; the cache is cleared
- * on `loader/volatile-update` or `llm/adapters-updated` so reconfiguring a route
- * or changing adapter topology picks up fresh capabilities. An absent `reasoning`
- * block means the route advertises no efforts, so the configured effort must
- * be dropped rather than sent.
- *
- * If the optional AbortSignal is already aborted before querying, the result
- * must not be written to the capability cache. If the query throws or the route
- * is unavailable, the failure is cached (unless pre-aborted or stale generation)
- * and false is returned to preserve fail-safe behavior: provider/model override
- * is kept and reasoningEffort is omitted without throwing errors to waterfall
- * listeners or reviewers.
+ * frequent. Only successful lookups are cached: failures and timeouts propagate
+ * as actionable errors and are retried on the next request. The cache is
+ * cleared on `loader/volatile-update` or `llm/adapters-updated` so reconfiguring
+ * a route or changing adapter topology picks up fresh capabilities. An absent
+ * `reasoning` block means the route advertises no efforts, so the configured
+ * effort must not be sent; that is a successful lookup result, not a failure.
  *
  * Lookups track cache generation so older asynchronous queries that settle
  * after cache invalidation do not overwrite newer cached capabilities.
@@ -147,6 +336,7 @@ function createCapabilityCache(): CapabilityCache {
  * @param {string} effort - normalized configured effort.
  * @param {AbortSignal} [signal] - optional cancellation signal from reviewer request.
  * @returns {Promise<boolean>} true only when the route advertises this effort.
+ * @throws {ReviewerCapabilityError} when the capability query fails or times out.
  */
 async function isEffortSupported(
   ctx: HostContext,
@@ -157,37 +347,16 @@ async function isEffortSupported(
   signal?: AbortSignal,
 ): Promise<boolean> {
   const key = effortCacheKey(provider, model);
-  if (!cache.entries.has(key)) {
-    if (signal?.aborted) {
-      return false;
-    }
-    const startGen = cache.generation;
-    let efforts: Set<string> | null = null;
-    try {
-      const info = await ctx.llm.resolveModelInfo(provider, model, signal);
-      const advertised = info?.reasoning?.efforts;
-      efforts = new Set(
-        Array.isArray(advertised)
-          ? advertised
-              .map((entry) => entry?.id)
-              .filter((id): id is string => id !== undefined)
-          : [],
-      );
-    } catch {
-      // A failed lookup cannot prove support. Remember the failure until the
-      // next settings or adapter change, but keep the provider/model override intact.
-      if (!signal?.aborted && cache.generation === startGen) {
-        cache.entries.set(key, null);
-      }
-      return false;
-    }
-    if (!signal?.aborted && cache.generation === startGen) {
-      cache.entries.set(key, efforts);
-    }
-    return efforts.has(effort);
+  const cached = cache.entries.get(key);
+  if (cached !== undefined) {
+    return cached.has(effort);
   }
-  const efforts = cache.entries.get(key);
-  return efforts instanceof Set && efforts.has(effort);
+  const startGen = cache.generation;
+  const efforts = await resolveRouteEfforts(ctx, provider, model, signal);
+  if (cache.generation === startGen) {
+    cache.entries.set(key, efforts);
+  }
+  return efforts.has(effort);
 }
 
 /**
@@ -224,8 +393,11 @@ async function* rewriteAutoReviewStream(
   ) {
     patched.reasoningEffort = effort;
   } else {
-    // No configured effort, an unsupported one, or a failed capability lookup:
-    // the provider default applies, so never forward a stale caller effort.
+    // No configured effort, or a successful lookup proved the route does not
+    // advertise it: the provider default applies, so never forward a stale
+    // caller effort. A failed or timed-out lookup throws above instead of
+    // reaching this fallback, so a transient route problem never silently
+    // degrades the review to a default reasoning effort.
     delete patched.reasoningEffort;
   }
   patchedRequests.add(patched);
@@ -293,4 +465,6 @@ export const __testing = {
   normalizeEffort,
   shouldOverrideRoute,
   effortCacheKey,
+  CAPABILITY_TIMEOUT_MS,
+  ReviewerCapabilityError,
 };

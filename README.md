@@ -20,8 +20,8 @@ Regular chat, subagents, title generation, compaction, and other LLM requests ar
 
 - **Request interception**: The host-side plugin listens on `llm/stream` and specifically matches Auto-review requests where the `system` prompt starts with `REVIEW_POLICY\n` and contains the fixed reviewer marker sentence (`You are the final authorization reviewer for exactly one pending tool call.`).
 - **Route rewriting**: When enabled and configured with a complete provider/model pair, it clones the frozen request object and replaces `provider`, `model`, and `reasoningEffort`. The original review prompt, risk criteria, and instructions remain unchanged.
-- **Reasoning capability lookup**: Before forwarding a configured reasoning effort, the plugin queries the route's capabilities via `resolveModelInfo` (forwarding `AbortSignal`). If the target model advertises support for that effort tier, it is applied; otherwise (or if the lookup fails), the effort is omitted so the provider default applies.
-- **Cache invalidation**: Capability lookups are cached per route using a generation/epoch counter to prevent in-flight lookup completions or failures from writing back stale data across invalidations. The cache is invalidated whenever `llm/adapters-updated` or `loader/volatile-update` (listened globally with `global: true` to reliably receive local provider configuration updates) fires.
+- **Reasoning capability lookup**: Before forwarding a configured reasoning effort, the plugin queries the route's capabilities via `resolveModelInfo`, combining the review request's `AbortSignal` with a 300000 ms (5 min) timeout. If the target model advertises support for that effort tier, it is applied; if the successful lookup advertises other or no efforts, the effort is omitted so the provider default applies. A failed or timed-out lookup fails the review closed with an actionable error that names the exact route, the 300000 ms (5 min) timeout, and repair steps; a lookup failure is never treated as "unsupported" and never silently degrades to the default effort.
+- **Cache invalidation**: Only successful capability lookups are cached per route, using a generation/epoch counter to prevent in-flight lookup completions from writing back stale data across invalidations. Failed or timed-out lookups are never cached, so the next review retries them. The cache is invalidated whenever `llm/adapters-updated` or `loader/volatile-update` (listened globally with `global: true` to reliably receive local provider configuration updates) fires.
 - **Fail-closed security**: If the specified review route is misconfigured, unavailable, or encounters an error during the review, the review fails and the pending tool call is not executed (fail-closed).
 
 ## Install
@@ -56,7 +56,7 @@ The **Auto review model** (自动审查模型) configuration section renders dir
 - `provider` and `model` must be set as a non-empty pair and `enabled` must be true to activate the route override.
 - Leaving `provider` empty indicates inheriting the current session model.
 - Setting only one field does not partially apply; the plugin falls back completely to native behavior (using the current session's provider and model). Specifically, if `provider` is non-empty while `model` is empty, host routing falls back to the session model under existing host rules, and the UI explicitly alerts that the override is not activated.
-- `reasoningEffort` is optional. If left empty, no explicit effort is passed. It is forwarded only when the target model advertises support for that tier; if unsupported or if capability discovery fails, it falls back to the provider default.
+- `reasoningEffort` is optional. If left empty, no explicit effort is passed. It is forwarded only when the target model advertises support for that tier; a successful lookup that does not advertise it falls back to the provider default. A failed or timed-out capability lookup fails the review closed with an actionable error (exact route, 300000 ms / 5 min timeout, and repair steps) instead of silently using the default effort.
 - In the configuration UI, if an existing configuration contains an unrecognized or unadvertised `reasoningEffort`, the client preserves and explicitly displays it without disguising it as the provider default, allowing the user to inspect it or explicitly clear it.
 - **Takes effect immediately on the next review after saving.** In-flight reviews are not rewritten, and no session restart or profile reload is required.
 
@@ -67,7 +67,7 @@ Assuming the following providers are configured in your DSH environment (e.g., i
 - `glm-coding` / `glm-5.3-flashx`: a low-latency reviewer;
 - `codex-proxy` / `gemini-3.8-flash-high`: a stronger reviewer.
 
-These are machine-specific examples; available options depend on your DSH setup. Valid `reasoningEffort` values are model-specific (e.g. `low`, `medium`, `high`, `xhigh`). If the selected model does not advertise the specified effort, the plugin omits it and uses the provider default instead of passing an unsupported parameter.
+These are machine-specific examples; available options depend on your DSH setup. Valid `reasoningEffort` values are model-specific (e.g. `low`, `medium`, `high`, `xhigh`). If a successful capability lookup shows that the selected model does not advertise the specified effort, the plugin omits it and uses the provider default instead of passing an unsupported parameter. A failed or timed-out capability lookup is different: it fails the review closed with an actionable error and never falls back to the provider default.
 
 ## Limitations
 
@@ -75,7 +75,7 @@ These are machine-specific examples; available options depend on your DSH setup.
 - **The plugin must be enabled.** `enabled` must be `true` and the plugin layer must be loaded by the DSH profile.
 - **The Auto review permission mode is required.** Review requests only exist while the session runs under the Auto review permission mode; this plugin cannot replace or bypass Auto review.
 - **The provider / model must already exist in DSH configuration.** An invalid ID or unreachable model causes the review request to fail. In accordance with fail-closed behavior, the pending tool call is blocked and will not execute.
-- **Reasoning effort is model-owned.** Effort tiers are only forwarded if the target model explicitly declares support; otherwise (or if capability queries fail), it falls back to the provider default.
+- **Reasoning effort is model-owned.** Effort tiers are only forwarded if the target model explicitly declares support; a successful lookup without support falls back to the provider default. If the capability lookup fails or exceeds its 300000 ms (5 min) deadline, the review fails closed with an actionable error rather than silently degrading to a default effort.
 - **Reload profile and refresh page after client changes.** The configuration interface is provided by `client/client.js`. After installing or modifying client code, reload the Web profile and refresh the browser page. Saving configuration settings applies immediately to the next review.
 - **Experimental nature.** Auto review may incorrectly approve unsafe operations or deny benign ones, and consumes extra tokens. Choosing a dedicated reviewer model does not eliminate these inherent risks; Auto review should still be used with care.
 - **The review policy is unchanged.** The prompt templates, risk classifications, and allow/deny/escalate decision logic remain governed entirely by DSH Auto review.

@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { Config, __testing, apply, inject, name } from '@aghost-prj/dsh-auto-review-model';
+import { Config, ReviewerCapabilityError, __testing, apply, inject, name } from '@aghost-prj/dsh-auto-review-model';
 import {
   REVIEW_POLICY_MARKER,
   REVIEW_POLICY_PREFIX,
@@ -256,6 +256,53 @@ function fireAdaptersUpdate(harness: Harness): void {
   for (const update of updates) update.listener();
 }
 
+/** Message fragments every actionable capability error must carry. */
+const CAPABILITY_ERROR_FRAGMENTS = [
+  '300000ms',
+  '(5 min)',
+  'valid credentials',
+  'correctly routed',
+  'network',
+  'Auto review model in Settings',
+] as const;
+
+/**
+ * Assert that a rejected review carries the actionable capability failure for
+ * one exact route and the requested timeout kind.
+ */
+function assertCapabilityFailure(
+  error: unknown,
+  route: string,
+  timedOut: boolean,
+): asserts error is ReviewerCapabilityError {
+  assert.ok(
+    error instanceof ReviewerCapabilityError,
+    `expected a ReviewerCapabilityError, got ${String(error)}`,
+  );
+  const failure = error as ReviewerCapabilityError;
+  assert.equal(failure.name, 'AutoReviewModelCapabilityError');
+  assert.equal(failure.route, route);
+  assert.equal(failure.provider, route.slice(0, route.indexOf('/')));
+  assert.equal(failure.model, route.slice(route.indexOf('/') + 1));
+  assert.equal(failure.timeoutMs, 300_000);
+  assert.equal(failure.timedOut, timedOut);
+  assert.equal(
+    failure.code,
+    timedOut ? 'AUTO_REVIEW_MODEL_CAPABILITY_TIMEOUT' : 'AUTO_REVIEW_MODEL_CAPABILITY_FAILED',
+  );
+  for (const fragment of [route, ...CAPABILITY_ERROR_FRAGMENTS]) {
+    assert.ok(
+      failure.message.includes(fragment),
+      `error message must include ${JSON.stringify(fragment)}: ${failure.message}`,
+    );
+  }
+  if (timedOut) {
+    assert.ok(failure.message.includes('timed out'), `timeout message must say so: ${failure.message}`);
+  } else {
+    assert.ok(failure.message.includes('failed'), `failure message must say so: ${failure.message}`);
+  }
+}
+
 test('plugin metadata follows the shared loader contract', () => {
   assert.equal(name, 'auto-review-model');
   assert.deepEqual(inject, ['llm', 'sessionLogDeepSeek']);
@@ -271,6 +318,12 @@ test('Config declares four volatile settings with the shared defaults', () => {
   assert.equal(config.provider.get(), '');
   assert.equal(config.model.get(), '');
   assert.equal(config.reasoningEffort.get(), '');
+});
+
+test('capability query deadline is 300000ms (5 min)', () => {
+  assert.equal(__testing.CAPABILITY_TIMEOUT_MS, 300_000);
+  assert.equal(__testing.CAPABILITY_TIMEOUT_MS, 5 * 60_000);
+  assert.equal(__testing.ReviewerCapabilityError, ReviewerCapabilityError);
 });
 
 test('marker recognition accepts only the fixed auto-review prompt', () => {
@@ -462,6 +515,8 @@ test('overrides provider, model, and supported effort', async () => {
 });
 
 test('drops an effort the target route does not advertise', async () => {
+  // A successful lookup that advertises other efforts is not a capability
+  // failure: the unsupported effort is dropped to the provider default.
   for (const modelInfo of [
     () => ({ reasoning: { efforts: [{ id: 'low' }] } }),
     () => ({}),
@@ -483,7 +538,7 @@ test('drops an effort the target route does not advertise', async () => {
   }
 });
 
-test('keeps the route but drops effort when capability lookup throws', async () => {
+test('capability lookup failure rejects with an actionable error instead of silently dropping effort', async () => {
   const harness = createHarness({
     config: { provider: 'review-provider-2', model: 'review-model-2', reasoningEffort: 'high' },
     modelInfo: () => {
@@ -492,17 +547,160 @@ test('keeps the route but drops effort when capability lookup throws', async () 
   });
   const options = reviewOptions();
 
-  const chunks = await collect(harness.ctx.llm.stream(options));
+  await assert.rejects(
+    collect(harness.ctx.llm.stream(options)),
+    (error: unknown) => {
+      assertCapabilityFailure(error, 'review-provider-2/review-model-2', false);
+      assert.match(error.message, /capability lookup failed/);
+      assert.ok(error.cause instanceof Error, 'the original lookup failure must be preserved as cause');
+      return true;
+    },
+  );
 
-  assert.deepEqual(chunks, harness.baseChunks);
-  const used = harness.baseCalls[0];
-  assert.equal(used.provider, 'review-provider-2');
-  assert.equal(used.model, 'review-model-2');
-  assert.equal(Object.hasOwn(used, 'reasoningEffort'), false);
+  assert.equal(harness.baseCalls.length, 0, 'a failed lookup must fail closed, not send a default-effort request');
   assert.deepEqual(
     harness.resolveCalls.map((c) => [c.provider, c.model]),
     [['review-provider-2', 'review-model-2']],
   );
+  assert.equal(options.provider, 'request-provider', 'the frozen original request must stay untouched');
+});
+
+test('a failed capability lookup is not cached and every review retries it', async () => {
+  let attempts = 0;
+  const harness = createHarness({
+    config: { provider: 'review-provider-fail', model: 'review-model-fail', reasoningEffort: 'high' },
+    modelInfo: () => {
+      attempts += 1;
+      throw new Error(`provider unreachable (attempt ${attempts})`);
+    },
+  });
+
+  for (const attempt of [1, 2]) {
+    await assert.rejects(
+      collect(harness.ctx.llm.stream(reviewOptions())),
+      (error: unknown) => {
+        assertCapabilityFailure(error, 'review-provider-fail/review-model-fail', false);
+        assert.match(error.message, new RegExp(`provider unreachable \\(attempt ${attempt}\\)`));
+        return true;
+      },
+    );
+  }
+
+  assert.equal(attempts, 2, 'a failed lookup must not be cached');
+  assert.equal(harness.baseCalls.length, 0, 'no retry may send a degraded request');
+  assert.equal(harness.resolveCalls.length, 2);
+});
+
+test('a capability lookup that exceeds the 300000ms deadline rejects actionably and is not cached', async () => {
+  const originalTimeoutMethod = AbortSignal.timeout;
+  const realTimeout = originalTimeoutMethod.bind(AbortSignal);
+  const requested: number[] = [];
+  let hang = true;
+  (AbortSignal as unknown as { timeout: (ms: number) => AbortSignal }).timeout = (ms: number): AbortSignal => {
+    requested.push(ms);
+    // Delegate to a real short timeout so the combined signal actually aborts.
+    return realTimeout(5);
+  };
+
+  try {
+    const harness = createHarness({
+      config: { provider: 'review-provider-timeout', model: 'review-model-timeout', reasoningEffort: 'high' },
+      modelInfo: (_provider, _model, signal) => {
+        if (!hang) return { reasoning: { efforts: [{ id: 'high' }] } };
+        return new Promise<TestModelInfo>((_resolve, reject) => {
+          assert.ok(signal, 'resolveModelInfo must receive the combined capability signal');
+          if (signal.aborted) {
+            reject(signal.reason);
+            return;
+          }
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
+      },
+    });
+
+    await assert.rejects(
+      collect(harness.ctx.llm.stream(reviewOptions())),
+      (error: unknown) => {
+        assertCapabilityFailure(error, 'review-provider-timeout/review-model-timeout', true);
+        assert.match(error.message, /timed out after 300000ms \(5 min\)/);
+        return true;
+      },
+    );
+
+    assert.deepEqual(requested, [300_000], 'the lookup must use AbortSignal.timeout(300_000)');
+    assert.equal(harness.baseCalls.length, 0, 'a timed-out lookup must not fall back to a default effort');
+
+    hang = false;
+    await collect(harness.ctx.llm.stream(reviewOptions()));
+    assert.equal(harness.baseCalls.length, 1);
+    assert.equal(harness.baseCalls[0].reasoningEffort, 'high', 'the retry after a timeout must use the configured effort');
+    assert.equal(harness.resolveCalls.length, 2, 'a timeout must not be cached');
+    assert.deepEqual(requested, [300_000, 300_000]);
+  } finally {
+    (AbortSignal as unknown as { timeout: (ms: number) => AbortSignal }).timeout = originalTimeoutMethod;
+  }
+});
+
+test('a lookup that yields no model information fails closed', async () => {
+  const harness = createHarness({
+    config: { provider: 'review-provider-empty', model: 'review-model-empty', reasoningEffort: 'high' },
+    modelInfo: () => undefined,
+  });
+
+  await assert.rejects(
+    collect(harness.ctx.llm.stream(reviewOptions())),
+    (error: unknown) => {
+      assertCapabilityFailure(error, 'review-provider-empty/review-model-empty', false);
+      assert.match(error.message, /no model information/);
+      return true;
+    },
+  );
+
+  assert.equal(harness.baseCalls.length, 0, 'an unresolved route must not fall back to a default effort');
+});
+
+test('cancelling the original request during a capability lookup rejects and is not cached', async () => {
+  const controller = new AbortController();
+  let hanging = true;
+  const harness = createHarness({
+    config: { provider: 'review-provider-cancel', model: 'review-model-cancel', reasoningEffort: 'high' },
+    modelInfo: (_provider, _model, signal) => {
+      if (!hanging) return { reasoning: { efforts: [{ id: 'high' }] } };
+      return new Promise<TestModelInfo>((_resolve, reject) => {
+        assert.ok(signal, 'resolveModelInfo must receive the combined capability signal');
+        if (signal.aborted) {
+          reject(signal.reason);
+          return;
+        }
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    },
+  });
+  const options = reviewOptions({ signal: controller.signal });
+  const pending = collect(harness.ctx.llm.stream(options));
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.resolveCalls.length, 1);
+  const combined = harness.resolveCalls[0].signal;
+  assert.ok(combined instanceof AbortSignal);
+  assert.notEqual(combined, controller.signal, 'the caller signal must be combined with the timeout signal');
+
+  controller.abort();
+  await assert.rejects(pending, (error: unknown) => {
+    assert.equal(
+      (error as Error).name,
+      'AbortError',
+      'caller cancellation must propagate instead of being reported as a route failure',
+    );
+    return true;
+  });
+  assert.equal(combined.aborted, true, 'the combined signal must follow caller cancellation');
+  assert.equal(harness.baseCalls.length, 0, 'a cancelled lookup must not send a degraded request');
+
+  hanging = false;
+  await collect(harness.ctx.llm.stream(reviewOptions()));
+  assert.equal(harness.resolveCalls.length, 2, 'a cancellation must not be cached as a route failure');
+  assert.equal(harness.baseCalls[0].reasoningEffort, 'high');
 });
 
 test('never mutates deeply frozen reviewer options', async () => {
@@ -686,7 +884,7 @@ test('late-settling lookup (success) started before cache invalidation does not 
   assert.equal(harness.baseCalls[2].reasoningEffort, undefined);
 });
 
-test('late-settling lookup (failure) started before cache invalidation does not pollute cache', async () => {
+test('late-settling lookup (failure) started before cache invalidation propagates and does not pollute cache', async () => {
   const deferred1 = createDeferred<TestModelInfo | undefined>();
   const deferred2 = createDeferred<TestModelInfo | undefined>();
   let resolveCallsCount = 0;
@@ -718,18 +916,25 @@ test('late-settling lookup (failure) started before cache invalidation does not 
   await req2Promise;
   assert.equal(harness.baseCalls[0].reasoningEffort, 'high');
 
-  // Request 1 late-rejects (fails)
+  // Request 1 late-rejects: it must surface its actionable failure instead of
+  // silently sending a default-effort request.
   deferred1.reject(new Error('network error from old provider'));
-  await req1Promise;
+  await assert.rejects(req1Promise, (error: unknown) => {
+    assertCapabilityFailure(error, 'review-provider-fail-race/review-model-fail-race', false);
+    assert.match(error.message, /network error from old provider/);
+    return true;
+  });
+  assert.equal(harness.baseCalls.length, 1, 'the late failure must not reach the base stream');
 
-  // Request 3 should use cached 'high' from request 2, NOT null (failure) from request 1
+  // Request 3 should use the cached 'high' from request 2, not a failure entry.
   await collect(harness.ctx.llm.stream(reviewOptions()));
-  assert.equal(harness.baseCalls.length, 3);
+  assert.equal(harness.baseCalls.length, 2);
   assert.equal(
-    harness.baseCalls[2].reasoningEffort,
+    harness.baseCalls[1].reasoningEffort,
     'high',
-    'late failure from before invalidation must not overwrite valid newer cache',
+    'a late failure from before invalidation must not overwrite the valid newer cache',
   );
+  assert.equal(harness.resolveCalls.length, 2, 'request 3 must hit the successful cache');
 });
 
 test('apply registers a global, prepended llm/stream listener', () => {
@@ -743,12 +948,13 @@ test('apply registers a global, prepended llm/stream listener', () => {
   assert.equal(typeof registrations[0].listener, 'function');
 });
 
-test('resolveModelInfo receives options.signal as third argument', async () => {
+test('resolveModelInfo receives a combined signal that follows the original request signal', async () => {
   const controller = new AbortController();
+  let observed: AbortSignal | undefined;
   const harness = createHarness({
     config: { provider: 'review-provider-signal', model: 'review-model-signal', reasoningEffort: 'high' },
     modelInfo: (_provider, _model, signal) => {
-      assert.equal(signal, controller.signal, 'signal in resolveModelInfo must match caller signal');
+      observed = signal;
       return { reasoning: { efforts: [{ id: 'high' }] } };
     },
   });
@@ -759,11 +965,13 @@ test('resolveModelInfo receives options.signal as third argument', async () => {
   assert.equal(harness.resolveCalls.length, 1);
   assert.equal(harness.resolveCalls[0].provider, 'review-provider-signal');
   assert.equal(harness.resolveCalls[0].model, 'review-model-signal');
-  assert.equal(
-    harness.resolveCalls[0].signal,
-    controller.signal,
-    'recorded signal must be strictly equal to options.signal',
-  );
+  const combined = harness.resolveCalls[0].signal;
+  assert.ok(combined instanceof AbortSignal);
+  assert.notEqual(combined, controller.signal, 'the caller signal must be combined with the 300000ms timeout');
+  assert.equal(observed, combined, 'resolveModelInfo must receive the combined signal');
+  assert.equal(combined.aborted, false);
+  controller.abort();
+  assert.equal(combined.aborted, true, 'cancelling the request must abort the combined lookup signal');
   assert.equal(harness.baseCalls[0].reasoningEffort, 'high');
 });
 
@@ -799,7 +1007,7 @@ test('llm/adapters-updated clears the effort capability cache and triggers new r
   assert.equal(harness.resolveCalls[1].model, 'review-model-adapters');
 });
 
-test('pre-aborted request does not cache failure and drops effort', async () => {
+test('pre-aborted request rejects without querying and without caching a failure', async () => {
   const controller = new AbortController();
   controller.abort();
   let calls = 0;
@@ -812,13 +1020,18 @@ test('pre-aborted request does not cache failure and drops effort', async () => 
   });
   const options = reviewOptions({ signal: controller.signal });
 
-  await collect(harness.ctx.llm.stream(options));
-  // Because signal was pre-aborted, isEffortSupported returns false immediately without calling resolveModelInfo
-  assert.equal(calls, 0);
-  assert.equal(Object.hasOwn(harness.baseCalls[0], 'reasoningEffort'), false);
+  await assert.rejects(
+    collect(harness.ctx.llm.stream(options)),
+    (error: unknown) => {
+      assert.equal((error as Error).name, 'AbortError', 'a pre-aborted request must keep abort semantics');
+      return true;
+    },
+  );
+  assert.equal(calls, 0, 'a pre-aborted request must not start a capability lookup');
+  assert.equal(harness.baseCalls.length, 0);
 
-  // Subsequent non-aborted request must still query resolveModelInfo (cache was not polluted)
+  // The cancellation must not poison the cache for a later live request.
   await collect(harness.ctx.llm.stream(reviewOptions()));
   assert.equal(calls, 1);
-  assert.equal(harness.baseCalls[1].reasoningEffort, 'high');
+  assert.equal(harness.baseCalls[0].reasoningEffort, 'high');
 });
