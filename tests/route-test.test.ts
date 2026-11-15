@@ -294,6 +294,63 @@ function deferredNextStream(gate: Deferred<IteratorResult<TestChunk>>): StreamFa
   });
 }
 
+/**
+ * A custom stream WITHOUT `return()` whose first next() already settles with
+ * oversize content; any later next() would hang. This is the reviewer repro for
+ * a non-terminal early exit on an unclosable stream.
+ */
+function oversizeNoReturnStream(): AsyncIterable<TestChunk> {
+  return {
+    [Symbol.asyncIterator]() {
+      let step = 0;
+      return {
+        next(): Promise<IteratorResult<TestChunk>> {
+          step += 1;
+          if (step === 1) {
+            return Promise.resolve({
+              done: false,
+              value: { type: 'text-delta', index: 0, text: 'x'.repeat(100) },
+            });
+          }
+          return new Promise<IteratorResult<TestChunk>>(() => {});
+        },
+      };
+    },
+  };
+}
+
+/** A custom stream WITHOUT `return()` that reports a terminal finish chunk. */
+function finishNoReturnStream(): AsyncIterable<TestChunk> {
+  return {
+    [Symbol.asyncIterator]() {
+      let step = 0;
+      return {
+        next(): Promise<IteratorResult<TestChunk>> {
+          step += 1;
+          if (step === 1) {
+            return Promise.resolve({ done: false, value: { type: 'text-delta', index: 0, text: 'OK' } });
+          }
+          if (step === 2) {
+            return Promise.resolve({ done: false, value: { type: 'finish', reason: { kind: 'stop' } } });
+          }
+          return new Promise<IteratorResult<TestChunk>>(() => {});
+        },
+      };
+    },
+  };
+}
+
+/** A custom stream WITHOUT `return()` that ends naturally via `step.done`. */
+function endedNoReturnStream(): AsyncIterable<TestChunk> {
+  return {
+    [Symbol.asyncIterator]() {
+      return {
+        next: () => Promise.resolve({ done: true, value: undefined }),
+      };
+    },
+  };
+}
+
 /** A stream that finishes after one text delta, then hangs in `return()`. */
 function finishThenHangingClose(gate: Deferred<IteratorResult<TestChunk>>): StreamFactory {
   return () => {
@@ -487,6 +544,11 @@ test('probe request is the fixed harmless one-shot with no session or tool field
   for (const forbidden of ['sessionId', 'purpose', 'tools', 'toolHistory', 'history']) {
     assert.ok(!(forbidden in request), `probe request must not carry ${forbidden}`);
   }
+  assert.equal(
+    request.signal.aborted,
+    false,
+    'a normal terminal probe must not abort its request signal',
+  );
 });
 
 test('probe reads the saved route live and never mutates settings', async () => {
@@ -1176,6 +1238,75 @@ test('a late close rejection is observed and releases the slot', async () => {
     assertResultCode(await harness.invoke(), 'OK', 'ok');
     assert.equal(harness.streamCalls.length, 2);
   });
+});
+
+test('a non-terminal early exit on a stream without return() abandons the slot', async () => {
+  // Reviewer repro: oversize stops consuming, the last next() has already
+  // settled, and the custom iterator has no return(). Releasing the slot would
+  // let a second provider stream accumulate beside one that can never be closed.
+  let providerCalls = 0;
+  const signals: AbortSignal[] = [];
+  const harness = createHarness({
+    stream: (options) => {
+      providerCalls += 1;
+      if (options !== undefined) signals.push(options.signal);
+      return oversizeNoReturnStream();
+    },
+  });
+
+  const first = await harness.invoke();
+  assertResultCode(first, 'UNKNOWN', 'error');
+  assert.equal(providerCalls, 1);
+  assert.equal(signals.length, 1);
+  assert.equal(harness.streamCalls.length, 1);
+  assert.equal(
+    harness.streamCalls[0]!.signal.aborted,
+    true,
+    'the request signal must be aborted after an oversize early return',
+  );
+  assert.equal(signals[0]?.aborted, true);
+
+  // The unclosable stream is abandoned: the slot is never released.
+  assertResultCode(await harness.invoke(), 'BUSY', 'blocked');
+  assert.equal(providerCalls, 1, 'an abandoned probe must never start a second provider stream');
+  assert.equal(harness.streamCalls.length, 1);
+});
+
+test('a terminal stream without return() still releases the slot', async () => {
+  // A consumed finish chunk is terminal even without a return() method.
+  let finishCalls = 0;
+  const finished = createHarness({
+    stream: () => {
+      finishCalls += 1;
+      return finishCalls === 1 ? finishNoReturnStream() : okStream()();
+    },
+  });
+  assertResultCode(await finished.invoke(), 'OK', 'ok');
+  assert.equal(
+    finished.streamCalls[0]!.signal.aborted,
+    false,
+    'a fully settled terminal probe must not abort its request signal',
+  );
+  assertResultCode(await finished.invoke(), 'OK', 'ok');
+  assert.equal(finishCalls, 2, 'a terminal no-return stream must not lock the slot');
+
+  // A natural step.done ends the stream terminally too (reported as a
+  // premature-close connection failure, but ownership is released normally).
+  let endedCalls = 0;
+  const ended = createHarness({
+    stream: () => {
+      endedCalls += 1;
+      return endedCalls === 1 ? endedNoReturnStream() : okStream()();
+    },
+  });
+  assertResultCode(await ended.invoke(), 'ACCOUNT_CONNECTION', 'error');
+  assert.equal(
+    ended.streamCalls[0]!.signal.aborted,
+    false,
+    'a naturally ended probe must not abort its request signal',
+  );
+  assertResultCode(await ended.invoke(), 'OK', 'ok');
+  assert.equal(endedCalls, 2, 'a natural step.done must not lock the slot');
 });
 
 test('the endpoint probes the SAVED route even when a caller injects arguments', async () => {

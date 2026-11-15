@@ -95,7 +95,7 @@ These are machine-specific examples; available options depend on your DSH setup.
 
 As of 2026-11-16, the saved-route test feature was verified with the following automated evidence:
 - **Automated commands**: `npm run typecheck`, `npm test`, `npm run check`, and `npm run verify` all exited with code 0.
-- **Tests**: 127 unit tests passed (0 failures): host 33, route-test 34, client 25, client component 19, Typert contract/artifacts 9, packaging 7.
+- **Tests**: 129 unit tests passed (0 failures): host 33, route-test 36, client 25, client component 19, Typert contract/artifacts 9, packaging 7.
 - **Static verification**: 25 of 25 checks passed (`npm run verify`), covering exports, the Loader-valid `./typert` manifest, Host/Client descriptor alignment, `./remote` embedding and `$mount` wiring, dependency-free hand-written Typert artifacts, and syntax of every entry. On Desktop, the installed experimental-auto-review policy check reads the running `app.asar` through `DSH_NODE_EXECUTABLE`; a missing `DSH_INSTALL_DIR` combined with an unreadable source fails the check instead of silently skipping it. SKIP is reserved for source checkouts with no installed DSH package tree.
 - **Safety invariants asserted**: the probe request carries only provider/model/[reasoningEffort]/fixed prompt/maxTokens/temperature/signal (never `sessionId`, `purpose`, `tools`, `toolHistory` or conversation history); settings are never written; no model output, credential material or arbitrary transport error text is returned or rendered; Account versus API-key failures classify distinctly; throttle, single-flight, bounded timeout, bounded output, and stale-result invalidation after a saved-route change are covered.
 

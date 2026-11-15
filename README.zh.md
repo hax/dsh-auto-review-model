@@ -95,7 +95,7 @@ dsh plugin --profile web add /home/aghost/workspace/dsh-auto-approval-model-fix
 
 截至 2026-11-16，已保存路由测试功能通过以下自动化证据验证：
 - **自动化命令**：`npm run typecheck`、`npm test`、`npm run check` 与 `npm run verify` 退出码均为 0。
-- **测试**：127 项单元测试全部通过（0 失败）：host 33、route-test 34、client 25、client-component 19、Typert contract/产物 9、packaging 7。
+- **测试**：129 项单元测试全部通过（0 失败）：host 33、route-test 36、client 25、client-component 19、Typert contract/产物 9、packaging 7。
 - **静态校验**：`npm run verify` 25/25 项通过，覆盖 exports、Loader 可接受的 `./typert` manifest、Host/Client descriptor 一致性、`./remote` 内嵌与 `$mount` 接线、手写 Typert 产物零运行时依赖，以及所有入口的语法。Desktop 环境下，已安装 experimental-auto-review 策略检查通过 `DSH_NODE_EXECUTABLE` 读取运行中的 `app.asar`；若存在 `DSH_INSTALL_DIR` 但无法读取官方源码，检查会失败而不是静默跳过。只有没有已安装 DSH 包树的源码检出环境才允许报告 SKIP。
 - **已断言的安全不变量**：探测请求只包含 provider/model/[reasoningEffort]/固定 prompt/maxTokens/temperature/signal（绝不含 `sessionId`、`purpose`、`tools`、`toolHistory` 或对话历史）；不写设置；不返回模型输出、凭证材料或任意传输错误文本；Account 与 API-key 故障分类可区分；限流、single-flight、有界超时、有界输出，以及已保存路由变化后的过期结果失效均有覆盖。
 

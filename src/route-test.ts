@@ -29,7 +29,12 @@
  *   handed back only when every provider operation the probe started — a
  *   capability lookup, a stream `next()`, or a stream `return()` — has actually
  *   settled, so a timed-out or cancelled probe cannot accumulate a second
- *   provider stream beside an orphaned one.
+ *   provider stream beside an orphaned one. A probe that stops on a
+ *   non-terminal result while the provider stream declares no `return()` is
+ *   abandoned: the slot is never released, because that stream could still be
+ *   live and cannot be closed. Remaining or abandoned provider work is aborted
+ *   through the probe-owned request signal before the endpoint returns, while a
+ *   fully settled terminal probe keeps its request signal untouched.
  *
  * The result is exactly the strict `ReviewRouteTestResult` codec declared in
  * `./typert.contract.ts`; that module owns the wire shape and this module keeps
@@ -295,7 +300,8 @@ export interface RouteTestState {
    * Provider operations started by the last admitted probe that have not
    * settled yet. While this is non-zero the single-flight slot stays held, so
    * a timeout/cancellation can return a result without allowing a second
-   * provider stream to accumulate beside an orphaned one.
+   * provider stream to accumulate beside an orphaned one. An abandoned
+   * unclosable stream also keeps the slot held even after this reaches zero.
    */
   pendingProviderOperations: number;
 }
@@ -308,6 +314,13 @@ interface RouteTestFlight {
   finished: boolean;
   /** Whether the single-flight slot has been handed back. */
   released: boolean;
+  /**
+   * Whether the probe stopped before a terminal stream result on a stream that
+   * has no `return()`: the provider iterator cannot be closed, so the slot is
+   * held for the lifetime of the endpoint instead of risking an orphaned stream
+   * beside a second provider request.
+   */
+  abandoned: boolean;
 }
 
 /** Tracks provider operations against one flight's single-flight ownership. */
@@ -320,6 +333,12 @@ interface RouteTestOperationTracker {
    * @returns the provider promise, observed so a late rejection is never unhandled.
    */
   track<T>(operation: () => Promise<T> | T): Promise<T>;
+  /**
+   * Give the single-flight slot up permanently because a non-terminal stream
+   * could not be closed. No promise is created, so nothing can surface as an
+   * unhandled rejection.
+   */
+  abandon(): void;
 }
 
 /** Effective probe-budget settings. */
@@ -377,6 +396,16 @@ interface RouteTestDeadline {
   readonly callerSignal: AbortSignal | undefined;
   /** Whether the hard deadline (rather than the caller) aborted the signal. */
   timedOut(): boolean;
+  /**
+   * Abort the probe-owned deadline signal (not the caller signal).
+   *
+   * The endpoint calls this before returning whenever it still owns provider
+   * work, so a live model request is severed instead of only having its timer
+   * cleared. Aborting an already-aborted signal is a no-op.
+   *
+   * @param reason - optional abort reason for adapter-side diagnostics.
+   */
+  abort(reason?: unknown): void;
   /** Release the timer and the caller abort listener. */
   dispose(): void;
 }
@@ -960,6 +989,10 @@ function createRouteTestDeadline(
     signal: controller.signal,
     callerSignal,
     timedOut: () => timedOut,
+    abort(reason?: unknown) {
+      if (controller.signal.aborted) return;
+      controller.abort(reason ?? new Error('route test probe finished'));
+    },
     dispose() {
       if (timer !== undefined) clearTimeout(timer);
       callerSignal?.removeEventListener('abort', onCallerAbort);
@@ -1076,7 +1109,10 @@ function measureBlockEnd(block: unknown): RouteTestContentMeasure {
  * bounded measurement that never copies or stores the value. Every `next()`
  * promise is tracked so an adapter that ignores cancellation keeps the
  * single-flight slot until it actually settles, and the iterator is always
- * closed through the same tracker.
+ * closed through the same tracker. A terminal result (a consumed `finish` or a
+ * natural `step.done`) releases that ownership normally; a non-terminal early
+ * stop on a stream without `return()` abandons it permanently, because the
+ * provider iterator could still be live and nothing can close it.
  *
  * @param llm - live LLM service.
  * @param request - fixed probe request.
@@ -1144,6 +1180,10 @@ async function consumeRouteTestStream(
     return exceedsContentBound();
   };
 
+  // A terminal result is a consumed `finish` chunk or a natural `step.done`.
+  // Every other exit (output bound, cancellation, timeout, thrown next) stops
+  // the probe before the provider stream proved it was finished.
+  let terminal = false;
   try {
     for (;;) {
       // Track the provider operation before racing it: a `next()` that never
@@ -1162,7 +1202,8 @@ async function consumeRouteTestStream(
       if (aborted === 'CANCELLED') return { kind: 'cancelled' };
       if (aborted === 'TIMEOUT') return { kind: 'timeout' };
       if (step.done === true) {
-        // No terminal finish: the provider closed the stream prematurely.
+        // The iterator ended naturally: terminal even without a finish chunk.
+        terminal = true;
         return { kind: 'failure', failure: { code: 'STREAM_CLOSED' } };
       }
 
@@ -1181,6 +1222,9 @@ async function consumeRouteTestStream(
         : undefined;
 
       if (type === 'finish') {
+        // The provider reported its terminal result even if the content bound
+        // rejects what was assembled: the stream itself is finished.
+        terminal = true;
         if (exceedsContentBound()) return { kind: 'oversize' };
         return { kind: 'finish', reason: chunk.reason, sawContent };
       }
@@ -1212,7 +1256,14 @@ async function consumeRouteTestStream(
       if (addMisc(measureModelContent(chunk))) return { kind: 'oversize' };
     }
   } finally {
+    const hadReturn = typeof iterator.return === 'function';
     await closeRouteTestIterator(iterator, tracker);
+    if (!terminal && !hadReturn) {
+      // The probe stopped before the stream ended and there is no `return()`
+      // to close it: the provider iterator may still be live, so the slot must
+      // never be released (a second stream would accumulate beside an orphan).
+      tracker.abandon();
+    }
   }
 }
 
@@ -1368,7 +1419,9 @@ export function installRouteTestEndpoint(
    * an orphaned one.
    */
   const releaseFlight = (flight: RouteTestFlight): void => {
-    if (flight.released) return;
+    // An abandoned flight can never be released: its provider stream could not
+    // be closed, and a second probe must not accumulate beside it.
+    if (flight.released || flight.abandoned) return;
     flight.released = true;
     if (activeFlight !== flight) return;
     activeFlight = undefined;
@@ -1406,6 +1459,9 @@ export function installRouteTestEndpoint(
         () => settleFlightOperation(flight),
       );
       return promise;
+    },
+    abandon(): void {
+      flight.abandoned = true;
     },
   });
 
@@ -1447,7 +1503,7 @@ export function installRouteTestEndpoint(
 
       const deadline = createRouteTestDeadline(timeoutMs, signal);
       markRouteTestStarted(state, now());
-      const flight: RouteTestFlight = { pending: 0, finished: false, released: false };
+      const flight: RouteTestFlight = { pending: 0, finished: false, released: false, abandoned: false };
       activeFlight = flight;
       const tracker = createTracker(flight);
       try {
@@ -1545,9 +1601,17 @@ export function installRouteTestEndpoint(
         if (aborted === 'TIMEOUT') return refuse('TIMEOUT');
         return buildRouteTestFailure(stats, readThrownFailure(error), { startedAt, now });
       } finally {
-        // The endpoint has decided its result; the slot is handed back only
-        // when every tracked provider operation has actually settled, so an
-        // orphaned capability/next/return keeps later probes at BUSY.
+        // Only an outstanding provider operation (or an abandoned unclosable
+        // stream) needs the request severed: clearing just the deadline timer
+        // would leave that live model request running. A normal terminal probe
+        // whose operations all settled is already complete and keeps its
+        // request signal untouched.
+        if (flight.pending > 0 || flight.abandoned) {
+          deadline.abort();
+        }
+        // The slot is handed back only after every tracked operation actually
+        // settles (or never, for an abandoned unclosable stream), so an orphan
+        // cannot be joined by a second provider stream.
         finishFlight(flight);
         deadline.dispose();
       }

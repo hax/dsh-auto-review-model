@@ -152,7 +152,8 @@ export interface RouteTestState {
      * Provider operations started by the last admitted probe that have not
      * settled yet. While this is non-zero the single-flight slot stays held, so
      * a timeout/cancellation can return a result without allowing a second
-     * provider stream to accumulate beside an orphaned one.
+     * provider stream to accumulate beside an orphaned one. An abandoned
+     * unclosable stream also keeps the slot held even after this reaches zero.
      */
     pendingProviderOperations: number;
 }
