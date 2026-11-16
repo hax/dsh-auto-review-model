@@ -23,7 +23,7 @@ DSH 的 Auto review 在每次受支持的工具调用执行前，用当前会话
 - **思考等级能力查询**：在传递配置的 `reasoningEffort` 前，插件通过 `resolveModelInfo` 查询该路由的能力，并将审查请求的 `AbortSignal` 与 300000ms（5 分钟）超时组合后传入。只有当目标模型声明支持该等级时才传递；若查询成功但未声明该等级，则不显式传递并回退到 provider 默认值。若查询失败或超时，审查会以包含实际 route、超时时间和修复建议的可操作错误直接失败（fail-closed），不会把失败当成“不支持”，也不会静默降级。
 - **缓存失效**：仅缓存成功的能力查询结果，按路由进行内存缓存，并采用 generation / epoch 计数机制，防止在缓存失效前在途的查询结果以过时数据错误写回。失败或超时的查询不会被缓存，下一次审查会重新查询。宿主侧监听 `loader/volatile-update` 时使用 `global: true`，以确保能够可靠接收到 provider 的局部配置变更通知；当收到 `llm/adapters-updated` 或 `loader/volatile-update` 事件时，缓存会及时失效。
 - **Fail-closed 安全机制**：若配置的模型不存在、网络不可达或审查执行失败，工具调用按审查失败处理，不会执行（fail-closed）。
-- **已保存路由测试端点**：同一宿主插件还提供一个小的 Typert Remote 方法 `autoReviewModel/testReviewRoute`，由手写的 generated-style `./typert` manifest 声明，浏览器侧从本包 `./remote` contribution 挂载。设置页提供「测试审查路由」操作，用固定无害 prompt 探测已保存的 provider/model/推理等级。宿主自己读取已保存设置，因此页面不传 route、不传凭证、不传 session id、不传 purpose、不传 tools、不传对话历史。探测有界（16 输出 token、20 秒总超时、每分钟 5 次、同一时刻 1 次），不写设置、不改主模型、不执行工具、不返回模型输出。
+- **已保存路由测试端点**：同一宿主插件还提供一个小的 Typert Remote 方法 `autoReviewModel/testReviewRoute`，由手写的 generated-style `./typert` manifest 声明，浏览器侧从本包 `./remote` contribution 挂载。设置页提供「测试审查路由」操作，用固定无害 prompt 探测已保存的 provider/model/推理等级。宿主自己读取已保存设置，因此页面不传 route、不传凭证、不传 session id、不传 purpose、不传 tools、不传对话历史。探测有界（16 输出 token、20 秒总超时、每分钟 5 次、同一时刻 1 次），不写设置、不改主模型、不执行工具、不返回模型输出。若流结束但没有任何真实模型内容（只有结构块，包括空 text block），结果为 `EMPTY_RESPONSE`，不会报告成功。
 
 ## 安装
 
@@ -95,7 +95,7 @@ dsh plugin --profile web add /home/aghost/workspace/dsh-auto-approval-model-fix
 
 截至 2026-11-16，已保存路由测试功能通过以下自动化证据验证：
 - **自动化命令**：`npm run typecheck`、`npm test`、`npm run check` 与 `npm run verify` 退出码均为 0。
-- **测试**：129 项单元测试全部通过（0 失败）：host 33、route-test 36、client 25、client-component 19、Typert contract/产物 9、packaging 7。
+- **测试**：130 项单元测试全部通过（0 失败）：host 33、route-test 37、client 25、client-component 19、Typert contract/产物 9、packaging 7。
 - **静态校验**：`npm run verify` 25/25 项通过，覆盖 exports、Loader 可接受的 `./typert` manifest、Host/Client descriptor 一致性、`./remote` 内嵌与 `$mount` 接线、手写 Typert 产物零运行时依赖，以及所有入口的语法。Desktop 环境下，已安装 experimental-auto-review 策略检查通过 `DSH_NODE_EXECUTABLE` 读取运行中的 `app.asar`；若存在 `DSH_INSTALL_DIR` 但无法读取官方源码，检查会失败而不是静默跳过。只有没有已安装 DSH 包树的源码检出环境才允许报告 SKIP。
 - **已断言的安全不变量**：探测请求只包含 provider/model/[reasoningEffort]/固定 prompt/maxTokens/temperature/signal（绝不含 `sessionId`、`purpose`、`tools`、`toolHistory` 或对话历史）；不写设置；不返回模型输出、凭证材料或任意传输错误文本；Account 与 API-key 故障分类可区分；限流、single-flight、有界超时、有界输出，以及已保存路由变化后的过期结果失效均有覆盖。
 

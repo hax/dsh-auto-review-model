@@ -646,6 +646,40 @@ test('EMPTY_RESPONSE is a warning and carries no model output', async () => {
   assert.equal(failureResult.failureCode, 'EMPTY_RESPONSE');
 });
 
+test('structurally empty streams report EMPTY_RESPONSE instead of OK', async () => {
+  // Reviewer boundary: block-start and an empty text block are structure, not
+  // model content, so neither stream may be reported as a successful answer.
+  const cases: Array<{ name: string; chunks: TestChunk[] }> = [
+    {
+      name: 'block-start then empty text block',
+      chunks: [
+        { type: 'block-start', index: 0, blockType: 'text' },
+        { type: 'block-end', index: 0, block: { type: 'text', text: '' } },
+        { type: 'finish', reason: { kind: 'stop' } },
+      ],
+    },
+    {
+      name: 'block-start then finish',
+      chunks: [
+        { type: 'block-start', index: 0, blockType: 'text' },
+        { type: 'finish', reason: { kind: 'stop' } },
+      ],
+    },
+  ];
+  for (const entry of cases) {
+    const tracker = { closed: false, consumed: 0 };
+    const harness = createHarness({ stream: trackedStream(entry.chunks, tracker) });
+    const result = await harness.invoke();
+    assertResultCode(result, 'EMPTY_RESPONSE', 'warning');
+    assert.equal(result.failureCode, '');
+    assert.equal(result.detail, __testing.ROUTE_TEST_DETAILS.EMPTY_RESPONSE);
+    assert.ok(tracker.closed, `${entry.name}: the consumed stream must be closed`);
+  }
+
+  // A normal short reply still carries real content and stays OK.
+  assertResultCode(await createHarness({ stream: okStream() }).invoke(), 'OK', 'ok');
+});
+
 test('the official DeepSeek Account entry (no nativeAuth) maps account failures', async () => {
   const cases: Array<{ failure: string; status?: number; expected: ReviewRouteTestResult['code'] }> = [
     { failure: 'ACCOUNT_SIGN_IN_REQUIRED', expected: 'ACCOUNT_SIGN_IN_REQUIRED' },
