@@ -13,6 +13,33 @@ export declare const REVIEW_POLICY_MARKER = "You are the final authorization rev
 /** Separator used in the model-capability cache key (`provider\0model`). */
 export declare const EFFORT_CACHE_SEPARATOR = "\0";
 /**
+ * How a review attempt's provider stream is captured before it reaches the
+ * caller's single-decision stream.
+ *
+ * - `buffered` (default): the whole attempt is held until its own terminal
+ *   `finish` proves success, so a failed attempt can never leak reasoning or
+ *   partial text; route failures then advance to the next route. The attempt
+ *   buffer has a deliberately non-binding ceiling (see `./fallback.ts`).
+ * - `pass-through`: every chunk is forwarded immediately. Failing over is only
+ *   possible while no chunk has been emitted; once the caller has seen output,
+ *   a later failure is surfaced instead of switching routes. There is no
+ *   buffer and no ceiling in this mode.
+ */
+export type StreamCaptureMode = 'buffered' | 'pass-through';
+/** Default capture mode; also the fallback for an invalid/unknown value. */
+export declare const DEFAULT_STREAM_CAPTURE: StreamCaptureMode;
+/**
+ * Normalize the volatile `streamCapture` setting.
+ *
+ * Only the exact `pass-through` token (case-insensitive, trimmed) selects the
+ * unbuffered mode; every other value — including a missing field, an unknown
+ * token, or a non-string — degrades to the safe `buffered` default.
+ *
+ * @param {unknown} value - raw configured value.
+ * @returns {StreamCaptureMode} the normalized capture mode.
+ */
+export declare function normalizeStreamCapture(value: unknown): StreamCaptureMode;
+/**
  * Sentinel stored by the settings UI for "inherit the main session's effort".
  *
  * The Host resolves it per intercepted review request and adapts the inherited
@@ -55,6 +82,8 @@ export interface ReviewerConfig {
     provider?: ConfigValue<string>;
     model?: ConfigValue<string>;
     reasoningEffort?: ConfigValue<string>;
+    /** How provider chunks are captured before reaching the caller. */
+    streamCapture?: ConfigValue<unknown>;
     fallbacks?: ConfigValue<unknown>;
 }
 /** Normalized reviewer settings read from one live config snapshot. */
@@ -66,6 +95,8 @@ export interface ReviewerSettings {
     provider: string;
     model: string;
     reasoningEffort: string;
+    /** Normalized capture mode (`buffered` unless explicitly `pass-through`). */
+    streamCapture: StreamCaptureMode;
 }
 /**
  * Whether one `llm/stream` request is the experimental auto-review call.

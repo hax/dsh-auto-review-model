@@ -85,6 +85,8 @@ interface ReviewerSettings {
   provider: string;
   model: string;
   reasoningEffort: string;
+  /** How provider chunks are captured: `buffered` (default) or `pass-through`. */
+  streamCapture: string;
   /**
    * Ordered explicit routes after row 1 (the legacy primary fields above).
    * Optional so a legacy section (which never had this key) is loaded, edited
@@ -306,12 +308,29 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
   const MAX_ROUTES = 10;
   /** Effort sentinel the UI stores for "inherit the main session's effort". */
   const INHERIT_EFFORT = 'inherit';
+  /** Capture modes the UI offers; every other stored value falls back to buffered. */
+  const STREAM_CAPTURE_MODES = ['buffered', 'pass-through'] as const;
+  const DEFAULT_STREAM_CAPTURE = 'buffered';
+
+  /**
+   * Normalize the volatile capture mode; unknown/old values degrade to the safe
+   * buffered default exactly like the Host does.
+   * @param value - raw configured value.
+   * @returns `pass-through` only for the exact token, otherwise `buffered`.
+   */
+  function normalizeStreamCapture(value: unknown): string {
+    return typeof value === 'string' && value.trim().toLowerCase() === 'pass-through'
+      ? 'pass-through'
+      : DEFAULT_STREAM_CAPTURE;
+  }
+
   /** Values shown before the first successful read; never mutated. */
   const DEFAULT_SETTINGS: ReviewerSettings = Object.freeze({
     primaryEnabled: true,
     provider: '',
     model: '',
     reasoningEffort: '',
+    streamCapture: DEFAULT_STREAM_CAPTURE,
     fallbacks: Object.freeze([]) as unknown as FallbackEntry[],
   });
 
@@ -347,6 +366,10 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     routeRowLabel: '审查路由 {index}',
     routeTableLabel: '审查路由表',
     routeActions: '操作',
+    streamCaptureLabel: '流式捕获',
+    streamCaptureBuffered: '缓冲（默认）',
+    streamCapturePassThrough: '直通（不缓冲）',
+    streamCaptureHint: '缓冲模式在整条路由成功后才交付，失败尝试不会泄漏；直通模式逐块转发，但一旦已有输出后失败就只能报错，不会切换路由。',
     routeProvider: '提供商',
     routeProviderPlaceholder: '选择提供商',
     routeModel: '模型',
@@ -455,6 +478,10 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     routeRowLabel: 'Review route {index}',
     routeTableLabel: 'Review routes table',
     routeActions: 'Actions',
+    streamCaptureLabel: 'Stream capture',
+    streamCaptureBuffered: 'Buffered (default)',
+    streamCapturePassThrough: 'Pass-through (unbuffered)',
+    streamCaptureHint: 'Buffered delivers only after an attempt succeeds, so a failed attempt never leaks. Pass-through forwards chunks immediately; once output has been emitted, a later failure is reported instead of switching routes.',
     routeProvider: 'Provider',
     routeProviderPlaceholder: 'Select a provider',
     routeModel: 'Model',
@@ -568,6 +595,9 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
 .dsh_arm_testBlocked{color:var(--dsw-alias-label-tertiary)}
 .dsh_arm_testDetail{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;overflow-wrap:anywhere}
 .dsh_arm_routes{display:flex;flex-direction:column;gap:8px;min-width:0;padding-top:10px;border-top:1px solid var(--dsw-alias-border-l2)}
+.dsh_arm_capture{display:flex;flex-direction:column;gap:4px;min-width:0}
+.dsh_arm_captureRow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+.dsh_arm_captureRow .dsh_arm_select{flex:0 1 220px;min-width:150px}
 .dsh_arm_routeHeader{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;min-width:0}
 .dsh_arm_tableWrap{width:100%;min-width:0;overflow-x:auto;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-1)}
 .dsh_arm_table{box-sizing:border-box;width:100%;min-width:680px;border-collapse:collapse;table-layout:fixed}
@@ -655,6 +685,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
       provider: trimString(source.provider),
       model: trimString(source.model),
       reasoningEffort: trimString(source.reasoningEffort),
+      streamCapture: normalizeStreamCapture(source.streamCapture),
     };
     // Only materialize the key when the section actually carries a fallback
     // list, so a legacy section round-trips unchanged until the user saves.
@@ -868,7 +899,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
    * @param rows - editable explicit routes in display order.
    * @returns the settings value to persist.
    */
-  function settingsFromRows(rows: unknown): ReviewerSettings {
+  function settingsFromRows(rows: unknown, streamCapture: unknown = DEFAULT_STREAM_CAPTURE): ReviewerSettings {
     const list = normalizeRoutes(rows);
     const [first, ...rest] = list;
     const settings: ReviewerSettings = {
@@ -876,6 +907,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
       provider: first === undefined ? '' : first.provider,
       model: first === undefined ? '' : first.model,
       reasoningEffort: first === undefined ? '' : first.reasoningEffort,
+      streamCapture: normalizeStreamCapture(streamCapture),
     };
     if (rest.length > 0) settings.fallbacks = rest.map(storedFallback);
     return settings;
@@ -1508,6 +1540,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     // this one.
     const [saved, setSaved] = React.useState<ReviewerSettings>(DEFAULT_SETTINGS);
     const [rows, setRows] = React.useState<ReviewRoute[]>(() => rowsFromSettings(DEFAULT_SETTINGS));
+    const [streamCapture, setStreamCapture] = React.useState<string>(DEFAULT_SETTINGS.streamCapture);
     const [groups, setGroups] = React.useState<ProviderGroup[]>([]);
     const [revision, setRevision] = React.useState<number | undefined>(undefined);
     const [catalogError, setCatalogError] = React.useState<string>('');
@@ -1548,6 +1581,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
         const next = reconcileDraft(result.value, result.groups);
         setSaved(next);
         setRows(rowsFromSettings(next));
+        setStreamCapture(next.streamCapture);
         setGroups(result.groups);
         setRevision(result.revision);
         setCatalogError(result.catalogError);
@@ -1583,6 +1617,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
         const next = reconcileDraft(result.value, result.groups);
         setSaved(next);
         setRows(rowsFromSettings(next));
+        setStreamCapture(next.streamCapture);
         setGroups(result.groups);
         setRevision(result.revision);
         setCatalogError(result.catalogError);
@@ -1612,8 +1647,9 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     // primaryEnabled flag is stored in the top-level fields, rows 2..N plus
     // their enabled flags in `fallbacks`. The implicit session fallback is not
     // a row, so it can never be reordered, removed or persisted.
-    const draft = settingsFromRows(rows);
-    const dirty = !routesEqual(rows, rowsFromSettings(saved));
+    const draft = settingsFromRows(rows, streamCapture);
+    const dirty = !routesEqual(rows, rowsFromSettings(saved))
+      || streamCapture !== saved.streamCapture;
 
     const formBusy = busy || loading;
     const controlsDisabled = formBusy || !loaded;
@@ -1666,6 +1702,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
 
     const discard = () => {
       setRows(rowsFromSettings(saved));
+      setStreamCapture(saved.streamCapture);
       resetRowTests();
       setStatus(null);
     };
@@ -1750,7 +1787,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
         const response = await saveReviewerSettings(
           remote,
           NS,
-          settingsFromRows(rows),
+          settingsFromRows(rows, streamCapture),
           revision,
         );
         if (response === null || response === undefined || response.ok !== true) {
@@ -1765,6 +1802,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
           const next = reconcileDraft(refreshed.value, refreshed.groups);
           setSaved(next);
           setRows(rowsFromSettings(next));
+          setStreamCapture(next.streamCapture);
           setGroups(refreshed.groups);
           setRevision(refreshed.revision);
           setCatalogError(refreshed.catalogError);
@@ -1785,6 +1823,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
         const fallback = reconcileDraft(normalizeSettings(rawSection), groups);
         setSaved(fallback);
         setRows(rowsFromSettings(fallback));
+        setStreamCapture(fallback.streamCapture);
         // The saved values moved even though the re-read failed: drop every
         // result that belongs to the previous values.
         resetRowTests();
@@ -2034,6 +2073,27 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
         }, t('routeAdd')),
       ),
       React.createElement('p', { className: 'dsh_arm_hint' }, t('reviewRoutesHint')),
+      React.createElement('div', { className: 'dsh_arm_capture' },
+        React.createElement('div', { className: 'dsh_arm_captureRow' },
+          React.createElement('span', { className: 'dsh_arm_label' }, t('streamCaptureLabel')),
+          React.createElement(ARMSelect, {
+            value: streamCapture,
+            onChange: (value: string) => {
+              setStreamCapture(normalizeStreamCapture(value));
+              clearOk();
+            },
+            placeholder: t('streamCaptureBuffered'),
+            label: t('streamCaptureLabel'),
+            options: STREAM_CAPTURE_MODES.map((mode) => ({
+              value: mode,
+              label: mode === 'pass-through' ? t('streamCapturePassThrough') : t('streamCaptureBuffered'),
+            })),
+            disabled: controlsDisabled,
+            testId: 'stream-capture',
+          }),
+        ),
+        React.createElement('p', { className: 'dsh_arm_hint' }, t('streamCaptureHint')),
+      ),
       testRoute === undefined
         ? React.createElement('p', { className: 'dsh_arm_hint' }, t('testUnavailableHint'))
         : null,

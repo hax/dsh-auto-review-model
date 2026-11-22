@@ -34,12 +34,15 @@
  * whose official failure code is a quota / auth / credential / rate-limit /
  * server / timeout / transport / adapter failure — advance to the next route.
  * A caller abort is propagated untouched, and content/protocol failures are
- * surfaced instead of retried. Chunks are forwarded to the caller immediately:
- * a route may only be replaced before its first chunk is emitted. Once output
- * has crossed that commit point, a later failure is surfaced as an actionable
- * error instead of retrying, so the caller's single-decision stream never sees
- * chunks from two different routes. When every route fails before any output,
- * one aggregate error lists each attempted route with its code and raw provider message.
+ * surfaced instead of retried. An attempt that exceeds the bounded buffer is a
+ * route failure too: its buffered output is discarded and the next route (and
+ * finally the session route) is tried, because a reasoning-heavy reviewer can
+ * legitimately stream many chunks. Each attempt is buffered until its own
+ * terminal `finish` proves success, so a failed attempt's reasoning or partial
+ * text can never leak into the caller's single-decision stream; only a
+ * successful route's buffered chunks are yielded, exactly once. When every
+ * route fails, one aggregate error lists each attempted route with its code and
+ * raw provider message.
  *
  * The same plugin instance publishes one small Typert Remote endpoint,
  * `autoReviewModel/testReviewRoute`, so the settings page can probe the SAVED
@@ -53,12 +56,12 @@
  * @module @aghost-prj/dsh-auto-review-model
  */
 import z from '@deepseek-ai/schemastery';
-import { adaptEffortToAdvertised, effortCacheKey, effortRank, isAutoReviewRequest, normalizeEffort, readReviewerSettings, shouldOverrideRoute } from './policy.js';
+import { adaptEffortToAdvertised, effortCacheKey, effortRank, isAutoReviewRequest, normalizeEffort, normalizeStreamCapture, readReviewerSettings, shouldOverrideRoute } from './policy.js';
 import type { ReviewerConfig } from './policy.js';
 import { installRouteTestEndpoint } from './route-test.js';
 import { readThrownFailure } from './failure.js';
 export { ReviewerRouteError, ReviewerRoutesError } from './fallback.js';
-import { ReviewerRouteError, ReviewerRoutesError, buildReviewPlan, failureFromFinish, failureFromThrown, isAsyncIterable, isFallbackEligibleFailure, readFallbackEntries } from './fallback.js';
+import { ReviewerRouteError, ReviewerRoutesError, buildReviewPlan, closeReviewStream, failureFromFinish, failureFromThrown, isAsyncIterable, isFallbackEligibleFailure, measureChunkContent, readFallbackEntries } from './fallback.js';
 /** One adapter-owned reasoning effort advertised for an exact route. */
 interface LlmEffortInfo {
     id?: string;
@@ -198,15 +201,20 @@ export declare const __testing: {
     effortRank: typeof effortRank;
     adaptEffortToAdvertised: typeof adaptEffortToAdvertised;
     INHERIT_EFFORT: string;
+    normalizeStreamCapture: typeof normalizeStreamCapture;
     CAPABILITY_TIMEOUT_MS: number;
     ReviewerCapabilityError: typeof ReviewerCapabilityError;
     /** Fallback policy and streaming helpers exported by `./fallback.js` for Host tests. */
     fallback: {
         MAX_FALLBACK_ENTRIES: number;
+        FALLBACK_MAX_BUFFER_CHUNKS: number;
+        FALLBACK_MAX_BUFFER_CHARS: number;
+        FALLBACK_CLOSE_GRACE_MS: number;
         ROUTES_ERROR_NAME: string;
         ROUTES_ERROR_CODE: string;
         ROUTE_ERROR_NAME: string;
         ROUTE_ERROR_CODE: string;
+        BUFFER_LIMIT_CODE: string;
         PROTOCOL_FAILURE_CODE: string;
         normalizeFallbackEntry: typeof import("./fallback.js").normalizeFallbackEntry;
         isLegacySessionEntry: typeof import("./fallback.js").isLegacySessionEntry;
@@ -215,7 +223,9 @@ export declare const __testing: {
         isFallbackEligibleFailure: typeof isFallbackEligibleFailure;
         failureFromThrown: typeof failureFromThrown;
         failureFromFinish: typeof failureFromFinish;
+        measureChunkContent: typeof measureChunkContent;
         isAsyncIterable: typeof isAsyncIterable;
+        closeReviewStream: typeof closeReviewStream;
         ReviewerRoutesError: typeof ReviewerRoutesError;
         ReviewerRouteError: typeof ReviewerRouteError;
     };

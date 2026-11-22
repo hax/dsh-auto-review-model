@@ -23,13 +23,14 @@
  *   route (route / credential / quota / rate-limit / transport failures only),
  *   using the installed `@deepseek-ai/dsh-llm` provider-neutral taxonomy;
  * - the aggregate `ReviewerRoutesError` and the non-retryable
- *   `ReviewerRouteError` thrown back to Auto review.
+ *   `ReviewerRouteError` thrown back to Auto review;
+ * - the bounded content measurement and stream-closing helper used by the
+ *   Host's all-or-nothing attempt buffering.
  *
- * The Host entry (`./index.ts`) performs the actual streaming. It forwards the
- * winning route's chunks immediately and can only switch routes before the
- * first chunk reaches the caller: once output has been emitted, a later failure
- * is surfaced rather than retried, so the caller's decision stream is never
- * contaminated with a second route.
+ * The Host entry (`./index.ts`) performs the actual streaming; it buffers one
+ * attempt until its terminal `finish` proves success, so a failed attempt can
+ * never leak reasoning or partial text into the caller's single-decision
+ * stream.
  *
  * @module @aghost-prj/dsh-auto-review-model/fallback
  */
@@ -48,6 +49,37 @@ import type { ConfigValue, ReviewerConfig, ReviewerSettings } from './policy.js'
 /** Largest number of configurable fallback entries a Host will schedule. */
 export const MAX_FALLBACK_ENTRIES = 10;
 
+/**
+ * Largest number of stream chunks one BUFFERED attempt may hold before the
+ * attempt is abandoned.
+ *
+ * This ceiling is deliberately non-binding in practice: a provider stream is
+ * already bounded by the model's max output tokens, and adapters emit roughly
+ * one chunk per token, so a legitimate reasoning-heavy stream cannot approach
+ * 131 072 chunks. It exists only to stop a pathological unbounded stream from
+ * exhausting memory. Exceeding it is a ROUTE failure: the buffered chunks are
+ * discarded and the next route (and finally the session route) is tried.
+ *
+ * The `pass-through` capture mode does not buffer and therefore has no ceiling.
+ */
+export const FALLBACK_MAX_BUFFER_CHUNKS = 131_072;
+
+/**
+ * Largest number of model-content characters one BUFFERED attempt may hold.
+ *
+ * 8 000 000 characters (roughly 8 MB of model text) is far above any legitimate
+ * reviewer reply, including long reasoning chains. ATTEMPTS ARE SEQUENTIAL, so
+ * at most one attempt's backlog is alive at a time: the memory bound is roughly
+ * `FALLBACK_MAX_BUFFER_CHARS` characters plus one JS array slot per buffered
+ * chunk (at most `FALLBACK_MAX_BUFFER_CHUNKS`). Exceeding it abandons the
+ * attempt, discards its buffer, and advances to the next route exactly like a
+ * quota/transport failure.
+ */
+export const FALLBACK_MAX_BUFFER_CHARS = 8_000_000;
+
+/** Bound on closing an abandoned attempt's provider stream. */
+export const FALLBACK_CLOSE_GRACE_MS = 250;
+
 /** Stable `name` of the aggregate all-routes-failed error. */
 export const ROUTES_ERROR_NAME = 'AutoReviewModelRoutesError';
 
@@ -59,6 +91,9 @@ export const ROUTE_ERROR_NAME = 'AutoReviewModelRouteError';
 
 /** Stable `code` of one non-retryable attempt failure. */
 export const ROUTE_ERROR_CODE = 'AUTO_REVIEW_MODEL_ROUTE_FAILED';
+
+/** Error code: one attempt exceeded the bounded attempt buffer (a retryable route failure). */
+export const BUFFER_LIMIT_CODE = 'AUTO_REVIEW_MODEL_BUFFER_LIMIT';
 
 /** Error code: one attempt's finish reported an unclassified protocol failure. */
 export const PROTOCOL_FAILURE_CODE = 'AUTO_REVIEW_MODEL_PROTOCOL_FAILURE';
@@ -467,10 +502,9 @@ export class ReviewerRoutesError extends Error {
 /**
  * Throwable raised when one route failed in a way that must not be retried.
  *
- * Content/protocol problems, adapter-side aborts, and a failure after the
- * route already emitted output belong to that route: another route would hide
- * the problem, duplicate output, or fail the same way, so the review fails
- * closed with this actionable error.
+ * Content/protocol problems, adapter-side aborts, and attempt-buffer overflows
+ * belong to the route that produced them: another route would hide the problem
+ * or fail the same way, so the review fails closed with this actionable error.
  */
 export class ReviewerRouteError extends Error {
   /** Stable diagnostic code. */
@@ -499,6 +533,78 @@ export class ReviewerRouteError extends Error {
   }
 }
 
+/** Maximum number of nodes one bounded chunk measurement walks. */
+const MAX_MEASURE_NODES = 256;
+
+/**
+ * Measure one stream chunk's model content without retaining or serializing it.
+ *
+ * Stream content can arrive as delta text, assembled blocks, tool arguments, or
+ * future merge-extensible chunk types, so the walker counts string lengths
+ * across a node-bounded walk and stops as soon as {@link FALLBACK_MAX_BUFFER_CHARS}
+ * is exceeded. The cap is reported as `limit + 1`, which is all the caller needs
+ * to refuse the attempt.
+ *
+ * @param value - one stream chunk.
+ * @returns measured characters, clamped to `FALLBACK_MAX_BUFFER_CHARS + 1`.
+ */
+export function measureChunkContent(value: unknown): number {
+  const limit = FALLBACK_MAX_BUFFER_CHARS;
+  const seen = { chars: 0, nodes: 0, exceeded: false };
+  const visit = (current: unknown): void => {
+    if (seen.exceeded) return;
+    seen.nodes += 1;
+    if (seen.nodes > MAX_MEASURE_NODES) {
+      seen.exceeded = true;
+      return;
+    }
+    switch (typeof current) {
+      case 'string':
+        seen.chars += current.length;
+        break;
+      case 'number':
+      case 'boolean':
+      case 'undefined':
+        seen.chars += 1;
+        break;
+      case 'object': {
+        if (current === null) break;
+        if (Array.isArray(current)) {
+          for (const item of current) {
+            visit(item);
+            if (seen.exceeded) return;
+          }
+          break;
+        }
+        const record = current as Record<string, unknown>;
+        for (const key in record) {
+          if (!Object.hasOwn(record, key)) continue;
+          seen.chars += key.length;
+          if (seen.chars > limit) {
+            seen.exceeded = true;
+            return;
+          }
+          try {
+            visit(record[key]);
+          } catch {
+            // A hostile getter/proxy is unknown content: refuse rather than read it.
+            seen.exceeded = true;
+            return;
+          }
+          if (seen.exceeded) return;
+        }
+        break;
+      }
+      default:
+        // Functions, symbols, and bigints are not JSON model content.
+        break;
+    }
+    if (seen.chars > limit) seen.exceeded = true;
+  };
+  visit(value);
+  return Math.min(seen.chars, limit + 1);
+}
+
 /** Whether a value is an async iterable the Host can consume. */
 export function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return false;
@@ -506,13 +612,48 @@ export function isAsyncIterable(value: unknown): value is AsyncIterable<unknown>
   return typeof iterator === 'function';
 }
 
+/**
+ * Close one abandoned attempt's provider iterator under a small grace bound.
+ *
+ * A failed attempt may still hold a live provider request. Closing it is
+ * cleanup, so every error is swallowed; a degraded adapter that never settles
+ * `return()` must not hold the review open, hence the grace race. The returned
+ * promise never rejects.
+ *
+ * @param iterator - the attempt's stream iterator.
+ */
+export async function closeReviewStream(iterator: AsyncIterator<unknown>): Promise<void> {
+  const close = iterator.return;
+  if (typeof close !== 'function') return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      Promise.resolve()
+        .then(() => close.call(iterator))
+        .then(() => {}, () => {}),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, FALLBACK_CLOSE_GRACE_MS);
+        timer.unref?.();
+      }),
+    ]);
+  } catch {
+    // Cleanup must never mask the failure that made the attempt abandoned.
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 /** Stable surface for host tests; not part of the plugin contract. */
 export const __testing = {
   MAX_FALLBACK_ENTRIES,
+  FALLBACK_MAX_BUFFER_CHUNKS,
+  FALLBACK_MAX_BUFFER_CHARS,
+  FALLBACK_CLOSE_GRACE_MS,
   ROUTES_ERROR_NAME,
   ROUTES_ERROR_CODE,
   ROUTE_ERROR_NAME,
   ROUTE_ERROR_CODE,
+  BUFFER_LIMIT_CODE,
   PROTOCOL_FAILURE_CODE,
   normalizeFallbackEntry,
   isLegacySessionEntry,
@@ -521,7 +662,9 @@ export const __testing = {
   isFallbackEligibleFailure,
   failureFromThrown,
   failureFromFinish,
+  measureChunkContent,
   isAsyncIterable,
+  closeReviewStream,
   ReviewerRoutesError,
   ReviewerRouteError,
 };

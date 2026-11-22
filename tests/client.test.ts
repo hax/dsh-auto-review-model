@@ -110,6 +110,7 @@ interface ReviewerSettings {
   provider: string;
   model: string;
   reasoningEffort: string;
+  streamCapture: string;
   fallbacks?: FallbackEntry[];
 }
 
@@ -718,6 +719,7 @@ test('normalizeSettings supplies the route defaults and ignores the deprecated e
     provider: '',
     model: '',
     reasoningEffort: '',
+    streamCapture: 'buffered',
   };
   assert.deepEqual(testing().normalizeSettings(), expected);
   assert.deepEqual(testing().normalizeSettings(undefined), expected);
@@ -741,12 +743,14 @@ test('normalizeSettings trims strings and honors explicit enable flags', () => {
       provider: '  provider-a  ',
       model: '  model-a1  ',
       reasoningEffort: '  high  ',
+      streamCapture: ' pass-through ',
     }),
     {
       primaryEnabled: false,
       provider: 'provider-a',
       model: 'model-a1',
       reasoningEffort: 'high',
+      streamCapture: 'pass-through',
     },
   );
 });
@@ -764,6 +768,7 @@ test('normalizeSettings tolerates dirty field values without throwing', () => {
     'primaryEnabled',
     'provider',
     'reasoningEffort',
+    'streamCapture',
   ]);
   assert.equal(typeof normalized.primaryEnabled, 'boolean');
   assert.equal(typeof normalized.provider, 'string');
@@ -805,6 +810,7 @@ test('reconcileDraft retains provider, model, effort and enable flags when catal
     provider: 'provider-custom',
     model: 'model-custom',
     reasoningEffort: 'high',
+    streamCapture: 'buffered',
   };
 
   assert.deepEqual(reconcileDraft(savedSettings, []), savedSettings);
@@ -823,6 +829,7 @@ test('reconcileDraft retains provider, model, effort and enable flags when catal
       provider: 'prov',
       model: 'mod',
       reasoningEffort: 'med',
+      streamCapture: 'buffered',
     },
   );
 });
@@ -970,6 +977,7 @@ test('loadReviewerSettings reads settings and the model catalog', async () => {
     provider: 'provider-a',
     model: 'model-a1',
     reasoningEffort: 'high',
+    streamCapture: 'buffered',
   }, 'the deprecated enabled knob is not loaded');
   assert.equal(loaded.revision, 11);
   assert.deepEqual(loaded.groups, GROUPS);
@@ -984,6 +992,7 @@ test('loadReviewerSettings returns ok:true with empty groups and catalogError wh
     provider: 'provider-saved',
     model: 'model-saved',
     reasoningEffort: 'low',
+    streamCapture: 'buffered',
   };
 
   const remoteCatalogFailed = {
@@ -1066,32 +1075,32 @@ test('summaryLine reflects loading, enabled rows and the implicit session fallba
   const t = (key: string) => `[${key}]`;
 
   assert.equal(
-    summaryLine({ primaryEnabled: true, provider: 'p1', model: 'm1', reasoningEffort: '' }, true, t),
+    summaryLine({ primaryEnabled: true, provider: 'p1', model: 'm1', reasoningEffort: '', streamCapture: 'buffered' }, true, t),
     '[summaryLabel]: [summaryLoading]',
   );
   assert.equal(
-    summaryLine({ primaryEnabled: true, provider: '', model: '', reasoningEffort: '' }, false, t),
+    summaryLine({ primaryEnabled: true, provider: '', model: '', reasoningEffort: '', streamCapture: 'buffered' }, false, t),
     '[summaryLabel]: [summarySession]',
   );
   assert.equal(
-    summaryLine({ primaryEnabled: false, provider: 'p1', model: 'm1', reasoningEffort: 'high' }, false, t),
+    summaryLine({ primaryEnabled: false, provider: 'p1', model: 'm1', reasoningEffort: 'high', streamCapture: 'buffered' }, false, t),
     '[summaryLabel]: [summarySession]',
     'a disabled row is not summarized as the active route',
   );
   assert.equal(
-    summaryLine({ primaryEnabled: true, provider: 'p1', model: '', reasoningEffort: '' }, false, t),
+    summaryLine({ primaryEnabled: true, provider: 'p1', model: '', reasoningEffort: '', streamCapture: 'buffered' }, false, t),
     '[summaryLabel]: [summarySession]',
   );
   assert.equal(
-    summaryLine({ primaryEnabled: true, provider: 'p1', model: 'm1', reasoningEffort: '' }, false, t),
+    summaryLine({ primaryEnabled: true, provider: 'p1', model: 'm1', reasoningEffort: '', streamCapture: 'buffered' }, false, t),
     '[summaryLabel]: p1 / m1',
   );
   assert.equal(
-    summaryLine({ primaryEnabled: true, provider: 'p1', model: 'm1', reasoningEffort: 'high' }, false, t),
+    summaryLine({ primaryEnabled: true, provider: 'p1', model: 'm1', reasoningEffort: 'high', streamCapture: 'buffered' }, false, t),
     '[summaryLabel]: p1 / m1 · high',
   );
   assert.equal(
-    summaryLine({ primaryEnabled: true, provider: 'p1', model: 'm1', reasoningEffort: 'inherit' }, false, t),
+    summaryLine({ primaryEnabled: true, provider: 'p1', model: 'm1', reasoningEffort: 'inherit', streamCapture: 'buffered' }, false, t),
     '[summaryLabel]: p1 / m1 · inherit',
   );
 });
@@ -1113,6 +1122,7 @@ test('saveReviewerSettings writes row 1 with primaryEnabled and no deprecated en
     provider: 'provider-a',
     model: 'model-a1',
     reasoningEffort: 'high',
+    streamCapture: 'pass-through',
   };
 
   await testing().saveReviewerSettings(remote, SETTINGS_NS, draft, 11);
@@ -1123,6 +1133,7 @@ test('saveReviewerSettings writes row 1 with primaryEnabled and no deprecated en
       provider: 'provider-a',
       model: 'model-a1',
       reasoningEffort: 'high',
+      streamCapture: 'pass-through',
     },
     11,
   ]);
@@ -1166,6 +1177,7 @@ test('normalizeSettings keeps legacy sections without a fallbacks key', () => {
     'primaryEnabled',
     'provider',
     'reasoningEffort',
+    'streamCapture',
   ]);
   assert.ok(!Object.hasOwn(legacy, 'fallbacks'), 'a legacy section must not gain a fallbacks key');
   assert.equal(legacy.primaryEnabled, true);
@@ -1253,17 +1265,18 @@ test('settingsFromRows splits row 1 and keeps per-row enable flags', () => {
       provider: 'provider-a',
       model: 'model-a1',
       reasoningEffort: 'high',
+      streamCapture: 'buffered',
       fallbacks: [{ mode: 'route', enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: '' }],
     },
   );
   assert.deepEqual(
     testing().settingsFromRows([]),
-    { primaryEnabled: true, provider: '', model: '', reasoningEffort: '' },
+    { primaryEnabled: true, provider: '', model: '', reasoningEffort: '', streamCapture: 'buffered' },
     'an empty list keeps the legacy shape without a fallbacks key',
   );
   assert.deepEqual(
     testing().settingsFromRows([{ enabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: '' }]),
-    { primaryEnabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: '' },
+    { primaryEnabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: '', streamCapture: 'buffered' },
     'a single row needs no fallbacks key',
   );
 });
@@ -1359,6 +1372,7 @@ test('saveReviewerSettings persists enable flags with the split list', async () 
       provider: 'provider-a',
       model: 'model-a1',
       reasoningEffort: 'inherit',
+      streamCapture: 'pass-through',
       fallbacks: [
         { mode: 'route', enabled: false, provider: ' provider-b ', model: ' model-b1 ', reasoningEffort: 'high' },
         { mode: 'route', enabled: true, provider: '', model: '', reasoningEffort: '' },
@@ -1374,6 +1388,7 @@ test('saveReviewerSettings persists enable flags with the split list', async () 
       provider: 'provider-a',
       model: 'model-a1',
       reasoningEffort: 'inherit',
+      streamCapture: 'pass-through',
       fallbacks: [
         { mode: 'route', enabled: false, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'high' },
         { mode: 'route', enabled: true, provider: '', model: '', reasoningEffort: '' },
@@ -1398,6 +1413,7 @@ test('summaryLine counts only enabled later rows', () => {
         provider: 'p1',
         model: 'm1',
         reasoningEffort: '',
+        streamCapture: 'buffered',
         fallbacks: [SAVED_FALLBACK, { ...SAVED_FALLBACK, enabled: false }],
       },
       false,
@@ -1439,6 +1455,10 @@ test('the locale dictionaries cover the per-row enable, inherit and inline test 
     'summarySession',
     'summaryFallbacks',
     'testUnavailableHint',
+    'streamCaptureLabel',
+    'streamCaptureBuffered',
+    'streamCapturePassThrough',
+    'streamCaptureHint',
   ]) {
     assert.equal(typeof reg.zh[key], 'string', `${key} missing from zh`);
     assert.equal(typeof reg.en[key], 'string', `${key} missing from en`);

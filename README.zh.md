@@ -24,9 +24,10 @@ DSH 的 Auto review 在每次受支持的工具调用执行前，用当前会话
 - **逐行启用**：每行都有启用标记（第 1 行是 `primaryEnabled`，每个备选是 `enabled`）。禁用的行仍会保存、仍可编辑，但在构造尝试计划时被跳过；若所有行都被禁用或为空，计划为空，插件完全不改写请求。
 - **思考等级能力查询**：在传递配置的 `reasoningEffort` 前，插件通过 `resolveModelInfo` 查询该路由的能力，并将审查请求的 `AbortSignal` 与 300000ms（5 分钟）超时组合后传入。只有当目标模型声明支持该等级时才传递；若查询成功但未声明该等级，则不显式传递并回退到 provider 默认值。若查询失败或超时，该路由按“路由失败”处理：记录包含实际 route、超时时间和修复建议的可操作错误，然后尝试下一条已启用路由（最后是隐式会话路由）；只有全部路由失败时，该错误才会出现在聚合错误里。它不会被当成“不支持”，也不会静默降级到默认等级。
 - **缓存失效**：仅缓存成功的能力查询结果，按路由进行内存缓存，并采用 generation / epoch 计数机制，防止在缓存失效前在途的查询结果以过时数据错误写回。失败或超时的查询不会被缓存，下一次审查会重新查询。宿主侧监听 `loader/volatile-update` 时使用 `global: true`，以确保能够可靠接收到 provider 的局部配置变更通知；当收到 `llm/adapters-updated` 或 `loader/volatile-update` 事件时，缓存会及时失效。
-- **有序路由与隐式会话兜底**：只有“路由不可用”类失败才会切换到下一条：能力查询失败/超时、provider 流抛错，或终止 `finish` 的官方失败码属于配额、认证、凭据、限流、服务端、超时、传输、适配器或模型路由类失败。调用方 abort 原样传播；内容/协议失败直接失败、不重试。当前会话模型（即被拦截请求自带的 provider/model）始终是最后一次尝试：它不可配置、不可调整顺序、不会被保存，也不强制推理等级；请求没有可用路由时不会追加，若已有显式路由使用相同 provider+model 则不会重复追加。没有可用显式路由（列表为空）时插件完全不改写审查请求，直接由会话模型完成审查。旧配置中的 `{ mode: 'session' }` 项会被忽略，因为该兜底已改为隐式。chunk 会立即转发给调用方；fallback 以“首个已发出的 chunk”为提交点：在此之前失败会尝试下一条路由，一旦已有输出，后续失败会直接报错而不再重试，从而避免调用方的“单决策”流混入两条路由的输出。全部路由（含隐式会话兜底）在产生任何输出前都失败时，以一个聚合错误列出每条尝试过的路由、失败码与原始 provider 消息（逐字保留）。
+- **有序路由与隐式会话兜底**：在默认的 `buffered` 捕获模式下，只有“路由不可用”类失败才会切换到下一条：能力查询失败/超时、provider 流抛错、单次尝试超出尝试缓冲上限（131,072 个 chunk 或 8,000,000 字符），或终止 `finish` 的官方失败码属于配额、认证、凭据、限流、服务端、超时、传输、适配器或模型路由类失败。调用方 abort 原样传播；内容/协议失败直接失败、不重试。当前会话模型（即被拦截请求自带的 provider/model）始终是最后一次尝试：它不可配置、不可调整顺序、不会被保存，也不强制推理等级；请求没有可用路由时不会追加，若已有显式路由使用相同 provider+model 则不会重复追加。没有可用显式路由（列表为空）时插件完全不改写审查请求，直接由会话模型完成审查。旧配置中的 `{ mode: 'session' }` 项会被忽略，因为该兜底已改为隐式。`buffered` 模式下每次尝试都先完整持有，直到它自己的正常 `finish` 证明成功；`pass-through` 模式则立即转发，且首个 chunk 发出后不再切换路由。全部路由（含隐式会话兜底）失败时，以一个聚合错误列出每条尝试过的路由、失败码与原始 provider 消息（逐字保留）。
 - **Fail-closed 安全机制**：当所有已配置路由与隐式会话路由都失败（含重试/回退之后）时，审查失败，工具调用不会执行（fail-closed）。
 - **思考等级：继承与适配**：每行的思考等级可选 provider 默认（空）、适配器声明的显式等级，或“继承主会话”（存储哨兵 `inherit`）。审查时，`inherit` 通过 `session.requestHeader()?.config.reasoningEffort` 读取被拦截请求所属会话的当前等级；没有会话或没有等级时回退到 provider 默认。继承到的具体等级会适配目标路由声明的等级（按规范 rank 取最近，距离相同偏向更高 rank；目标没有可排名等级则回退 provider 默认）。显式等级不做适配：只有目标声明支持时才发送，否则不发送。最后的隐式会话尝试始终不携带思考等级。
+- **流式捕获模式**：`streamCapture` 决定一次尝试的 provider chunk 如何进入调用方的“单决策”流。`buffered`（默认）先完整持有该尝试，直到它自己的终止 `finish` 证明成功，因此失败尝试绝不会泄漏 reasoning 或部分文本；缓冲上限（131,072 个 chunk / 8,000,000 字符）刻意设为实际上不构成约束——provider 流本就被模型的最大输出 token 限制，适配器大致每个 token 产生一个 chunk，上限只用于拦截病态的无界流。`pass-through` 逐块立即转发，无缓冲、无上限，但只有在尚未发出任何 chunk 时才能切换路由；一旦调用方已经看到输出，后续失败会直接报错（成功路由的流绝不会重复）。`streamCapture` 每次审查实时读取，未知值归一为 `buffered`。
 - **逐行测试端点**：同一宿主插件还提供一个小的 Typert Remote 方法 `autoReviewModel/testReviewRoute`，由手写的 generated-style `./typert` manifest 声明，浏览器侧从本包 `./remote` contribution 挂载。每个路由行都有独立的「测试」按钮，通过可选显式路由入参探测该行**当前**的值（包括未保存修改）；省略入参或 provider+model 为空时仍探测已保存的第 1 行。对显式路由，宿主要求 provider 与 model 均非空、provider 存在于实时 configurable-provider 目录，并用 `resolveModelInfo` 证明模型可用后才发起流式请求。页面无法传入 URL、凭证、session id、purpose、tools 或对话历史。探测有界（16 输出 token、20 秒总超时、每分钟 5 次、同一时刻 1 次），不写设置、不改主模型、不执行工具、不返回模型输出。若流结束但没有任何真实模型内容（只有结构块，包括空 text block），结果为 `EMPTY_RESPONSE`，不会报告成功。
 
 ## 安装
@@ -58,6 +59,7 @@ dsh plugin --profile web add /path/to/dsh-auto-review-model
 | `provider` | string | 空 | 审查请求使用的 provider ID（设置列表第 1 行）。留空表示该行被跳过，审查继续使用后续行并最终回落到当前会话模型。必须与 `model` 同时填写才是可用路由。 |
 | `model` | string | 空 | 审查请求使用的 model ID。必须与 `provider` 同时填写该行才可用。 |
 | `reasoningEffort` | string | 空 | 第 1 行的思考等级。留空表示 provider 默认；`inherit` 表示继承主会话当前等级并适配到目标路由。 |
+| `streamCapture` | string | `buffered` | 区域级流式捕获模式：`buffered`（默认；失败尝试不会泄漏，上限实际上不构成约束）或 `pass-through`（逐块立即转发，首个 chunk 发出后不再切换路由）。未知值一律归一为 `buffered`。volatile 字段：对下一次审查生效。 |
 | `fallbacks` | array | `[]` | 第 1 行之后按顺序尝试的显式路由。每项是 `{ enabled?, provider, model, reasoningEffort? }`；禁用项被跳过，`mode` 字段仅用于让旧配置中的 `{ mode: 'session' }` 项被忽略而不是被误当成显式路由。被拦截请求自带的模型始终是隐式最后一次尝试，不保存在这里。volatile 字段，保存后对下一次审查立即生效；缺省值表示没有额外路由（旧行为）。 |
 
 ### 配置规则
@@ -89,8 +91,18 @@ dsh plugin --profile web add /path/to/dsh-auto-review-model
 | 流在终止 `finish` 之前结束 | 是（传输失败，`STREAM_CLOSED`） |
 | 调用方 abort（`options.signal.aborted`） | **否**——原样传播，绝不重试 |
 | 内容/协议失败（`INVALID_REQUEST`、`MALFORMED_RESPONSE`、`CONTEXT_WINDOW_EXCEEDED`、`UNSUPPORTED_*`、`EMPTY_RESPONSE`、`UNKNOWN`，或适配器侧 `aborted` finish） | **否**——直接失败，不被下一条路由掩盖 |
+| 单次尝试超出缓冲上限（131,072 个 chunk 或 8,000,000 字符；仅 `buffered` 模式） | **是**——丢弃该尝试已缓冲的输出并尝试下一条路由（最后是隐式会话路由）；只有全部路由都超限时聚合错误才会出现，并带上 `AUTO_REVIEW_MODEL_BUFFER_LIMIT`。`pass-through` 没有该上限 |
 
-chunk 会在到达时立即转发给调用方，因此 reasoning 较重的审查可以一直流式输出到 provider 允许的范围。fallback 规则是一个提交点：只有在首个 chunk 发出之前才能替换路由；一旦调用方已经收到任何输出，后续失败会以可操作错误直接暴露，而不是重试，因为切换路由会重复或混合输出。该流就是调用方的“单决策”流，因此成功路由的 chunk 恰好 yield 一次。当所有已配置路由与隐式会话路由都在产生任何输出前失败时，审查以一个聚合错误失败，按顺序列出每条尝试过的 `provider/model`（最后的隐式会话尝试带 `(session)` 标记）、失败码与原始 provider 消息（逐字保留，例如 `deepseek-account/deepseek-flash: QUOTA: <provider message>`），与 official Auto review 自身的行为一致。插件自身不会向消息中添加凭证或请求正文，只呈现它收到的 provider 文本。official 插件会把它包成 `Auto review of tool "<name>" failed; its body was not executed: <reason>`，因此不会伪造 allow/deny。
+在默认的 `buffered` 模式下，每次尝试都先完整持有，直到它自己的正常 `finish` 证明成功，因此失败尝试的 reasoning/部分文本不会泄漏到调用方“只允许一个决策”的流中；只有成功路由的 chunk 会被 yield（恰好一次）。每个尝试的上限为 131,072 个 chunk 与 8,000,000 字符的模型内容；尝试是串行的，因此同一时刻最多只有一个尝试的积压。对合法流量该上限实际上不构成约束（最大输出 token 已经限制了流，且大致每个 token 一个 chunk），它只用于拦截病态的无界流。超过任一上限即按路由失败处理：丢弃缓冲、尝试下一条路由。`pass-through` 模式没有缓冲：chunk 立即转发，只有首个 chunk 发出前才能切换路由，之后的失败会直接报错而不重试。被放弃的 provider 流会在 250ms 宽限内关闭。当所有已配置路由与隐式会话路由都失败时，审查以一个聚合错误失败，按顺序列出每条尝试过的 `provider/model`（最后的隐式会话尝试带 `(session)` 标记）、失败码与原始 provider 消息（逐字保留，例如 `deepseek-account/deepseek-flash: QUOTA: <provider message>`，溢出尝试显示 `AUTO_REVIEW_MODEL_BUFFER_LIMIT`），与 official Auto review 自身的行为一致。插件自身不会向消息中添加凭证或请求正文，只呈现它收到的 provider 文本。official 插件会把它包成 `Auto review of tool "<name>" failed; its body was not executed: <reason>`，因此不会伪造 allow/deny。
+
+### 流式捕获模式
+
+`streamCapture` 是一个区域级 volatile 开关（没有逐行捕获控件），在路由区域中渲染为一个紧凑的带标签下拉框：
+
+- **`buffered`**（默认）——先完整捕获整次尝试，只有其终止 `finish` 证明成功后才交付。失败或超限的尝试会被整体丢弃，不会有任何内容泄漏到调用方流中，然后尝试下一条路由。上限为 131,072 个 chunk / 8,000,000 字符；它对真实审查实际上不构成约束——适配器大致每个输出 token 产生一个 chunk，而模型本身限制了输出 token——只用于拦截病态的无界流。
+- **`pass-through`**——每个 chunk 到达即转发，无缓冲、无上限。这保留了流式延迟，但削弱了 fallback：只有在首个 chunk 到达调用方之前才能切换路由。一旦已经发出任何输出，后续失败会直接报错（流已被污染，此时切换路由会重复或混合输出）。成功路由的流绝不会重复。
+
+该开关在每次审查时实时读取（volatile），未知或旧值统一归一为 `buffered`。
 
 ### 测试某条审查路由
 
@@ -162,12 +174,12 @@ fallbacks:
 
 ## 验证状态
 
-截至 2026-11-22，始终生效的有序路由列表（逐行启用、继承等级适配、隐式会话兜底）与逐行路由测试功能通过以下证据验证（自动化测试 + 重启后的真实链路检查）：
+截至 2026-11-22，始终生效的有序路由列表（逐行启用、继承等级适配、隐式会话兜底、缓冲超限 fallback）与逐行路由测试功能通过以下证据验证（自动化测试 + 重启后的真实链路检查）：
 - **自动化命令**：`npm run typecheck`、`npm test`、`npm run check` 与 `npm run verify` 退出码均为 0。
-- **测试**：191 项单元测试全部通过（0 失败）：host 39、fallback 36、route-test 43、client 33、client-component 23、Typert contract/产物 10、packaging 7。
+- **测试**：197 项单元测试全部通过（0 失败）：host 39、fallback 41、route-test 43、client 33、client-component 24、Typert contract/产物 10、packaging 7。
 - **静态校验**：`npm run verify` 25/25 项通过，覆盖 exports、Loader 可接受的 `./typert` manifest、Host/Client descriptor 一致性、`./remote` 内嵌与 `$mount` 接线、手写 Typert 产物零运行时依赖，以及所有入口的语法。Desktop 环境下，已安装 experimental-auto-review 策略检查通过 `DSH_NODE_EXECUTABLE` 读取运行中的 `app.asar`；若存在 `DSH_INSTALL_DIR` 但无法读取官方源码，检查会失败而不是静默跳过。只有没有已安装 DSH 包树的源码检出环境才允许报告 SKIP。
 - **已断言的安全不变量**：探测请求只包含 provider/model/[reasoningEffort]/固定 prompt/maxTokens/temperature/signal（绝不含 `sessionId`、`purpose`、`tools`、`toolHistory` 或对话历史）；显式探测路由会先经实时 provider 目录与 `resolveModelInfo` 校验；不写设置；不返回模型输出、凭证材料或任意传输错误文本；Account 与 API-key 故障分类可区分；限流、single-flight、有界超时、有界输出，以及列表修改后的过期结果失效均有覆盖。
-- **已断言的路由列表不变量**：确定性的尝试顺序（第 1 行 → 数组顺序 → 隐式会话路由最后）、会话路由使用被拦截请求自带路由且不强制推理等级、显式路由与请求路由相同时不重复追加会话尝试、旧 `{ mode: 'session' }` 项被忽略、旧 primary+fallbacks 配置按列表顺序迁移、空列表/全部禁用保持原生直通、禁用项与不完整项被跳过、配额/认证/限流/服务端/传输类 finish 与抛错的流会 fallback、恰好 yield 一个终止 finish、调用方 abort 不 fallback、能力查询失败会 fallback、不可重试的内容/协议错误与适配器 abort 直接失败、chunk 在终止 finish 前即转发、首个 chunk 前可 fallback、发出输出后的失败直接报错不重试、成功路由恰好 yield 一次且不重复、超过 5,000 chunk 的 reasoning 重负载尝试成功、单个聚合错误按顺序列出所有尝试路由（会话尝试在最后）且逐字保留原始 provider 消息与失败码（按尝试顺序）、`enabled:false` 被忽略、非审查请求不受影响、volatile 路由列表在下次审查立即生效、单列表客户端的逐行启用/增删/上移下移/保存行为（无可见序号、无固定会话行）、整行测试结果不改变列宽、逐行探测相互独立，以及可选 `input` 入参与旧式无参调用经 Gateway 解码路径的回归钉，以及继承等级的精确保留/最近适配/平手偏高/off→low/xhigh→max/无可排名等级→默认，显式等级不被改编与逐行探测的校验/安全约束。
+- **已断言的路由列表不变量**：确定性的尝试顺序（第 1 行 → 数组顺序 → 隐式会话路由最后）、会话路由使用被拦截请求自带路由且不强制推理等级、显式路由与请求路由相同时不重复追加会话尝试、旧 `{ mode: 'session' }` 项被忽略、旧 primary+fallbacks 配置按列表顺序迁移、空列表/全部禁用保持原生直通、禁用项与不完整项被跳过、配额/认证/限流/服务端/传输类 finish 与抛错的流会 fallback、失败尝试的部分 reasoning 被丢弃、恰好 yield 一个终止 finish、调用方 abort 不 fallback、能力查询失败会 fallback、不可重试的内容/协议错误与适配器 abort 直接失败、缓冲超限会 fallback（尝试下一条路由，最后是会话路由；溢出尝试的 chunk 不泄漏；全部超限时每条路由都带缓冲码的聚合错误）、超过 5,000 chunk 的 reasoning 重负载尝试在不构成实际约束的上限内成功、pass-through 在终止 finish 前逐块转发且不缓冲、首个 chunk 前可 fallback、发出输出后的失败直接报错不重试、成功路由不会重复、streamCapture 的 volatile 生效与未知值归一为 buffered、单个聚合错误按顺序列出所有尝试路由（会话尝试在最后）且逐字保留原始 provider 消息与失败码（按尝试顺序）、`enabled:false` 被忽略、非审查请求不受影响、volatile 路由列表在下次审查立即生效、单列表客户端的逐行启用/增删/上移下移/保存行为（无可见序号、无固定会话行）、整行测试结果不改变列宽、逐行探测相互独立，以及可选 `input` 入参与旧式无参调用经 Gateway 解码路径的回归钉，以及继承等级的精确保留/最近适配/平手偏高/off→low/xhigh→max/无可排名等级→默认，显式等级不被改编与逐行探测的校验/安全约束。
 
 **验证边界**：
 - **自动化测试使用内存 fake adapter**：单元测试不会调用真实 LLM API 或网络；真实行为在重启 DSH web host 后另行验证（见下）。

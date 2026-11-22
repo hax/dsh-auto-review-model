@@ -223,6 +223,7 @@ interface SetupTestEnvOptions {
     provider?: string;
     model?: string;
     reasoningEffort?: string;
+    streamCapture?: string;
     fallbacks?: FallbackSetting[];
   };
   revision?: number;
@@ -967,6 +968,7 @@ test('rows can be reordered, removed and saved with their enable flags', async (
     provider: 'provider-a',
     model: 'model-a1',
     reasoningEffort: 'inherit',
+    streamCapture: 'buffered',
     fallbacks: [
       { mode: 'route', enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'inherit' },
     ],
@@ -998,6 +1000,7 @@ test('removing the first of two rows promotes the second into row 1', async () =
     provider: 'provider-b',
     model: 'model-b1',
     reasoningEffort: '',
+    streamCapture: 'buffered',
   });
 });
 
@@ -1055,6 +1058,39 @@ test('legacy { mode: session } rows are ignored and dropped on the next save', a
     { mode: 'route', enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: '' },
   ]);
   assert.ok(!JSON.stringify(env.writes[0].nextSettings).includes('session'));
+});
+
+test('one capture-mode select controls buffering for the whole section', async () => {
+  const env = await setupComponent({
+    savedSettings: { ...SAVED_ROUTE, streamCapture: 'legacy-value' },
+  });
+  env.render();
+  let nodes = flattenNodes(await env.flush());
+
+  const selects = nodes.filter((node) => node.props?.testId === 'stream-capture');
+  assert.equal(selects.length, 1, 'exactly one section-level capture control');
+  assert.equal(
+    nodes.some((node) => typeof node.props?.testId === 'string'
+      && node.props.testId !== 'stream-capture'
+      && node.props.testId.includes('capture')),
+    false,
+    'no per-row capture control exists',
+  );
+  // An unknown/old stored mode is normalized to buffered in the UI.
+  assert.equal(selects[0].props.value, 'buffered');
+  const options = selects[0].props.options as Array<{ value: string; label: string }>;
+  assert.deepEqual(options.map((option) => option.value), ['buffered', 'pass-through']);
+  assert.equal(options[1].label, env.t('streamCapturePassThrough'));
+
+  selects[0].props.onChange('pass-through');
+  nodes = flattenNodes(await env.flush());
+  assert.equal(findByTestId(nodes, 'stream-capture')?.props.value, 'pass-through');
+  assert.ok(findNodeByClass(nodes, 'dsh_arm_unsaved'), 'changing the capture mode is an unsaved change');
+
+  findButton(nodes, env.t('save'))?.props.onClick();
+  await env.flush();
+  assert.equal(env.writes.length, 1);
+  assert.equal(env.writes[0].nextSettings.streamCapture, 'pass-through');
 });
 
 /* ============================================================

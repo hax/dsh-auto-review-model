@@ -368,7 +368,7 @@ test('plugin metadata follows the shared loader contract', () => {
 
 test('Config keeps the deprecated enabled flag plus per-row enable flags and the fallback list', () => {
   const config = Config({}) as unknown as Record<string, { get: () => unknown }>;
-  for (const key of ['enabled', 'primaryEnabled', 'provider', 'model', 'reasoningEffort', 'fallbacks']) {
+  for (const key of ['enabled', 'primaryEnabled', 'provider', 'model', 'reasoningEffort', 'streamCapture', 'fallbacks']) {
     assert.equal(typeof config[key]?.get, 'function', `${key} must be a volatile ref`);
   }
   // `enabled` is deprecated and ignored; it stays in the schema only so old
@@ -378,6 +378,7 @@ test('Config keeps the deprecated enabled flag plus per-row enable flags and the
   assert.equal(config.provider.get(), '');
   assert.equal(config.model.get(), '');
   assert.equal(config.reasoningEffort.get(), '');
+  assert.equal(config.streamCapture.get(), 'buffered', 'capture defaults to buffered');
   assert.deepEqual(config.fallbacks.get(), [], 'legacy configs have no fallback routes');
   const withFallbacks = Config({ fallbacks: [{ provider: 'p', model: 'm' }] }) as unknown as Record<string, { get: () => unknown }>;
   assert.deepEqual(withFallbacks.fallbacks.get(), [
@@ -442,6 +443,7 @@ test('readReviewerSettings reads volatile refs live and defaults both enable fla
     provider: 'p1',
     model: 'm1',
     reasoningEffort: ' high ',
+    streamCapture: 'pass-through',
   };
   const config = Object.fromEntries(
     Object.entries(values).map(([key]) => [key, { get: () => values[key] }]),
@@ -452,15 +454,17 @@ test('readReviewerSettings reads volatile refs live and defaults both enable fla
     provider: 'p1',
     model: 'm1',
     reasoningEffort: 'high',
+    streamCapture: 'pass-through',
   });
 
-  values = { enabled: true, primaryEnabled: true, provider: 'p2', model: 'm2', reasoningEffort: 'inherit' };
+  values = { enabled: true, primaryEnabled: true, provider: 'p2', model: 'm2', reasoningEffort: 'inherit', streamCapture: 'nonsense' };
   assert.deepEqual(readReviewerSettings(config), {
     enabled: true,
     primaryEnabled: true,
     provider: 'p2',
     model: 'm2',
     reasoningEffort: 'inherit',
+    streamCapture: 'buffered',
   });
 
   assert.deepEqual(readReviewerSettings(undefined), {
@@ -469,6 +473,7 @@ test('readReviewerSettings reads volatile refs live and defaults both enable fla
     provider: '',
     model: '',
     reasoningEffort: '',
+    streamCapture: 'buffered',
   });
 });
 
@@ -539,7 +544,7 @@ test('whitespace-only provider and model do not override the reviewer route', as
   assert.equal(harness.resolveCalls.length, 0);
   assert.deepEqual(
     readReviewerSettings({ provider: '  p1  ', model: '  m1  ' }),
-    { enabled: true, primaryEnabled: true, provider: 'p1', model: 'm1', reasoningEffort: '' },
+    { enabled: true, primaryEnabled: true, provider: 'p1', model: 'm1', reasoningEffort: '', streamCapture: 'buffered' },
   );
 });
 

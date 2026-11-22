@@ -6,7 +6,7 @@
  * provider stream, and a rewrite calls `ctx.llm.stream` again to re-enter it.
  * Every provider route is scripted independently, so the tests can inject quota
  * finishes, partial reasoning before a failure, thrown stream errors, hanging
- * streams, missing terminal finishes, and post-output failures without any
+ * streams, missing terminal finishes, and bounded-buffer overflows without any
  * network or live loader.
  */
 import assert from 'node:assert/strict';
@@ -80,6 +80,7 @@ interface HarnessState {
   provider: string;
   model: string;
   reasoningEffort: string;
+  streamCapture: string;
   fallbacks: unknown[];
 }
 
@@ -221,6 +222,7 @@ function createHarness({ config = {}, routes = {}, modelInfo = () => ({}) }: Har
     provider: 'primary-provider',
     model: 'primary-model',
     reasoningEffort: '',
+    streamCapture: 'buffered',
     fallbacks: [],
     ...config,
   };
@@ -230,6 +232,7 @@ function createHarness({ config = {}, routes = {}, modelInfo = () => ({}) }: Har
     provider: { get: () => state.provider },
     model: { get: () => state.model },
     reasoningEffort: { get: () => state.reasoningEffort },
+    streamCapture: { get: () => state.streamCapture },
     fallbacks: { get: () => state.fallbacks },
   };
 
@@ -353,6 +356,8 @@ test('Config keeps a volatile explicit route list and never stores the session f
   const config = Config({}) as unknown as Record<string, { get: () => unknown }>;
   assert.equal(typeof config.fallbacks?.get, 'function', 'fallbacks must be a volatile ref');
   assert.deepEqual(config.fallbacks.get(), [], 'fallbacks default to an empty list');
+  assert.equal(typeof config.streamCapture?.get, 'function', 'streamCapture must be a volatile ref');
+  assert.equal(config.streamCapture.get(), 'buffered', 'buffered capture is the default');
   const withFallbacks = Config({
     fallbacks: [
       // A legacy "follow session" row: kept in the schema so it cannot silently
@@ -533,11 +538,16 @@ test('a fallback entry with an unknown mode is treated as an explicit route', as
   assert.equal(harness.stats('backup-provider/backup-model').requests.length, 1);
 });
 
-test('a quota finish before any output falls back and yields only the next route', async () => {
+test('a quota finish on the primary route falls back to the next explicit route and yields only its chunks', async () => {
+  const primaryReasoning = 'thinking about the pending action '.repeat(3);
   const harness = createHarness({
     routes: {
       'primary-provider/primary-model': {
-        steps: [{ chunk: errorFinish('QUOTA', 'the account balance is exhausted') }],
+        steps: [
+          { chunk: reasoning(primaryReasoning) },
+          { chunk: text('{"risk":"high","decision":"deny"}') },
+          { chunk: errorFinish('QUOTA', 'the account balance is exhausted') },
+        ],
       },
       'backup-provider/backup-model': {
         steps: [{ chunk: text('{"risk":"low","decision":"allow"}') }, { chunk: STOP_FINISH }],
@@ -552,7 +562,11 @@ test('a quota finish before any output falls back and yields only the next route
   const types = chunks.map((chunk) => (chunk as { type: string }).type);
 
   assert.deepEqual(types, ['text-delta', 'finish'], 'only the winning route may reach the caller');
-  assert.equal((chunks[0] as { text: string }).text, '{"risk":"low","decision":"allow"}');
+  assert.equal(
+    (chunks[0] as { text: string }).text,
+    '{"risk":"low","decision":"allow"}',
+    'the failed attempt\'s reasoning and text must be discarded',
+  );
   assert.equal(chunks.filter((chunk) => (chunk as { type: string }).type === 'finish').length, 1);
   assert.equal(harness.stats('primary-provider/primary-model').requests.length, 1);
   assert.equal(harness.stats('backup-provider/backup-model').requests.length, 1);
@@ -657,7 +671,7 @@ test('a thrown provider stream falls back to the next explicit route', async () 
   assert.equal(harness.stats('backup-provider/backup-model').requests.length, 1);
 });
 
-test('a stream rejection after the first chunk is surfaced without retrying', async () => {
+test('a stream rejection after partial output falls back and discards the partial output', async () => {
   const harness = createHarness({
     routes: {
       'primary-provider/primary-model': {
@@ -670,25 +684,18 @@ test('a stream rejection after the first chunk is surfaced without retrying', as
     config: { fallbacks: [{ mode: 'route', provider: 'backup-provider', model: 'backup-model' }] },
   });
 
-  const stream = harness.ctx.llm.stream(reviewOptions());
-  const iterator = stream[Symbol.asyncIterator]();
-  const first = await iterator.next();
-  assert.equal((first.value as { text: string }).text, 'partial reasoning');
-  await assert.rejects(iterator.next(), (error: unknown) => {
-    assert.ok(error instanceof ReviewerRouteError, `expected ReviewerRouteError, got ${String(error)}`);
-    return true;
-  });
-  assert.equal(
-    harness.stats('backup-provider/backup-model').requests.length,
-    0,
-    'output makes the route non-retryable',
+  const chunks = await collect(harness.ctx.llm.stream(reviewOptions()));
+
+  assert.deepEqual(
+    chunks.map((chunk) => (chunk as { type: string }).type),
+    ['text-delta', 'finish'],
   );
 });
 
-test('a stream that ends with no output falls back', async () => {
+test('a stream that ends without a terminal finish falls back', async () => {
   const harness = createHarness({
     routes: {
-      'primary-provider/primary-model': { steps: [] },
+      'primary-provider/primary-model': { steps: [{ chunk: text('{"risk":"low"') }] },
       'backup-provider/backup-model': {
         steps: [{ chunk: text('{"risk":"low","decision":"allow"}') }, { chunk: STOP_FINISH }],
       },
@@ -698,7 +705,6 @@ test('a stream that ends with no output falls back', async () => {
 
   const chunks = await collect(harness.ctx.llm.stream(reviewOptions()));
   assert.equal(chunks.filter((chunk) => (chunk as { type: string }).type === 'finish').length, 1);
-  assert.equal(harness.stats('backup-provider/backup-model').requests.length, 1);
 });
 
 test('a classified content failure is surfaced instead of retried', async () => {
@@ -892,12 +898,117 @@ test('a fallback effort that is not advertised drops to the provider default', a
   assert.equal(sentEffort(harness.stats('backup-provider/backup-model').requests[0]), undefined);
 });
 
-test('a reasoning-heavy 5,000-chunk attempt succeeds without any artificial ceiling', async () => {
+test('the production attempt-buffer limits are large enough for reasoning-heavy reviewers', () => {
+  assert.equal(__testing.fallback.FALLBACK_MAX_BUFFER_CHUNKS, 131_072);
+  assert.equal(__testing.fallback.FALLBACK_MAX_BUFFER_CHARS, 8_000_000);
+  assert.ok(__testing.fallback.FALLBACK_MAX_BUFFER_CHUNKS >= 131_072);
+  assert.ok(__testing.fallback.FALLBACK_MAX_BUFFER_CHARS >= 8_000_000);
+});
+
+test('an attempt that overflows the buffer falls back and leaks none of its chunks', async () => {
+  const marker = 'OVERFLOWED_ATTEMPT_REASONING_MARKER';
+  const overflow = 'x'.repeat(__testing.fallback.FALLBACK_MAX_BUFFER_CHARS + 1);
+  const harness = createHarness({
+    routes: {
+      'primary-provider/primary-model': {
+        steps: [
+          { chunk: reasoning(marker) },
+          { chunk: text(overflow) },
+          { chunk: STOP_FINISH },
+        ],
+      },
+      'backup-provider/backup-model': {
+        steps: [{ chunk: text('{"risk":"low","decision":"allow"}') }, { chunk: STOP_FINISH }],
+      },
+    },
+    config: { fallbacks: [{ mode: 'route', provider: 'backup-provider', model: 'backup-model' }] },
+  });
+
+  const chunks = await collect(harness.ctx.llm.stream(reviewOptions()));
+
+  assert.deepEqual(
+    chunks.map((chunk) => (chunk as { type: string }).type),
+    ['text-delta', 'finish'],
+    'only the next route may reach the caller',
+  );
+  assert.equal((chunks[0] as { text: string }).text, '{"risk":"low","decision":"allow"}');
+  assert.equal(chunks.filter((chunk) => (chunk as { type: string }).type === 'finish').length, 1);
+  const wire = JSON.stringify(chunks);
+  assert.ok(!wire.includes(marker), 'the overflowed attempt reasoning must not leak');
+  assert.ok(!wire.includes('xxxxxxxxxxxxxxxxxxxx'), 'the overflowed attempt text must not leak');
+  assert.equal(harness.stats('primary-provider/primary-model').requests.length, 1);
+  assert.equal(harness.stats('primary-provider/primary-model').returnCalls, 1, 'the overflowed stream must be closed');
+  assert.equal(harness.stats('backup-provider/backup-model').requests.length, 1);
+});
+
+test('a chunk-count overflow also advances to the next route', async () => {
+  const manyChunks: StreamStep[] = Array.from(
+    { length: __testing.fallback.FALLBACK_MAX_BUFFER_CHUNKS + 1 },
+    () => ({ chunk: reasoning('r') }),
+  );
+  const harness = createHarness({
+    routes: {
+      'primary-provider/primary-model': { steps: manyChunks },
+      'backup-provider/backup-model': {
+        steps: [{ chunk: text('{"risk":"low","decision":"allow"}') }, { chunk: STOP_FINISH }],
+      },
+    },
+    config: { fallbacks: [{ mode: 'route', provider: 'backup-provider', model: 'backup-model' }] },
+  });
+
+  const chunks = await collect(harness.ctx.llm.stream(reviewOptions()));
+  assert.equal(chunks.filter((chunk) => (chunk as { type: string }).type === 'finish').length, 1);
+  assert.equal(harness.stats('backup-provider/backup-model').requests.length, 1);
+});
+
+test('all routes overflowing surfaces one aggregate error per route with the buffer code', async () => {
+  const overflow = 'x'.repeat(__testing.fallback.FALLBACK_MAX_BUFFER_CHARS + 1);
+  const harness = createHarness({
+    config: {
+      fallbacks: [{ mode: 'route', provider: 'backup-provider', model: 'backup-model' }],
+    },
+    routes: {
+      'primary-provider/primary-model': { steps: [{ chunk: text(overflow) }] },
+      'backup-provider/backup-model': { steps: [{ chunk: text(overflow) }] },
+      'session-provider/session-model': { steps: [{ chunk: text(overflow) }] },
+    },
+  });
+
+  await assert.rejects(
+    collect(harness.ctx.llm.stream(reviewOptions())),
+    (error: unknown) => {
+      assert.ok(error instanceof ReviewerRoutesError, `expected ReviewerRoutesError, got ${String(error)}`);
+      const aggregate = error as ReviewerRoutesError;
+      assert.deepEqual(aggregate.routes, [
+        'primary-provider/primary-model',
+        'backup-provider/backup-model',
+        'session-provider/session-model (session)',
+      ]);
+      assert.equal(aggregate.failures.length, 3);
+      for (const failure of aggregate.failures) {
+        assert.equal(failure.code, __testing.fallback.BUFFER_LIMIT_CODE);
+        assert.match(failure.detail, /exceeded the bounded attempt buffer/, 'the raw overflow message is kept');
+        assert.ok(
+          aggregate.message.includes(`${failure.attempt.label}: ${__testing.fallback.BUFFER_LIMIT_CODE}:`),
+          'each attempted route shows its code in the aggregate message',
+        );
+      }
+      assert.ok(
+        aggregate.message.includes(__testing.fallback.BUFFER_LIMIT_CODE),
+        'the aggregate message must name the buffer-limit code',
+      );
+      return true;
+    },
+  );
+});
+
+test('a reasoning-heavy attempt under the new limit succeeds', async () => {
   const steps: StreamStep[] = Array.from(
     { length: 5_000 },
     (_value, index) => ({ chunk: reasoning(`thought ${index} `) }),
   );
   steps.push({ chunk: text('{"risk":"low","decision":"allow"}') }, { chunk: STOP_FINISH });
+  assert.ok(steps.length < __testing.fallback.FALLBACK_MAX_BUFFER_CHUNKS);
   const harness = createHarness({
     routes: { 'primary-provider/primary-model': { steps } },
   });
@@ -1142,8 +1253,9 @@ test('the session-log exclusion for auto-review is still registered', () => {
   assert.equal(harness.exclusions[0]({}), false);
 });
 
-test('chunks are forwarded before the terminal finish', async () => {
+test('pass-through forwards each chunk before the terminal finish', async () => {
   const harness = createHarness({
+    config: { streamCapture: 'pass-through' },
     routes: {
       'primary-provider/primary-model': {
         steps: [{ chunk: text('{"risk":"low"') }, { hang: true }],
@@ -1165,9 +1277,10 @@ test('chunks are forwarded before the terminal finish', async () => {
   await iterator.return?.();
 });
 
-test('failover is only possible before the first emitted chunk', async () => {
+test('pass-through falls back only before any chunk has been emitted', async () => {
   const beforeChunks = createHarness({
     config: {
+      streamCapture: 'pass-through',
       fallbacks: [{ mode: 'route', provider: 'backup-provider', model: 'backup-model' }],
     },
     routes: {
@@ -1183,6 +1296,7 @@ test('failover is only possible before the first emitted chunk', async () => {
 
   const afterChunks = createHarness({
     config: {
+      streamCapture: 'pass-through',
       fallbacks: [{ mode: 'route', provider: 'backup-provider', model: 'backup-model' }],
     },
     routes: {
@@ -1208,9 +1322,10 @@ test('failover is only possible before the first emitted chunk', async () => {
   );
 });
 
-test('the winning route is yielded once and never duplicated', async () => {
+test('pass-through yields the winning route once and never duplicates it', async () => {
   const harness = createHarness({
     config: {
+      streamCapture: 'pass-through',
       fallbacks: [{ mode: 'route', provider: 'backup-provider', model: 'backup-model' }],
     },
     routes: {
@@ -1230,6 +1345,49 @@ test('the winning route is yielded once and never duplicated', async () => {
   );
   assert.equal(harness.stats('primary-provider/primary-model').requests.length, 1);
   assert.equal(harness.stats('backup-provider/backup-model').requests.length, 0);
+});
+
+test('streamCapture is volatile and unknown values normalize to buffered', async () => {
+  assert.equal(__testing.normalizeStreamCapture(' PASS-THROUGH '), 'pass-through');
+  assert.equal(__testing.normalizeStreamCapture('nonsense'), 'buffered');
+  assert.equal(__testing.normalizeStreamCapture(undefined), 'buffered');
+  assert.equal(__testing.normalizeStreamCapture(42), 'buffered');
+
+  const harness = createHarness({
+    routes: {
+      'primary-provider/primary-model': {
+        steps: [{ chunk: text('{"risk":"low"') }, { chunk: errorFinish('QUOTA') }],
+      },
+      'backup-provider/backup-model': {
+        steps: [{ chunk: text('{"risk":"low","decision":"allow"}') }, { chunk: STOP_FINISH }],
+      },
+    },
+    config: {
+      fallbacks: [{ mode: 'route', provider: 'backup-provider', model: 'backup-model' }],
+    },
+  });
+
+  // Buffered: the failed attempt's chunk is discarded and the next route wins.
+  const bufferedChunks = await collect(harness.ctx.llm.stream(reviewOptions()));
+  assert.deepEqual(bufferedChunks.map(chunk => (chunk as { type: string }).type), ['text-delta', 'finish']);
+  assert.equal(harness.stats('backup-provider/backup-model').requests.length, 1);
+
+  // Pass-through: the same failure after output is surfaced, no retry.
+  harness.state.streamCapture = 'pass-through';
+  const iterator = harness.ctx.llm.stream(reviewOptions())[Symbol.asyncIterator]();
+  await iterator.next();
+  await assert.rejects(iterator.next(), (error: unknown) => {
+    assert.ok(error instanceof ReviewerRouteError);
+    assert.equal((error as ReviewerRouteError).failureCode, 'QUOTA');
+    return true;
+  });
+  assert.equal(harness.stats('backup-provider/backup-model').requests.length, 1, 'no extra backup attempt');
+
+  // Unknown/old value: normalized back to buffered on the next review.
+  harness.state.streamCapture = 'legacy-value';
+  const normalized = await collect(harness.ctx.llm.stream(reviewOptions()));
+  assert.deepEqual(normalized.map(chunk => (chunk as { type: string }).type), ['text-delta', 'finish']);
+  assert.equal(harness.stats('backup-provider/backup-model').requests.length, 2);
 });
 
 test('route policy helpers normalize, order and de-duplicate exactly as documented', () => {
