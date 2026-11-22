@@ -55,11 +55,59 @@ interface BundleModule {
   exports: Record<string, unknown>;
 }
 
-interface ReviewerSettings {
+/** One explicit reviewer route stored in the volatile `fallbacks` array. */
+interface FallbackEntry {
+  /**
+   * Retained for backward compatibility with the old settings shape. This client
+   * only ever writes `route`; the Host ignores legacy `session` values because
+   * the intercepted request's own route is the implicit final fallback.
+   */
+  mode: 'route';
+  /** Whether this row is eligible for review routing. */
   enabled: boolean;
   provider: string;
   model: string;
   reasoningEffort: string;
+}
+
+/** One editable explicit reviewer route (one row of the ordered settings list). */
+interface ReviewRoute {
+  /** Whether this row is eligible; a disabled row stays editable and testable. */
+  enabled: boolean;
+  provider: string;
+  model: string;
+  reasoningEffort: string;
+}
+
+interface ReviewerSettings {
+  /** Whether settings-list row 1 (the top-level route) is enabled. */
+  primaryEnabled: boolean;
+  provider: string;
+  model: string;
+  reasoningEffort: string;
+  /**
+   * Ordered explicit routes after row 1 (the legacy primary fields above).
+   * Optional so a legacy section (which never had this key) is loaded, edited
+   * and saved without gaining one when the list has no second row. Legacy
+   * `{ mode: 'session' }` entries are ignored and dropped on load. The
+   * deprecated top-level `enabled` knob is never read or written.
+   */
+  fallbacks?: FallbackEntry[];
+}
+
+/** Optional explicit route input of one per-row probe. */
+interface ReviewRouteTestInput {
+  provider?: string;
+  model?: string;
+  reasoningEffort?: string;
+}
+
+/** Independent probe state of one editable row. */
+interface RowTestState {
+  /** Whether that row's probe is currently in flight. */
+  busy: boolean;
+  /** Localized outcome of the last completed probe, or null. */
+  outcome: TestOutcome | null;
 }
 
 interface SelectOption {
@@ -127,7 +175,10 @@ interface ReviewRouteTestResult {
 
 /** One call of the mounted `remote.autoReviewModel.testReviewRoute` endpoint. */
 interface TestRouteEndpoint {
-  testReviewRoute(signal?: AbortSignal): Promise<RemoteResponse<ReviewRouteTestResult>>;
+  testReviewRoute(
+    input?: ReviewRouteTestInput,
+    signal?: AbortSignal,
+  ): Promise<RemoteResponse<ReviewRouteTestResult>>;
 }
 
 /** Mountable Host-for-Client contribution this package's `./remote` export carries. */
@@ -193,6 +244,8 @@ interface SelectProps {
   label: string;
   options: SelectOption[];
   disabled?: boolean;
+  /** Stable test hook rendered as `data-arm-select` (no behavior attached). */
+  testId?: string;
 }
 
 interface ConfigProps {
@@ -244,33 +297,30 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
    */
   const REMOTE_CONTRIBUTION_SPECIFIER = '@aghost-prj/dsh-auto-review-model/client.remote.js';
   const STYLE_ID = 'dsh_arm_styles';
-  const FIELDS: readonly (keyof ReviewerSettings)[] = [
-    'enabled',
-    'provider',
-    'model',
-    'reasoningEffort',
-  ];
-
+  /**
+   * Largest number of explicit routes the settings page will add or keep. Row 1
+   * maps to the top-level `provider`/`model`/`reasoningEffort` fields and rows
+   * 2..N map to `fallbacks`, so the whole list shares one cap. The implicit
+   * session row is fixed, read-only and not counted.
+   */
+  const MAX_ROUTES = 10;
+  /** Effort sentinel the UI stores for "inherit the main session's effort". */
+  const INHERIT_EFFORT = 'inherit';
   /** Values shown before the first successful read; never mutated. */
   const DEFAULT_SETTINGS: ReviewerSettings = Object.freeze({
-    enabled: true,
+    primaryEnabled: true,
     provider: '',
     model: '',
     reasoningEffort: '',
+    fallbacks: Object.freeze([]) as unknown as FallbackEntry[],
   });
 
   const zh = {
     title: '自动审查模型',
-    subtitle: '为自动审查指定提供商、模型与推理等级。提供商留空时继承当前会话模型。',
-    enabled: '启用自动审查模型配置',
-    enabledDesc: '关闭后自动审查沿用当前会话的模型与推理等级。',
+    subtitle: '按顺序配置自动审查使用的提供商与模型；全部启用路由失败后自动回退到主会话模型。',
     provider: '提供商',
-    providerEmpty: '继承当前会话模型',
-    model: '模型',
-    modelPlaceholder: '选择模型',
-    inheritModel: '继承当前会话模型',
-    effort: '推理等级',
     effortDefault: '默认（不指定）',
+    effortInherit: '继承主会话',
     save: '保存',
     discard: '放弃更改',
     reload: '重新读取',
@@ -284,11 +334,28 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     reloadFailed: '已保存，但重新读取设置失败',
     catalogFailed: '模型目录加载失败，但可继续编辑已保存设置',
     conflict: '设置已被其他窗口修改，请点击“重新读取”或刷新页面后重新编辑',
-    incompleteRouteHint: '模型未选择，覆盖未生效，继续使用会话模型',
     summaryLabel: '自动审查模型',
     summaryLoading: '正在读取…',
-    summaryOff: '已关闭',
-    summaryInherit: '继承当前会话模型',
+    summarySession: '主会话模型（自动兜底）',
+    summaryFallbacks: '+{count} 条后续路由',
+    reviewRoutesTitle: '审查路由（按顺序尝试）',
+    reviewRoutesHint: '路由按顺序尝试；全部启用路由失败后自动回退到主会话模型，若仍失败则审查失败、工具调用不会执行。测试使用该行当前值；“继承主会话”的推理等级在测试时按该路由默认等级发送。',
+    reviewRoutesEmpty: '尚未配置路由。审查将直接使用主会话模型。',
+    routeAdd: '添加路由',
+    routeCapHint: '最多 10 条路由。',
+    routeEnabled: '启用',
+    routeRowLabel: '审查路由 {index}',
+    routeTableLabel: '审查路由表',
+    routeActions: '操作',
+    routeProvider: '提供商',
+    routeProviderPlaceholder: '选择提供商',
+    routeModel: '模型',
+    routeModelPlaceholder: '选择模型（先选提供商）',
+    routeEffort: '推理等级',
+    routeIncompleteHint: '提供商或模型未选择完整；启用后此路由会在审查时被跳过。',
+    routeMoveUp: '上移',
+    routeMoveDown: '下移',
+    routeRemove: '删除',
     summaryError: '读取失败',
     unavailable: '（不可用）',
     unverified: '（未验证）',
@@ -296,14 +363,9 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     // Saved-route test action. Every string here is what the settings page
     // renders; provider output is never displayed as prose, only classified
     // outcomes plus a short technical detail.
-    test: '测试审查路由',
-    testing: '正在测试审查路由…',
-    testLabel: '审查路由测试',
-    testHint: '仅测试已保存的路由：{route}。未保存的更改不会被测试。',
-    testHintDirty: '你有未保存的更改；测试不会使用它们。',
-    testRouteDisabled: '覆盖已关闭',
-    testRouteIncomplete: '提供商或模型尚未保存',
-    testUnavailableHint: '审查路由测试不可用：Remote 端点未能挂载。请刷新页面或重启 DSH 后重试。',
+    test: '测试',
+    testing: '测试中…',
+    testUnavailableHint: '路由测试当前不可用：Remote 端点未能挂载。请刷新页面或重启 DSH 后重试。',
     testResultPrefix: '测试结果',
     testTransportFailed: '测试未能运行',
     testUnknownResult: '审查路由测试返回了无法识别的结果。',
@@ -311,10 +373,8 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     testEffortNote: '已保存的推理等级“{effort}”未被该路由声明；自动审查会回退到提供商默认值。',
     testSeconds: '{seconds} 秒',
     testNoEnvVar: '提供商凭证设置',
-    testResultRoute: '测试路由',
     testFailureCode: '失败代码',
     testTransportHint: '请重试测试；若持续失败，请刷新页面或重启 DSH。',
-    testLoadingHint: '设置尚未加载完成；请刷新页面后再测试。',
     testOkMessage: '路由可用。',
     testRouteDisabledMessage: '已保存的设置中，自动审查覆盖处于关闭状态。',
     testRouteIncompleteMessage: '已保存的审查路由不完整。',
@@ -365,16 +425,10 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
 
   const en = {
     title: 'Auto-review model',
-    subtitle: 'Choose the provider, model and reasoning effort used for auto review. An empty provider inherits the current session model.',
-    enabled: 'Enable auto-review model configuration',
-    enabledDesc: 'When off, auto review keeps the current session model and reasoning effort.',
+    subtitle: 'Choose the provider and model routes auto review tries, in order; if every enabled route fails, the session model is used automatically.',
     provider: 'Provider',
-    providerEmpty: 'Inherit current session model',
-    model: 'Model',
-    modelPlaceholder: 'Select a model',
-    inheritModel: 'Inherit current session model',
-    effort: 'Reasoning effort',
     effortDefault: 'Default (unset)',
+    effortInherit: 'Inherit session',
     save: 'Save',
     discard: 'Discard changes',
     reload: 'Reload',
@@ -388,25 +442,37 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     reloadFailed: 'Saved, but reloading the settings failed',
     catalogFailed: 'Failed to load model catalog; existing settings remain editable',
     conflict: 'These settings changed elsewhere. Click "Reload" or refresh the page and try again.',
-    incompleteRouteHint: 'Model not selected; override is inactive, continuing with session model',
     summaryLabel: 'Auto-review model',
     summaryLoading: 'Loading…',
-    summaryOff: 'Off',
-    summaryInherit: 'Inherits the current session model',
+    summarySession: 'Main session model (automatic fallback)',
+    summaryFallbacks: '+{count} more routes',
+    reviewRoutesTitle: 'Review routes (tried in order)',
+    reviewRoutesHint: 'Routes are tried in order; if every enabled route fails, the review falls back to the session model automatically, and if that also fails the review fails and the tool call is not executed. Testing uses the row\'s current values; an "Inherit session" effort is sent as that route\'s provider default for the test.',
+    reviewRoutesEmpty: 'No routes configured. Reviews use the current session model directly.',
+    routeAdd: 'Add route',
+    routeCapHint: 'At most 10 routes.',
+    routeEnabled: 'Enabled',
+    routeRowLabel: 'Review route {index}',
+    routeTableLabel: 'Review routes table',
+    routeActions: 'Actions',
+    routeProvider: 'Provider',
+    routeProviderPlaceholder: 'Select a provider',
+    routeModel: 'Model',
+    routeModelPlaceholder: 'Select a model (provider first)',
+    routeEffort: 'Reasoning effort',
+    routeIncompleteHint: 'Provider or model is incomplete; once enabled, this route is skipped during review.',
+    routeMoveUp: 'Move up',
+    routeMoveDown: 'Move down',
+    routeRemove: 'Remove',
     summaryError: 'Failed to load',
     unavailable: '(unavailable)',
     unverified: '(unverified)',
     notAdvertised: '(not advertised)',
     // Saved-route test action. Only classified outcomes and a short technical
     // detail are rendered; the provider's response text never reaches the page.
-    test: 'Test saved route',
-    testing: 'Testing saved route…',
-    testLabel: 'Review route test',
-    testHint: 'Tests the saved route only: {route}. Unsaved changes are not tested.',
-    testHintDirty: 'You have unsaved changes; they are not tested.',
-    testRouteDisabled: 'override disabled',
-    testRouteIncomplete: 'provider or model not saved',
-    testUnavailableHint: 'The route test is unavailable because its Remote endpoint did not mount. Refresh the page or restart DSH and try again.',
+    test: 'Test',
+    testing: 'Testing…',
+    testUnavailableHint: 'Route testing is unavailable because its Remote endpoint did not mount. Refresh the page or restart DSH and try again.',
     testResultPrefix: 'Test result',
     testTransportFailed: 'The test could not run',
     testUnknownResult: 'The route test returned an unrecognized result.',
@@ -414,10 +480,8 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     testEffortNote: 'The saved reasoning effort "{effort}" is not advertised by this route; auto review falls back to the provider default.',
     testSeconds: '{seconds}s',
     testNoEnvVar: 'the provider credential setting',
-    testResultRoute: 'Tested route',
     testFailureCode: 'Failure code',
     testTransportHint: 'Retry the test. If it keeps failing, reload the page or restart DSH.',
-    testLoadingHint: 'Settings are not loaded yet; reload the page before testing.',
     testOkMessage: 'The route works.',
     testRouteDisabledMessage: 'The auto-review override is disabled in the saved settings.',
     testRouteIncompleteMessage: 'The saved review route is incomplete.',
@@ -470,12 +534,6 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
 .dsh_arm_section{display:flex;flex-direction:column;gap:12px;min-width:0;color:var(--dsw-alias-label-primary)}
 .dsh_arm_title{margin:0;color:var(--dsw-alias-label-primary);font-size:18px;line-height:26px;font-weight:600}
 .dsh_arm_subtitle{margin:0;color:var(--dsw-alias-label-tertiary);font-size:13px;line-height:20px}
-.dsh_arm_toggle{display:flex;align-items:flex-start;gap:12px;min-width:0;padding:14px 16px;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-1);cursor:pointer}
-.dsh_arm_checkbox{flex:none;width:18px;height:18px;margin:2px 0 0;accent-color:var(--dsw-alias-brand-primary);cursor:pointer}
-.dsh_arm_checkbox:disabled{cursor:default}
-.dsh_arm_toggleText{display:flex;flex-direction:column;gap:2px;min-width:0}
-.dsh_arm_toggleTitle{color:var(--dsw-alias-label-primary);font-size:14px;line-height:22px}
-.dsh_arm_toggleDesc{color:var(--dsw-alias-label-tertiary);font-size:13px;line-height:20px}
 .dsh_arm_fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;min-width:0}
 .dsh_arm_field{display:flex;flex-direction:column;gap:6px;min-width:0;padding:14px 16px;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-1)}
 .dsh_arm_label{color:var(--dsw-alias-label-primary);font-size:14px;line-height:22px;font-weight:600}
@@ -503,16 +561,44 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
 .dsh_arm_statusError{color:var(--dsw-alias-state-error-primary)}
 .dsh_arm_summary{color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}
 .dsh_arm_hint{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
-.dsh_arm_test{display:flex;flex-direction:column;gap:6px;min-width:0;padding-top:12px;border-top:1px solid var(--dsw-alias-border-l2)}
-.dsh_arm_testHeader{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;min-width:0}
-.dsh_arm_testTitle{color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px;font-weight:600}
 .dsh_arm_testStatus{margin:0;font-size:13px;line-height:20px;overflow-wrap:anywhere}
 .dsh_arm_testOk{color:var(--dsw-alias-label-secondary)}
 .dsh_arm_testWarn{color:var(--dsw-alias-state-warn-label)}
 .dsh_arm_testError{color:var(--dsw-alias-state-error-primary)}
 .dsh_arm_testBlocked{color:var(--dsw-alias-label-tertiary)}
-.dsh_arm_testFeedback{display:flex;flex-direction:column;gap:6px;min-width:0}
 .dsh_arm_testDetail{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;overflow-wrap:anywhere}
+.dsh_arm_routes{display:flex;flex-direction:column;gap:8px;min-width:0;padding-top:10px;border-top:1px solid var(--dsw-alias-border-l2)}
+.dsh_arm_routeHeader{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;min-width:0}
+.dsh_arm_tableWrap{width:100%;min-width:0;overflow-x:auto;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-1)}
+.dsh_arm_table{box-sizing:border-box;width:100%;min-width:680px;border-collapse:collapse;table-layout:fixed}
+.dsh_arm_table th{box-sizing:border-box;padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;font-weight:600;text-align:left;white-space:nowrap}
+.dsh_arm_table td{box-sizing:border-box;min-width:0;padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-l2);vertical-align:middle;text-align:left}
+.dsh_arm_table tbody tr:last-child td{border-bottom:none}
+.dsh_arm_colEnable{width:52px}
+.dsh_arm_colProvider{width:22%}
+.dsh_arm_colModel{width:27%}
+.dsh_arm_colEffort{width:16%}
+.dsh_arm_colTest{width:84px}
+.dsh_arm_colActions{width:124px}
+.dsh_arm_cellEnable{text-align:center}
+.dsh_arm_tableCheckbox{width:16px;height:16px;margin:0;vertical-align:middle;accent-color:var(--dsw-alias-brand-primary);cursor:pointer}
+.dsh_arm_tableCheckbox:disabled{cursor:default}
+.dsh_arm_cellSelect .dsh_arm_select{width:100%;min-width:0}
+.dsh_arm_cellTest{white-space:nowrap}
+.dsh_arm_testButton{height:28px;padding:0 10px;font-size:12px;line-height:18px}
+.dsh_arm_cellActions{white-space:nowrap}
+.dsh_arm_cellActions .dsh_arm_iconButton{width:28px;height:28px;margin:0 2px 0 0}
+.dsh_arm_rowDisabled{background:transparent}
+.dsh_arm_rowDisabled td{opacity:.62}
+.dsh_arm_routeResultRow td,.dsh_arm_routeHintRow td{border-bottom:1px solid var(--dsw-alias-border-l2)}
+.dsh_arm_routeResultCell{padding-top:2px!important;padding-bottom:8px!important}
+.dsh_arm_routeHintCell{padding-top:0!important;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.dsh_arm_routeTestStatus{margin:0;font-size:12px;line-height:18px;overflow-wrap:anywhere}
+.dsh_arm_routeResultHint{display:block;margin-top:2px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;overflow-wrap:anywhere}
+.dsh_arm_tableEmptyRow td{padding:14px 10px;color:var(--dsw-alias-label-tertiary);font-size:13px;line-height:20px;text-align:center}
+.dsh_arm_iconButton{box-sizing:border-box;width:30px;height:30px;font:inherit;font-size:13px;line-height:18px;cursor:pointer;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);display:inline-flex;align-items:center;justify-content:center;padding:0}
+.dsh_arm_iconButton:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
+.dsh_arm_iconButton:disabled{opacity:.45;cursor:default}
 `;
 
   /** Inject the component stylesheet once; a no-op without a document. */
@@ -549,21 +635,33 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
   }
 
   /**
-   * Coerce whatever the settings namespace holds into the four form fields.
-   * Dirty values degrade to safe defaults, and strings are trimmed.
+   * Coerce whatever the settings namespace holds into the stored settings shape.
+   *
+   * Row 1 of the settings list is the legacy primary route (`provider`, `model`,
+   * `reasoningEffort`) plus `primaryEnabled`; rows 2..N are the ordered
+   * `fallbacks` array with a per-row `enabled` flag. The deprecated top-level
+   * `enabled` knob is never read or written. Legacy `{ mode: 'session' }`
+   * fallback rows are dropped: the session model is the implicit final fallback
+   * now and must never be a configurable row.
    * @param {unknown} raw - the namespace value, possibly absent or malformed.
-   * @returns {{ enabled: boolean, provider: string, model: string, reasoningEffort: string }}
+   * @returns {ReviewerSettings} the normalized route rows' storage shape.
    */
   function normalizeSettings(raw: unknown): ReviewerSettings {
     const source = raw !== null && typeof raw === 'object'
       ? (raw as Record<string, unknown>)
       : {};
-    return {
-      enabled: source.enabled !== false,
+    const settings: ReviewerSettings = {
+      primaryEnabled: source.primaryEnabled !== false,
       provider: trimString(source.provider),
       model: trimString(source.model),
       reasoningEffort: trimString(source.reasoningEffort),
     };
+    // Only materialize the key when the section actually carries a fallback
+    // list, so a legacy section round-trips unchanged until the user saves.
+    if (Array.isArray(source.fallbacks)) {
+      settings.fallbacks = normalizeRoutes(source.fallbacks).map(storedFallback);
+    }
+    return settings;
   }
 
   /**
@@ -659,55 +757,232 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
   }
 
   /**
-   * Selecting a provider drops the model and effort if the provider actually
-   * changed. Re-selecting the same provider is a no-op that preserves existing
-   * model/effort and avoids unnecessary dirty state.
+   * Reconcile a loaded value: normalizes the stored fields without clearing any
+   * persisted setting even when the catalog/groups are empty or missing.
+   * @param value - namespace section value.
+   * @param _groups - unused catalog snapshot (kept for call-site symmetry).
+   * @returns the normalized settings.
    */
-  function draftAfterProvider(draft: unknown, provider: unknown): ReviewerSettings {
-    const base = normalizeSettings(draft);
-    const nextProvider = trimString(provider);
-    if (nextProvider === base.provider) {
-      return base;
-    }
+  function reconcileDraft(value: unknown, _groups?: unknown): ReviewerSettings {
+    return normalizeSettings(value);
+  }
+
+  /** Whether one raw saved fallback entry is the removed `{ mode: 'session' }` row type. */
+  function isLegacySessionEntry(raw: unknown): boolean {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw)
+      ? raw as Record<string, unknown>
+      : {};
+    return trimString(source.mode).toLowerCase() === 'session';
+  }
+
+  /**
+   * Normalize one editable explicit route (one row of the settings list).
+   * Dirty values degrade to empty strings instead of throwing.
+   * @param raw - one row or saved entry, possibly malformed.
+   * @returns a normalized explicit route.
+   */
+  function normalizeRoute(raw: unknown): ReviewRoute {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw)
+      ? raw as Record<string, unknown>
+      : {};
     return {
-      ...base,
-      provider: nextProvider,
-      model: '',
-      reasoningEffort: '',
+      enabled: source.enabled !== false,
+      provider: trimString(source.provider),
+      model: trimString(source.model),
+      reasoningEffort: trimString(source.reasoningEffort),
     };
   }
 
   /**
-   * Selecting a model keeps the current reasoning effort only when that model
-   * supports it; a stale effort is cleared rather than silently persisted.
-   * Re-selecting the same model is a no-op that preserves existing reasoningEffort
-   * (including unadvertised/unverified values) and avoids unnecessary dirty state.
+   * Normalize a saved/edited explicit route list.
+   *
+   * A non-array degrades to an empty list. Legacy `{ mode: 'session' }` entries
+   * are dropped (the session model is implicit and not a row), while every
+   * other element becomes one row even when incomplete so the page can show it
+   * instead of silently rewriting the saved list.
+   * @param raw - raw `fallbacks` value or an editable row list.
+   * @returns normalized explicit routes in saved order (not capped).
    */
-  function draftAfterModel(draft: unknown, modelId: unknown, groups: unknown): ReviewerSettings {
-    const base = normalizeSettings(draft);
-    const model = trimString(modelId);
-    if (model === base.model) {
-      return base;
+  function normalizeRoutes(raw: unknown): ReviewRoute[] {
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .filter((entry) => !isLegacySessionEntry(entry))
+      .map((entry) => normalizeRoute(entry));
+  }
+
+  /** Convert one editable row into the stored `fallbacks` entry shape. */
+  function storedFallback(route: ReviewRoute): FallbackEntry {
+    return {
+      mode: 'route',
+      enabled: route.enabled,
+      provider: route.provider,
+      model: route.model,
+      reasoningEffort: route.reasoningEffort,
+    };
+  }
+
+  /**
+   * Build the full ordered explicit list from the saved namespace value.
+   *
+   * Row 1 is the legacy primary route, materialized whenever any of its fields
+   * is non-empty (or it was explicitly disabled) so an incomplete or disabled
+   * saved primary stays visible instead of being silently dropped. Fallback
+   * entries follow as rows 2..N. Legacy session entries never appear.
+   * @param raw - saved namespace value or draft settings.
+   * @returns the ordered explicit routes (the implicit session route is not a row).
+   */
+  function rowsFromSettings(raw: unknown): ReviewRoute[] {
+    const settings = normalizeSettings(raw);
+    const rows: ReviewRoute[] = [];
+    if (
+      settings.provider !== ''
+      || settings.model !== ''
+      || settings.reasoningEffort !== ''
+      || !settings.primaryEnabled
+    ) {
+      rows.push({
+        enabled: settings.primaryEnabled,
+        provider: settings.provider,
+        model: settings.model,
+        reasoningEffort: settings.reasoningEffort,
+      });
     }
+    for (const entry of settings.fallbacks ?? []) {
+      rows.push({
+        enabled: entry.enabled,
+        provider: entry.provider,
+        model: entry.model,
+        reasoningEffort: entry.reasoningEffort,
+      });
+    }
+    return rows;
+  }
+
+  /**
+   * Split the ordered explicit list back into the stored namespace shape.
+   *
+   * Row 1 becomes the top-level `primaryEnabled`/`provider`/`model`/
+   * `reasoningEffort` fields and rows 2..N become `fallbacks`. The key is
+   * omitted when there is no second row so a one-route (or empty) section keeps
+   * its legacy shape. The deprecated top-level `enabled` key is never written.
+   * @param rows - editable explicit routes in display order.
+   * @returns the settings value to persist.
+   */
+  function settingsFromRows(rows: unknown): ReviewerSettings {
+    const list = normalizeRoutes(rows);
+    const [first, ...rest] = list;
+    const settings: ReviewerSettings = {
+      primaryEnabled: first === undefined ? true : first.enabled,
+      provider: first === undefined ? '' : first.provider,
+      model: first === undefined ? '' : first.model,
+      reasoningEffort: first === undefined ? '' : first.reasoningEffort,
+    };
+    if (rest.length > 0) settings.fallbacks = rest.map(storedFallback);
+    return settings;
+  }
+
+  /** Structural equality for two ordered explicit lists, used for dirty detection. */
+  function routesEqual(left: unknown, right: unknown): boolean {
+    const a = normalizeRoutes(left);
+    const b = normalizeRoutes(right);
+    if (a.length !== b.length) return false;
+    return a.every((route, index) => (
+      route.enabled === b[index].enabled
+      && route.provider === b[index].provider
+      && route.model === b[index].model
+      && route.reasoningEffort === b[index].reasoningEffort
+    ));
+  }
+
+  /**
+   * Selecting a provider for one row clears its model and effort. Re-selecting
+   * the same provider is a no-op so it never marks the form dirty.
+   * @param route - current row.
+   * @param provider - newly selected provider id.
+   * @returns the updated row.
+   */
+  function routeAfterProvider(route: unknown, provider: unknown): ReviewRoute {
+    const base = normalizeRoute(route);
+    const nextProvider = trimString(provider);
+    if (nextProvider === base.provider) return base;
+    // Keep the inherit sentinel: it is route-independent, while an explicit
+    // effort belongs to the previous provider/model and must not leak.
+    return {
+      ...base,
+      provider: nextProvider,
+      model: '',
+      reasoningEffort: base.reasoningEffort === INHERIT_EFFORT ? INHERIT_EFFORT : '',
+    };
+  }
+
+  /**
+   * Selecting a model for one row keeps its reasoning effort only when that
+   * model advertises it; re-selecting the same model is a no-op.
+   * @param route - current row.
+   * @param modelId - newly selected model id.
+   * @param groups - provider groups from the model catalog.
+   * @returns the updated row.
+   */
+  function routeAfterModel(route: unknown, modelId: unknown, groups: unknown): ReviewRoute {
+    const base = normalizeRoute(route);
+    const model = trimString(modelId);
+    if (model === base.model) return base;
+    if (base.reasoningEffort === INHERIT_EFFORT) return { ...base, model };
     const supported = effortsFor(
       modelsFor(groups, base.provider).find((item) => item.id === model),
     ).map((effort) => effort.id);
     const reasoningEffort = base.reasoningEffort !== '' && !supported.includes(base.reasoningEffort)
       ? ''
       : base.reasoningEffort;
-    return {
-      ...base,
-      model,
-      reasoningEffort,
-    };
+    return { ...base, model, reasoningEffort };
+  }
+
+  /** Build a fresh, enabled explicit-route row that inherits the session effort. */
+  function emptyRoute(): ReviewRoute {
+    return { enabled: true, provider: '', model: '', reasoningEffort: INHERIT_EFFORT };
   }
 
   /**
-   * Reconcile a loaded value: normalizes the fields without clearing any
-   * persisted settings even if catalog/groups is empty or missing.
+   * Append one empty explicit-route row.
+   * @param list - current explicit list.
+   * @returns the new list; unchanged at {@link MAX_ROUTES}.
    */
-  function reconcileDraft(value: unknown, _groups?: unknown): ReviewerSettings {
-    return normalizeSettings(value);
+  function addRoute(list: unknown): ReviewRoute[] {
+    const rows = normalizeRoutes(list);
+    if (rows.length >= MAX_ROUTES) return rows;
+    return [...rows, emptyRoute()];
+  }
+
+  /** Replace one explicit-route row without mutating the current list. */
+  function replaceRoute(list: unknown, index: number, next: unknown): ReviewRoute[] {
+    const rows = normalizeRoutes(list);
+    if (index < 0 || index >= rows.length) return rows;
+    rows[index] = normalizeRoute(next);
+    return rows;
+  }
+
+  /** Remove one explicit-route row without mutating the current list. */
+  function removeRoute(list: unknown, index: number): ReviewRoute[] {
+    const rows = normalizeRoutes(list);
+    if (index < 0 || index >= rows.length) return rows;
+    return rows.filter((_route, current) => current !== index);
+  }
+
+  /**
+   * Move one explicit-route row up (`-1`) or down (`+1`).
+   * @param list - current explicit list.
+   * @param index - row to move.
+   * @param delta - direction.
+   * @returns the reordered list; unchanged when the move leaves the list.
+   */
+  function moveRoute(list: unknown, index: number, delta: number): ReviewRoute[] {
+    const rows = normalizeRoutes(list);
+    const target = index + delta;
+    if (index < 0 || index >= rows.length || target < 0 || target >= rows.length) return rows;
+    const reordered = [...rows];
+    const [moved] = reordered.splice(index, 1);
+    reordered.splice(target, 0, moved);
+    return reordered;
   }
 
   function errorText(error: unknown): string {
@@ -789,9 +1064,10 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
   }
 
   /**
-   * Replace the namespace's user section with the form's four fields, asking
-   * the Host to refuse the write if the revision moved since it was read.
-   * Resolves to the `remote.settings.replace` response unchanged.
+   * Replace the namespace's user section with the normalized settings value
+   * (row 1 in the top-level fields, rows 2..N in `fallbacks`), asking the Host
+   * to refuse the write if the revision moved since it was read. Resolves to
+   * the `remote.settings.replace` response unchanged.
    */
   function saveReviewerSettings(
     remote: RemoteFacade,
@@ -898,7 +1174,12 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
       }
     };
 
-    return React.createElement('div', { className: 'dsh_arm_select', ref: rootRef, onKeyDown },
+    return React.createElement('div', {
+      className: 'dsh_arm_select',
+      ref: rootRef,
+      onKeyDown,
+      ...(props.testId === undefined ? {} : { 'data-arm-select': props.testId }),
+    },
       React.createElement('button', {
         type: 'button',
         className: 'dsh_arm_trigger' + (open ? ' dsh_arm_triggerOpen' : ''),
@@ -1027,45 +1308,6 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
   }
 
   /**
-   * Describe the route the test actually probes: the SAVED settings, never the
-   * draft. An incomplete or disabled saved route is named explicitly so the
-   * page never implies a draft is being tested.
-   * @param saved - last accepted Host settings.
-   * @param t - locale bind function.
-   * @returns localized saved-route description.
-   */
-  function savedRouteText(saved: ReviewerSettings, t: (key: string) => string): string {
-    if (!saved.enabled) return t('testRouteDisabled');
-    if (saved.provider === '' || saved.model === '') return t('testRouteIncomplete');
-    let route = saved.provider + ' / ' + saved.model;
-    if (saved.reasoningEffort !== '') route += ' · ' + saved.reasoningEffort;
-    return route;
-  }
-
-  /**
-   * Explain which route the test button probes and whether unsaved edits exist.
-   * @param saved - last accepted Host settings.
-   * @param dirty - whether the draft differs from the saved settings.
-   * @param available - whether the Remote endpoint mounted.
-   * @param loaded - whether the saved settings were read successfully.
-   * @param t - locale bind function.
-   * @returns localized hint text.
-   */
-  function savedRouteHintText(
-    saved: ReviewerSettings,
-    dirty: boolean,
-    available: boolean,
-    loaded: boolean,
-    t: (key: string) => string,
-  ): string {
-    if (!available) return t('testUnavailableHint');
-    if (!loaded) return t('testLoadingHint');
-    let hint = formatText(t('testHint'), { route: savedRouteText(saved, t) });
-    if (dirty) hint += ' ' + t('testHintDirty');
-    return hint;
-  }
-
-  /**
    * Render a throttle delay with locale-appropriate units.
    * @param milliseconds - delay reported by the Host, or 0.
    * @param fallbackSeconds - locale-rendered fallback when the Host reported none.
@@ -1159,7 +1401,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     const failureCode = trimString(result.failureCode);
     const hostDetail = trimString(result.detail);
     // Classified outcomes already have localized repair advice; only an
-    // unclassified failure shows the Host's sanitized diagnostic, so the page
+    // unclassified failure shows the Host's classified diagnostic, so the page
     // never repeats English advisory prose on the localized UI.
     const diagnostics = code === 'UNKNOWN'
       ? [hostDetail === '' ? '' : t('testDetail') + ': ' + hostDetail]
@@ -1234,11 +1476,22 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     t: (key: string) => string,
   ): string {
     if (loading) return t('summaryLabel') + ': ' + t('summaryLoading');
-    if (!draft.enabled) return t('summaryLabel') + ': ' + t('summaryOff');
-    if (draft.provider === '' || draft.model === '') return t('summaryLabel') + ': ' + t('summaryInherit');
-    let line = t('summaryLabel') + ': ' + draft.provider + ' / ' + draft.model;
-    if (draft.reasoningEffort !== '') line += ' · ' + draft.reasoningEffort;
-    return line;
+    const rows = rowsFromSettings(draft).filter((route) => route.enabled);
+    if (rows.length === 0) return t('summaryLabel') + ': ' + t('summarySession');
+    // Summarize the first enabled route and count the remaining enabled routes;
+    // the implicit session fallback is not a row and is never counted.
+    const first = rows[0];
+    const remaining = rows.length - 1;
+    const suffix = remaining === 0
+      ? ''
+      : ' · ' + formatText(t('summaryFallbacks'), { count: String(remaining) });
+    if (first.provider === '' || first.model === '') {
+      return t('summaryLabel') + ': ' + t('summarySession') + suffix;
+    }
+    let line = t('summaryLabel') + ': ' + first.provider + ' / ' + first.model;
+    const effort = first.reasoningEffort === INHERIT_EFFORT ? 'inherit' : first.reasoningEffort;
+    if (effort !== '') line += ' · ' + effort;
+    return line + suffix;
   }
 
   function ReviewerModelConfig(props: ConfigProps): ReactElementLike {
@@ -1247,11 +1500,14 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     const t = props.t;
     const testRoute = props.testRoute;
 
-    // `saved` is the last accepted Host value; `draft` is the edited form.
-    // Nothing is written until Save, and Save re-reads the namespace so the
-    // next write carries the revision produced by this one.
+    // `saved` is the last accepted Host value. The editable list is kept as its
+    // own state (rather than derived from a settings draft) so an empty row,
+    // which the split storage shape cannot represent on its own, stays visible
+    // while the user fills it in. Nothing is written until Save, and Save
+    // re-reads the namespace so the next write carries the revision produced by
+    // this one.
     const [saved, setSaved] = React.useState<ReviewerSettings>(DEFAULT_SETTINGS);
-    const [draft, setDraft] = React.useState<ReviewerSettings>(DEFAULT_SETTINGS);
+    const [rows, setRows] = React.useState<ReviewRoute[]>(() => rowsFromSettings(DEFAULT_SETTINGS));
     const [groups, setGroups] = React.useState<ProviderGroup[]>([]);
     const [revision, setRevision] = React.useState<number | undefined>(undefined);
     const [catalogError, setCatalogError] = React.useState<string>('');
@@ -1259,31 +1515,24 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     const [loaded, setLoaded] = React.useState(false);
     const [busy, setBusy] = React.useState(false);
     const [status, setStatus] = React.useState<StatusLine | null>(null);
-    // The saved-route test is independent from Save: it has its own in-flight
-    // flag and its own result line, so it never reuses the save `busy` state or
-    // overwrites the save status text.
-    const [testing, setTesting] = React.useState(false);
-    const [testStatus, setTestStatus] = React.useState<TestOutcome | null>(null);
+    // Per-row probe state is independent for every row and from Save: each row
+    // has its own in-flight flag and result line, so a test never reuses the
+    // save `busy` state or overwrites another row's result.
+    const [rowTests, setRowTests] = React.useState<Record<number, RowTestState>>({});
     const aliveRef = React.useRef(true);
-    // Every started probe gets a sequence number; changing the saved route, or
-    // starting another probe, advances it so a late response can never be shown
-    // beside a different saved route. A synchronous ref also prevents two
-    // handler invocations in the same render from issuing two Remote calls.
+    // Every started probe gets a sequence number per row; editing the list, or
+    // starting another probe for the same row, advances it so a late response
+    // can never be shown beside different values. The controller map lets an
+    // edit or unmount abort every in-flight row probe promptly.
     const probeSeqRef = React.useRef(0);
-    const activeProbeRef = React.useRef<number | null>(null);
-    // Cancellation for the one in-flight probe: the Host applies its own
-    // deadline, but unmounting this page or changing the saved route must stop
-    // the probe (and its provider request) promptly instead of letting it run
-    // up to the 20 s deadline.
-    const probeAbortRef = React.useRef<AbortController | null>(null);
+    const probesRef = React.useRef(new Map<number, { seq: number; controller: AbortController }>());
     React.useEffect(() => {
       // Re-arm on setup so a StrictMode effect replay cannot ignore responses.
       aliveRef.current = true;
       return () => {
         aliveRef.current = false;
-        const controller = probeAbortRef.current;
-        probeAbortRef.current = null;
-        controller?.abort();
+        for (const probe of probesRef.current.values()) probe.controller.abort();
+        probesRef.current.clear();
       };
     }, []);
 
@@ -1298,14 +1547,14 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
         }
         const next = reconcileDraft(result.value, result.groups);
         setSaved(next);
-        setDraft(next);
+        setRows(rowsFromSettings(next));
         setGroups(result.groups);
         setRevision(result.revision);
         setCatalogError(result.catalogError);
         setLoaded(true);
         setLoading(false);
-        // A reloaded saved route invalidates any earlier probe result.
-        invalidateProbe();
+        // Reloaded values invalidate every earlier probe result.
+        resetRowTests();
         if (result.catalogError !== '') {
           setStatus({
             kind: 'error',
@@ -1333,14 +1582,14 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
         }
         const next = reconcileDraft(result.value, result.groups);
         setSaved(next);
-        setDraft(next);
+        setRows(rowsFromSettings(next));
         setGroups(result.groups);
         setRevision(result.revision);
         setCatalogError(result.catalogError);
         setLoaded(true);
         setLoading(false);
-        // A reloaded saved route invalidates any earlier probe result.
-        invalidateProbe();
+        // Reloaded values invalidate every earlier probe result.
+        resetRowTests();
         if (result.catalogError !== '') {
           setStatus({
             kind: 'error',
@@ -1359,36 +1608,12 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
       };
     }, [remote, t]);
 
-    const dirty = FIELDS.some((key) => draft[key] !== saved[key]);
-
-    const availableModels = modelsFor(groups, draft.provider);
-    const selectedModel = availableModels.find((model) => model.id === draft.model);
-    const availableEfforts = effortsFor(selectedModel);
-
-    const providerOptions = [{ value: '', label: t('providerEmpty') }];
-    if (draft.provider !== '' && !groups.some((group) => group.id === draft.provider)) {
-      providerOptions.push({ value: draft.provider, label: draft.provider + ' ' + t('unavailable') });
-    }
-    for (const group of groups) providerOptions.push({ value: group.id, label: group.name || group.id });
-
-    const modelOptions = availableModels.map((model) => ({ value: model.id, label: model.name || model.id }));
-    if (draft.model !== '' && selectedModel === undefined) {
-      modelOptions.unshift({ value: draft.model, label: draft.model + ' ' + t('unavailable') });
-    }
-
-    const effortOptions = [{ value: '', label: t('effortDefault') }];
-    for (const effort of availableEfforts) {
-      effortOptions.push({ value: effort.id, label: effort.name || effort.id });
-    }
-    if (draft.reasoningEffort !== '' && !availableEfforts.some((e) => e.id === draft.reasoningEffort)) {
-      const effortSuffix = catalogError !== ''
-        ? t('unverified')
-        : (selectedModel !== undefined ? t('notAdvertised') : t('unverified'));
-      effortOptions.push({
-        value: draft.reasoningEffort,
-        label: draft.reasoningEffort + ' ' + effortSuffix,
-      });
-    }
+    // The settings list is the single source of truth: row 1 plus its
+    // primaryEnabled flag is stored in the top-level fields, rows 2..N plus
+    // their enabled flags in `fallbacks`. The implicit session fallback is not
+    // a row, so it can never be reordered, removed or persisted.
+    const draft = settingsFromRows(rows);
+    const dirty = !routesEqual(rows, rowsFromSettings(saved));
 
     const formBusy = busy || loading;
     const controlsDisabled = formBusy || !loaded;
@@ -1397,89 +1622,122 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
       setStatus((prev) => (prev !== null && prev.kind === 'ok' ? null : prev));
     };
 
-    const edit = (patch: Partial<ReviewerSettings>): void => {
-      setDraft((prev) => ({ ...prev, ...patch }));
+    /**
+     * Drop every row probe's authority, abort its request, and clear its state.
+     *
+     * Called whenever the saved/list values change: a result must never appear
+     * beside different route values than the ones the Host actually probed.
+     */
+    const resetRowTests = (): void => {
+      probeSeqRef.current += 1;
+      for (const probe of probesRef.current.values()) probe.controller.abort();
+      probesRef.current.clear();
+      setRowTests({});
+    };
+
+    /** Replace the ordered explicit list, clearing stale probe results. */
+    const updateRoutes = (makeNext: (previous: ReviewRoute[]) => ReviewRoute[]): void => {
+      setRows((previous) => makeNext(previous));
+      resetRowTests();
       clearOk();
     };
 
-    const applyNext = (makeNext: (previous: ReviewerSettings) => ReviewerSettings): void => {
-      setDraft((prev) => makeNext(prev));
-      clearOk();
+    const changeRouteProvider = (index: number, provider: string): void => {
+      updateRoutes((list) => replaceRoute(list, index, routeAfterProvider(list[index], provider)));
+    };
+
+    const changeRouteModel = (index: number, modelId: string): void => {
+      updateRoutes((list) => replaceRoute(list, index, routeAfterModel(list[index], modelId, groups)));
+    };
+
+    const changeRouteEffort = (index: number, effort: string): void => {
+      updateRoutes((list) => replaceRoute(list, index, {
+        ...normalizeRoute(list[index]),
+        reasoningEffort: effort,
+      }));
+    };
+
+    const changeRouteEnabled = (index: number, enabled: boolean): void => {
+      updateRoutes((list) => replaceRoute(list, index, {
+        ...normalizeRoute(list[index]),
+        enabled,
+      }));
     };
 
     const discard = () => {
-      setDraft(saved);
+      setRows(rowsFromSettings(saved));
+      resetRowTests();
       setStatus(null);
     };
 
     /**
-     * Drop any in-flight probe's authority and its displayed outcome.
+     * Probe ONE row's current draft values through the mounted Remote endpoint.
      *
-     * Called whenever the saved route changes: a result must never appear beside
-     * a different route than the one the Host actually probed.
-     */
-    const invalidateProbe = (): void => {
-      probeSeqRef.current += 1;
-      const controller = probeAbortRef.current;
-      probeAbortRef.current = null;
-      // Saved-route change: cancel the probe for the previous route so no work
-      // (or provider request) continues for a route the page no longer shows.
-      controller?.abort();
-      setTestStatus(null);
-    };
-
-    /**
-     * Probe the SAVED review route through the mounted Remote endpoint.
+     * The row's provider/model/effort are sent as the optional explicit route,
+     * so unsaved edits are tested and the Host never falls back to the saved
+     * row 1. Each row keeps its own busy/result state and abort controller;
+     * editing the list, saving, reloading or unmounting aborts and clears it.
+     * The `inherit` effort is sent verbatim: the Host probes it with the
+     * route's provider default because the browser cannot know the session's
+     * effort. Results are classified text; provider prose is never requested.
      *
-     * The endpoint takes no arguments: the Host reads the saved settings itself,
-     * so a draft is never transmitted, no browser credential is read, and no
-     * route can be injected from the page. An independent `testing` flag (not
-     * the save `busy` flag) plus a synchronous sequence/lock guard duplicate
-     * taps, and a response is accepted only while its sequence is still current.
-     * The call receives a component-owned AbortSignal; unmounting the page or
-     * changing the saved route aborts it, so the Host stops the provider probe
-     * early. Results are classified text; provider prose is never requested or
-     * shown.
+     * @param index - row position in the current explicit list.
      */
-    const runRouteTest = async () => {
-      if (testing || formBusy || !loaded || testRoute === undefined) return;
-      if (activeProbeRef.current !== null) return;
-      // Defensive: a probe may never share the page with a second one, so a
-      // controller still present here belongs to a retired probe.
-      probeAbortRef.current?.abort();
-      const controller = new AbortController();
-      probeAbortRef.current = controller;
+    const runRowTest = async (index: number): Promise<void> => {
+      const row = rows[index];
+      if (row === undefined) return;
+      if (formBusy || !loaded || testRoute === undefined) return;
+      if (rowTests[index]?.busy === true) return;
+      // Defensive: a stale controller for this row belongs to a retired probe.
+      probesRef.current.get(index)?.controller.abort();
       const sequence = probeSeqRef.current + 1;
       probeSeqRef.current = sequence;
-      activeProbeRef.current = sequence;
-      setTesting(true);
-      setTestStatus(null);
+      const controller = new AbortController();
+      probesRef.current.set(index, { seq: sequence, controller });
+      setRowTests((previous) => ({
+        ...previous,
+        [index]: { busy: true, outcome: previous[index]?.outcome ?? null },
+      }));
+      const current = (): boolean => (
+        aliveRef.current && probesRef.current.get(index)?.seq === sequence
+      );
       try {
-        const response = await testRoute.testReviewRoute(controller.signal);
-        if (!aliveRef.current || activeProbeRef.current !== sequence) return;
-        if (sequence !== probeSeqRef.current) return;
+        const response = await testRoute.testReviewRoute({
+          provider: row.provider,
+          model: row.model,
+          reasoningEffort: row.reasoningEffort,
+        }, controller.signal);
+        if (!current()) return;
+        let outcome: TestOutcome;
         if (response === null || response === undefined || response.ok !== true) {
-          setTestStatus(mapTestTransportFailure(
+          outcome = mapTestTransportFailure(
             response === null || response === undefined ? undefined : response.error,
             t,
-          ));
-          return;
+          );
+        } else {
+          const value = response.value;
+          outcome = value === null || value === undefined
+            || typeof value !== 'object' || typeof value.code !== 'string'
+            ? mapTestUnknownResult(t)
+            : mapTestResult(value, t);
         }
-        const value = response.value;
-        if (value === null || value === undefined || typeof value !== 'object' || typeof value.code !== 'string') {
-          setTestStatus(mapTestUnknownResult(t));
-          return;
-        }
-        setTestStatus(mapTestResult(value, t));
+        setRowTests((previous) => ({ ...previous, [index]: { busy: false, outcome } }));
       } catch (error) {
-        if (aliveRef.current && activeProbeRef.current === sequence && sequence === probeSeqRef.current) {
-          setTestStatus(mapTestTransportFailure(error, t));
+        if (current()) {
+          setRowTests((previous) => ({
+            ...previous,
+            [index]: { busy: false, outcome: mapTestTransportFailure(error, t) },
+          }));
         }
       } finally {
-        if (probeAbortRef.current === controller) probeAbortRef.current = null;
-        if (activeProbeRef.current === sequence) {
-          activeProbeRef.current = null;
-          if (aliveRef.current) setTesting(false);
+        if (probesRef.current.get(index)?.seq === sequence) {
+          probesRef.current.delete(index);
+          if (aliveRef.current) {
+            setRowTests((previous) => ({
+              ...previous,
+              [index]: { busy: false, outcome: previous[index]?.outcome ?? null },
+            }));
+          }
         }
       }
     };
@@ -1489,7 +1747,12 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
       setBusy(true);
       setStatus(null);
       try {
-        const response = await saveReviewerSettings(remote, NS, draft, revision);
+        const response = await saveReviewerSettings(
+          remote,
+          NS,
+          settingsFromRows(rows),
+          revision,
+        );
         if (response === null || response === undefined || response.ok !== true) {
           setStatus({ kind: 'error', text: saveFailureText(response, t) });
           return;
@@ -1501,12 +1764,12 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
         if (refreshed.ok) {
           const next = reconcileDraft(refreshed.value, refreshed.groups);
           setSaved(next);
-          setDraft(next);
+          setRows(rowsFromSettings(next));
           setGroups(refreshed.groups);
           setRevision(refreshed.revision);
           setCatalogError(refreshed.catalogError);
-          // A saved route change invalidates any earlier probe result.
-          invalidateProbe();
+          // Saved values changed: every earlier probe result is stale.
+          resetRowTests();
           if (refreshed.catalogError !== '') {
             setStatus({ kind: 'ok', text: withDetail(t('savedCatalogFailed'), refreshed.catalogError) });
           } else {
@@ -1521,10 +1784,10 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
         const rawSection = namespaceSection(view);
         const fallback = reconcileDraft(normalizeSettings(rawSection), groups);
         setSaved(fallback);
-        setDraft(fallback);
-        // The saved route moved even though the re-read failed: drop a result
-        // that belongs to the previous route.
-        invalidateProbe();
+        setRows(rowsFromSettings(fallback));
+        // The saved values moved even though the re-read failed: drop every
+        // result that belongs to the previous values.
+        resetRowTests();
         let fallbackRevision: number | undefined = undefined;
         if (
           view !== null
@@ -1558,6 +1821,261 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
       + (status !== null && status.kind === 'error' ? ' dsh_arm_statusError' : '')
       + (status !== null && status.kind === 'ok' ? ' dsh_arm_statusOk' : '');
 
+    /**
+     * 审查路由表 / ordered review-route table.
+     *
+     * One real <table> so every provider/model/effort row is aligned: a narrow
+     * enable column, flexible provider/model/effort columns, and narrow test and
+     * action columns. A row is a single <tr data-route-index>; its test result
+     * (and any incomplete hint) is a separate full-width colSpan row, so a long
+     * provider name or a result line can never change the columns above.
+     */
+    const iconButton = (
+      label: string,
+      text: string,
+      disabled: boolean,
+      action: string,
+      onClick: () => void,
+    ): ReactElementLike => React.createElement('button', {
+      type: 'button',
+      className: 'dsh_arm_iconButton',
+      'aria-label': label,
+      title: label,
+      disabled,
+      'data-arm-action': action,
+      onClick,
+    }, text);
+
+    const renderRoute = (route: ReviewRoute, index: number): ReactElementLike[] => {
+      const entryProviderOptions: SelectOption[] = [
+        { value: '', label: t('routeProviderPlaceholder') },
+      ];
+      if (route.provider !== '' && !groups.some((group) => group.id === route.provider)) {
+        entryProviderOptions.push({ value: route.provider, label: route.provider + ' ' + t('unavailable') });
+      }
+      for (const group of groups) entryProviderOptions.push({ value: group.id, label: group.name || group.id });
+
+      const entryModels = modelsFor(groups, route.provider);
+      const entrySelectedModel = entryModels.find((model) => model.id === route.model);
+      const entryModelOptions = entryModels.map((model) => ({ value: model.id, label: model.name || model.id }));
+      if (route.model !== '' && entrySelectedModel === undefined) {
+        entryModelOptions.unshift({ value: route.model, label: route.model + ' ' + t('unavailable') });
+      }
+
+      const entryEfforts = effortsFor(entrySelectedModel);
+      const entryEffortOptions: SelectOption[] = [
+        { value: '', label: t('effortDefault') },
+        { value: INHERIT_EFFORT, label: t('effortInherit') },
+      ];
+      for (const effort of entryEfforts) entryEffortOptions.push({ value: effort.id, label: effort.name || effort.id });
+      if (
+        route.reasoningEffort !== ''
+        && route.reasoningEffort !== INHERIT_EFFORT
+        && !entryEfforts.some((effort) => effort.id === route.reasoningEffort)
+      ) {
+        const suffix = catalogError !== ''
+          ? t('unverified')
+          : (entrySelectedModel !== undefined ? t('notAdvertised') : t('unverified'));
+        entryEffortOptions.push({
+          value: route.reasoningEffort,
+          label: route.reasoningEffort + ' ' + suffix,
+        });
+      }
+
+      const rowDisabled = controlsDisabled;
+      const rowLabel = formatText(t('routeRowLabel'), { index: String(index + 1) });
+      const rowTest = rowTests[index];
+      const testBusy = rowTest?.busy === true;
+      const outcome = rowTest?.outcome ?? null;
+      const incomplete = route.provider === '' || route.model === '';
+
+      const mainRow = React.createElement('tr', {
+        className: 'dsh_arm_tableRow' + (route.enabled ? '' : ' dsh_arm_rowDisabled'),
+        key: 'route:' + String(index),
+        'data-route-index': index,
+        'aria-label': rowLabel,
+      },
+        React.createElement('td', { className: 'dsh_arm_cellEnable' },
+          React.createElement('input', {
+            type: 'checkbox',
+            className: 'dsh_arm_tableCheckbox',
+            checked: route.enabled,
+            disabled: rowDisabled,
+            'aria-label': t('routeEnabled') + ' ' + rowLabel,
+            'data-arm-action': 'route-' + String(index) + '-enable',
+            onChange: (event: { target: { checked: boolean } }) => {
+              changeRouteEnabled(index, event.target.checked);
+            },
+          }),
+        ),
+        React.createElement('td', { className: 'dsh_arm_cellSelect' },
+          React.createElement(ARMSelect, {
+            value: route.provider,
+            onChange: (value: string) => changeRouteProvider(index, value),
+            placeholder: t('routeProviderPlaceholder'),
+            label: t('routeProvider') + ' ' + String(index + 1),
+            options: entryProviderOptions,
+            disabled: rowDisabled,
+            testId: 'route-' + String(index) + '-provider',
+          }),
+        ),
+        React.createElement('td', { className: 'dsh_arm_cellSelect' },
+          React.createElement(ARMSelect, {
+            value: route.model,
+            onChange: (value: string) => changeRouteModel(index, value),
+            placeholder: t('routeModelPlaceholder'),
+            label: t('routeModel') + ' ' + String(index + 1),
+            options: entryModelOptions,
+            disabled: rowDisabled || route.provider === '' || entryModels.length === 0,
+            testId: 'route-' + String(index) + '-model',
+          }),
+        ),
+        React.createElement('td', { className: 'dsh_arm_cellSelect' },
+          React.createElement(ARMSelect, {
+            value: route.reasoningEffort,
+            onChange: (value: string) => changeRouteEffort(index, value),
+            placeholder: t('effortDefault'),
+            label: t('routeEffort') + ' ' + String(index + 1),
+            options: entryEffortOptions,
+            disabled: rowDisabled
+              || (route.reasoningEffort === '' && (route.model === '' || entryEfforts.length === 0)),
+            testId: 'route-' + String(index) + '-effort',
+          }),
+        ),
+        React.createElement('td', { className: 'dsh_arm_cellTest' },
+          React.createElement('button', {
+            type: 'button',
+            className: 'dsh_arm_button dsh_arm_buttonSecondary dsh_arm_testButton',
+            'data-arm-action': 'route-' + String(index) + '-test',
+            disabled: rowDisabled || testRoute === undefined || testBusy,
+            'aria-label': t('test') + ' ' + rowLabel,
+            onClick: () => {
+              void runRowTest(index);
+            },
+          }, testBusy ? t('testing') : t('test')),
+        ),
+        React.createElement('td', { className: 'dsh_arm_cellActions' },
+          iconButton(t('routeMoveUp'), '↑', rowDisabled || index === 0, 'route-' + String(index) + '-up', () => {
+            updateRoutes((list) => moveRoute(list, index, -1));
+          }),
+          iconButton(
+            t('routeMoveDown'),
+            '↓',
+            rowDisabled || index >= rows.length - 1,
+            'route-' + String(index) + '-down',
+            () => updateRoutes((list) => moveRoute(list, index, 1)),
+          ),
+          iconButton(t('routeRemove'), '✕', rowDisabled, 'route-' + String(index) + '-remove', () => {
+            updateRoutes((list) => removeRoute(list, index));
+          }),
+        ),
+      );
+
+      const children: ReactElementLike[] = [mainRow];
+
+      // The result is a full-width row directly under its route row, so a long
+      // status/hint never widens or shifts the columns above.
+      if (outcome !== null) {
+        const feedback: ReactElementLike[] = [
+          React.createElement('span', {
+            className: 'dsh_arm_routeTestStatus ' + testStatusClass(outcome.tone),
+            role: 'status',
+            key: 'status',
+          }, t('testResultPrefix') + ': ' + outcome.message),
+        ];
+        if (outcome.hint !== '') {
+          feedback.push(React.createElement('span', { className: 'dsh_arm_routeResultHint', key: 'hint' }, outcome.hint));
+        }
+        if (outcome.note !== '') {
+          feedback.push(React.createElement('span', { className: 'dsh_arm_routeResultHint', key: 'note' }, outcome.note));
+        }
+        if (outcome.detail !== '') {
+          feedback.push(React.createElement('span', { className: 'dsh_arm_testDetail', key: 'detail' }, outcome.detail));
+        }
+        children.push(React.createElement('tr', {
+          className: 'dsh_arm_routeResultRow',
+          key: 'route-result:' + String(index),
+          'data-route-result': index,
+        },
+          React.createElement('td', {
+            className: 'dsh_arm_routeResultCell',
+            colSpan: 6,
+          }, feedback),
+        ));
+      }
+
+      if (incomplete) {
+        children.push(React.createElement('tr', {
+          className: 'dsh_arm_routeHintRow',
+          key: 'route-hint:' + String(index),
+        },
+          React.createElement('td', {
+            className: 'dsh_arm_routeHintCell',
+            colSpan: 6,
+          }, t('routeIncompleteHint')),
+        ));
+      }
+
+      return children;
+    };
+
+    const routeSection = React.createElement('div', {
+      className: 'dsh_arm_routes',
+      'data-arm-routes': 'true',
+    },
+      React.createElement('div', { className: 'dsh_arm_routeHeader' },
+        React.createElement('span', { className: 'dsh_arm_label' }, t('reviewRoutesTitle')),
+        React.createElement('button', {
+          type: 'button',
+          className: 'dsh_arm_button dsh_arm_buttonSecondary',
+          'data-arm-action': 'route-add',
+          disabled: controlsDisabled || rows.length >= MAX_ROUTES,
+          onClick: () => updateRoutes((list) => addRoute(list)),
+        }, t('routeAdd')),
+      ),
+      React.createElement('p', { className: 'dsh_arm_hint' }, t('reviewRoutesHint')),
+      testRoute === undefined
+        ? React.createElement('p', { className: 'dsh_arm_hint' }, t('testUnavailableHint'))
+        : null,
+      React.createElement('div', { className: 'dsh_arm_tableWrap' },
+        React.createElement('table', {
+          className: 'dsh_arm_table',
+          'data-arm-table': 'true',
+          'aria-label': t('routeTableLabel'),
+        },
+          React.createElement('colgroup', null,
+            React.createElement('col', { className: 'dsh_arm_colEnable', key: 'enable' }),
+            React.createElement('col', { className: 'dsh_arm_colProvider', key: 'provider' }),
+            React.createElement('col', { className: 'dsh_arm_colModel', key: 'model' }),
+            React.createElement('col', { className: 'dsh_arm_colEffort', key: 'effort' }),
+            React.createElement('col', { className: 'dsh_arm_colTest', key: 'test' }),
+            React.createElement('col', { className: 'dsh_arm_colActions', key: 'actions' }),
+          ),
+          React.createElement('thead', null,
+            React.createElement('tr', null,
+              React.createElement('th', { scope: 'col', className: 'dsh_arm_thEnable' }, t('routeEnabled')),
+              React.createElement('th', { scope: 'col' }, t('routeProvider')),
+              React.createElement('th', { scope: 'col' }, t('routeModel')),
+              React.createElement('th', { scope: 'col' }, t('routeEffort')),
+              React.createElement('th', { scope: 'col' }, t('test')),
+              React.createElement('th', { scope: 'col' }, t('routeActions')),
+            ),
+          ),
+          React.createElement('tbody', null,
+            rows.length === 0
+              ? React.createElement('tr', { className: 'dsh_arm_tableEmptyRow', key: 'empty' },
+                React.createElement('td', { colSpan: 6 }, t('reviewRoutesEmpty')),
+              )
+              : null,
+            rows.flatMap((route, index) => renderRoute(route, index)),
+          ),
+        ),
+      ),
+      rows.length >= MAX_ROUTES
+        ? React.createElement('p', { className: 'dsh_arm_hint' }, t('routeCapHint'))
+        : null,
+    );
+
     return React.createElement('section', {
       className: 'dsh_arm_section',
       'aria-busy': formBusy,
@@ -1565,51 +2083,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     },
       React.createElement('h2', { className: 'dsh_arm_title' }, t('title')),
       React.createElement('p', { className: 'dsh_arm_subtitle' }, t('subtitle')),
-
-      React.createElement('label', { className: 'dsh_arm_toggle' },
-        React.createElement('input', {
-          type: 'checkbox',
-          className: 'dsh_arm_checkbox',
-          checked: draft.enabled,
-          disabled: controlsDisabled,
-          onChange: (event: { target: { checked: boolean } }) => edit({ enabled: event.target.checked }),
-        }),
-        React.createElement('span', { className: 'dsh_arm_toggleText' },
-          React.createElement('span', { className: 'dsh_arm_toggleTitle' }, t('enabled')),
-          React.createElement('span', { className: 'dsh_arm_toggleDesc' }, t('enabledDesc')),
-        ),
-      ),
-
-      React.createElement('div', { className: 'dsh_arm_fields' },
-        armField(t('provider'), React.createElement(ARMSelect, {
-          value: draft.provider,
-          onChange: (value: string) => applyNext((prev) => draftAfterProvider(prev, value)),
-          placeholder: t('providerEmpty'),
-          label: t('provider'),
-          options: providerOptions,
-          disabled: controlsDisabled || !draft.enabled,
-        })),
-        armField(t('model'), React.createElement(ARMSelect, {
-          value: draft.model,
-          onChange: (value: string) => applyNext((prev) => draftAfterModel(prev, value, groups)),
-          placeholder: draft.provider === '' ? t('inheritModel') : t('modelPlaceholder'),
-          label: t('model'),
-          options: modelOptions,
-          disabled: controlsDisabled || !draft.enabled || draft.provider === '' || availableModels.length === 0,
-        })),
-        armField(t('effort'), React.createElement(ARMSelect, {
-          value: draft.reasoningEffort,
-          onChange: (value: string) => edit({ reasoningEffort: value }),
-          placeholder: t('effortDefault'),
-          label: t('effort'),
-          options: effortOptions,
-          disabled: controlsDisabled || !draft.enabled || (draft.reasoningEffort === '' && (draft.model === '' || availableEfforts.length === 0)),
-        })),
-      ),
-
-      draft.enabled && draft.provider !== '' && draft.model === ''
-        ? React.createElement('p', { className: 'dsh_arm_hint' }, t('incompleteRouteHint'))
-        : null,
+      routeSection,
 
       React.createElement('div', { className: 'dsh_arm_actions' },
         dirty && !loading
@@ -1637,67 +2111,6 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
             void handleSave();
           },
         }, busy ? t('saving') : t('save')),
-      ),
-
-      // Saved-route probe: an independent action with its own state and result
-      // text. It always names the saved route, so a dirty draft is never mistaken
-      // for what the test exercises.
-      React.createElement('div', {
-        className: 'dsh_arm_test',
-        'data-arm-test': 'true',
-        'aria-busy': testing,
-      },
-        React.createElement('div', { className: 'dsh_arm_testHeader' },
-          React.createElement('span', { className: 'dsh_arm_testTitle' }, t('testLabel')),
-          React.createElement('button', {
-            type: 'button',
-            className: 'dsh_arm_button dsh_arm_buttonSecondary',
-            disabled: formBusy || !loaded || testing || testRoute === undefined,
-            onClick: () => {
-              void runRouteTest();
-            },
-          }, testing ? t('testing') : t('test')),
-        ),
-        React.createElement(
-          'p',
-          { className: 'dsh_arm_hint' },
-          savedRouteHintText(saved, dirty, testRoute !== undefined, loaded, t),
-        ),
-        // One persistent polite live region announces progress, the outcome,
-        // its tested route, and the actionable hint together.
-        React.createElement('div', {
-          className: 'dsh_arm_testFeedback',
-          role: 'status',
-          'aria-live': 'polite',
-          'aria-atomic': 'true',
-        },
-          testing
-            ? React.createElement('p', { className: 'dsh_arm_testStatus dsh_arm_testBlocked' }, t('testing'))
-            : null,
-          testStatus !== null
-            ? React.createElement(
-                'p',
-                { className: testStatusClass(testStatus.tone) },
-                t('testResultPrefix') + ': ' + testStatus.message,
-              )
-            : null,
-          testStatus !== null && testStatus.route !== ''
-            ? React.createElement(
-                'p',
-                { className: 'dsh_arm_hint' },
-                t('testResultRoute') + ': ' + testStatus.route,
-              )
-            : null,
-          testStatus !== null && testStatus.hint !== ''
-            ? React.createElement('p', { className: 'dsh_arm_hint' }, testStatus.hint)
-            : null,
-          testStatus !== null && testStatus.note !== ''
-            ? React.createElement('p', { className: 'dsh_arm_hint' }, testStatus.note)
-            : null,
-          testStatus !== null && testStatus.detail !== ''
-            ? React.createElement('p', { className: 'dsh_arm_testDetail' }, testStatus.detail)
-            : null,
-        ),
       ),
 
       loading
@@ -1791,16 +2204,27 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     providerGroups,
     modelsFor,
     effortsFor,
-    draftAfterProvider,
-    draftAfterModel,
+    isLegacySessionEntry,
+    normalizeRoute,
+    normalizeRoutes,
+    storedFallback,
+    rowsFromSettings,
+    settingsFromRows,
+    routesEqual,
+    routeAfterProvider,
+    routeAfterModel,
+    replaceRoute,
+    addRoute,
+    removeRoute,
+    moveRoute,
     reconcileDraft,
+    MAX_ROUTES,
     summaryLine,
     loadReviewerSettings,
     saveReviewerSettings,
-    // Saved-route test helpers (localized text composition only; no prose path).
+    INHERIT_EFFORT,
+    // Per-row probe result helpers (localized text composition only; no prose path).
     formatText,
-    savedRouteText,
-    savedRouteHintText,
     delayText,
     mapTestResult,
     mapTestTransportFailure,

@@ -28,7 +28,27 @@ const REVIEW_POLICY_MARKER =
 const INSTALLED_AUTO_REVIEW_CANDIDATES: string[] = [
   ...(process.env.DSH_INSTALL_DIR === undefined
     ? []
-    : [path.join(path.dirname(process.env.DSH_INSTALL_DIR), 'dsh-experimental-auto-review', 'lib', 'index.js')]),
+    : [
+      // A global install may place the official package beside the DSH package
+      // (`.../@deepseek-ai/dsh-experimental-auto-review`) or nest it inside the
+      // DSH package's own node_modules; a `~/.local` install uses the latter.
+      path.join(path.dirname(process.env.DSH_INSTALL_DIR), 'dsh-experimental-auto-review', 'lib', 'index.js'),
+      path.join(
+        process.env.DSH_INSTALL_DIR,
+        'node_modules',
+        '@deepseek-ai',
+        'dsh-experimental-auto-review',
+        'lib',
+        'index.js',
+      ),
+      path.join(
+        process.env.DSH_INSTALL_DIR,
+        'node_modules',
+        'dsh-experimental-auto-review',
+        'lib',
+        'index.js',
+      ),
+    ]),
   '/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-experimental-auto-review/lib/index.js',
 ];
 
@@ -258,7 +278,13 @@ await check('./typert exports a Loader-valid manifest with one strict invocation
         namespace?: string;
         method?: string;
         invocation?: { kind?: string };
-        parameters?: unknown[];
+        parameters?: Array<{
+          name?: string;
+          wire?: string;
+          source?: string;
+          acceptsUndefined?: boolean;
+          codec?: { mode?: string; typeSymbol?: string };
+        }>;
         cancellation?: { parameter?: string };
         result?: { mode?: string; typeSymbol?: string; create?: unknown; jsonSchema?: any };
       }>;
@@ -285,7 +311,16 @@ await check('./typert exports a Loader-valid manifest with one strict invocation
   assert(invocation.namespace === 'autoReviewModel', 'invocation namespace must be autoReviewModel');
   assert(invocation.method === 'testReviewRoute', 'invocation method must be testReviewRoute');
   assert(invocation.invocation?.kind === 'direct', 'the endpoint must be a direct Service invocation');
-  assert(Array.isArray(invocation.parameters) && invocation.parameters.length === 0, 'no browser wire parameters are accepted');
+  assert(Array.isArray(invocation.parameters) && invocation.parameters.length === 1, 'one optional route input is accepted');
+  const input = invocation.parameters?.[0];
+  assert(input?.name === 'input' && input.wire === 'input', 'the optional input must use the "input" wire field');
+  assert(input.source === 'json', 'the optional input must be a JSON parameter');
+  assert(input.acceptsUndefined === true, 'the optional input must be omissible');
+  assert(input.codec?.mode === 'strict', 'the optional input codec must be strict');
+  assert(
+    input.codec?.typeSymbol === `${PACKAGE_NAME}#ReviewRouteTestInput`,
+    'the optional input codec type symbol must be stable',
+  );
   assert(invocation.cancellation?.parameter === 'signal', 'the transport cancellation signal must be declared');
   assert(invocation.result?.mode === 'strict', 'the result codec must be strict');
   assert(typeof invocation.result?.typeSymbol === 'string' && invocation.result.typeSymbol !== '', 'the result codec needs a type symbol');

@@ -105,6 +105,28 @@ export type ReviewRouteTestStatus = 'ok' | 'warning' | 'error' | 'blocked';
 /** How the tested route authenticates, as classified from the provider directory. */
 export type ReviewRouteTestAuthKind = 'account' | 'api-key' | 'unknown';
 
+/**
+ * Optional explicit route input for one probe.
+ *
+ * Omitting the whole input (or sending an empty provider+model) keeps the
+ * original behavior: probe settings-list row 1. Every field is an id string;
+ * the Host trims and bounds them, and never accepts a URL or a credential.
+ */
+export interface ReviewRouteTestInput {
+  /** Provider id to probe. */
+  provider?: string;
+  /** Model id to probe. */
+  model?: string;
+  /** Effort to probe; `inherit` is sent as the provider default for a probe. */
+  reasoningEffort?: string;
+}
+
+/** Type name of the optional input codec's stable type symbol. */
+export const INPUT_SCHEMA_NAME = 'ReviewRouteTestInput';
+
+/** Stable type symbol of the optional input codec. */
+export const INPUT_TYPE_SYMBOL = `${PACKAGE_NAME}#${INPUT_SCHEMA_NAME}`;
+
 /** The exact saved route the test probed. */
 export interface ReviewRouteTestRoute {
   /** Saved provider id. */
@@ -146,9 +168,56 @@ export interface ReviewRouteTestResult {
   retryAfterMs: number;
   /** Provider-neutral failure code observed on the wire, or `''` when none. */
   failureCode: string;
-  /** Short sanitized diagnostic detail, or `''` when none. */
+  /** Short classified diagnostic detail, or `''` when none. */
   detail: string;
 }
+
+/** Ordered optional field list of {@link ReviewRouteTestInput}. */
+const INPUT_KEYS = ['provider', 'model', 'reasoningEffort'] as const;
+
+/**
+ * Strict parser for the optional explicit-route input.
+ *
+ * `undefined` (no wire field) is valid and means "probe the saved row 1". Any
+ * present field must be a string; unknown fields are rejected so a caller
+ * cannot smuggle credentials, prompts, or session data through the probe.
+ *
+ * @returns a parser accepting only the documented optional input.
+ */
+export function createInputSchema(): { readonly parse: (value: unknown) => ReviewRouteTestInput | undefined } {
+  return {
+    parse(value: unknown): ReviewRouteTestInput | undefined {
+      // Generated optional-input codecs return `undefined` for an absent field;
+      // the Gateway then leaves the wire key out entirely.
+      if (value === undefined) return undefined;
+      if (!isRecord(value)) throw new TypeError('ReviewRouteTestInput must be an object');
+      for (const key of Object.keys(value)) {
+        if (!(INPUT_KEYS as readonly string[]).includes(key)) {
+          throw new TypeError(`ReviewRouteTestInput has undeclared field ${JSON.stringify(key)}`);
+        }
+      }
+      const input: ReviewRouteTestInput = {};
+      for (const key of INPUT_KEYS) {
+        const field = value[key];
+        if (field === undefined) continue;
+        if (typeof field !== 'string') throw new TypeError(`ReviewRouteTestInput.${key} must be a string`);
+        input[key] = field;
+      }
+      return input;
+    },
+  };
+}
+
+/** JSON Schema projection of {@link ReviewRouteTestInput}. */
+export const INPUT_JSON_SCHEMA: Readonly<Record<string, unknown>> = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    provider: { type: 'string' },
+    model: { type: 'string' },
+    reasoningEffort: { type: 'string' },
+  },
+};
 
 /** Ordered field list of {@link ReviewRouteTestResult}; the strict parser rejects anything else. */
 const RESULT_KEYS = [
@@ -350,10 +419,18 @@ export interface ContractCodecSpec {
 export interface ContractParameterSpec {
   /** Source-level parameter name. */
   readonly name: string;
-  /** Required key in the wire `args` object. */
+  /** Wire `args` key. */
   readonly wire: string;
+  /** Optional documentation carried into the generated manifest. */
+  readonly description?: string;
   /** JSON or Host lookup value. */
   readonly source: 'json';
+  /**
+   * Declares an optional parameter: the Gateway then accepts a missing wire
+   * field and the method receives `undefined` (the generated optional-input
+   * shape).
+   */
+  readonly acceptsUndefined?: true;
   /** Strict boundary codec. */
   readonly codec: ContractCodecSpec;
 }
@@ -373,8 +450,9 @@ export interface ContractInvocationDescriptor {
   /** Direct Service invocation; the Client has no scoped Context projection. */
   readonly invocation: { readonly kind: 'direct' };
   /**
-   * Ordered business parameters. Deliberately empty: the browser supplies no
-   * route, credential, or prompt, so the wire carries no arguments at all.
+   * Ordered business parameters: exactly one optional explicit-route input.
+   * The browser supplies ids only; no credential, prompt, session id, or URL
+   * crosses the wire.
    */
   readonly parameters: readonly ContractParameterSpec[];
   /** Transport cancellation injected after business parameters. */
@@ -459,6 +537,20 @@ export interface ContractRemoteContribution {
 }
 
 /**
+ * Build the strict input codec for the optional explicit route.
+ * @returns the codec descriptor in generated-artifact shape.
+ */
+function createInputCodec(): ContractCodecSpec {
+  return {
+    mode: 'strict',
+    typeSymbol: INPUT_TYPE_SYMBOL,
+    create: createInputSchema,
+    description: 'Optional explicit review route to probe; omitted probes the saved row 1.',
+    jsonSchema: INPUT_JSON_SCHEMA,
+  };
+}
+
+/**
  * Build the strict result codec.
  * @returns the codec descriptor in generated-artifact shape.
  */
@@ -493,9 +585,18 @@ export function createInvocationDescriptor(): ContractInvocationDescriptor {
     service: REMOTE_SERVICE_KEY,
     namespace: REMOTE_NAMESPACE,
     method: REMOTE_METHOD,
-    description: 'Probe the saved review route with one fixed harmless prompt.',
+    description: 'Probe one review route (the saved row 1 by default) with one fixed harmless prompt.',
     invocation: { kind: 'direct' },
-    parameters: [],
+    parameters: [
+      {
+        name: 'input',
+        wire: 'input',
+        source: 'json',
+        acceptsUndefined: true,
+        codec: createInputCodec(),
+        description: 'Optional explicit route to probe; omitted probes the saved settings-list row 1.',
+      },
+    ],
     cancellation: { parameter: 'signal' },
     result: createResultCodec(),
   };
@@ -545,11 +646,20 @@ export function createHostManifest(): ContractTypertManifest {
             {
               kind: 'method',
               name: REMOTE_METHOD,
-              signature: `${REMOTE_METHOD}(signal?: AbortSignal): Promise<ReviewRouteTestResult>`,
-              summary: 'Probe the saved route and return a classified, prose-free outcome.',
+              signature: `${REMOTE_METHOD}(input?: ReviewRouteTestInput, signal?: AbortSignal): Promise<ReviewRouteTestResult>`,
+              summary: 'Probe the saved row 1 or an explicit route and return a classified, prose-free outcome.',
             },
           ],
           types: [
+            {
+              name: 'ReviewRouteTestInput',
+              declaration:
+                'export interface ReviewRouteTestInput {\n'
+                + '  readonly provider?: string;\n'
+                + '  readonly model?: string;\n'
+                + '  readonly reasoningEffort?: string;\n'
+                + '}',
+            },
             {
               name: 'ReviewRouteTestResult',
               declaration:

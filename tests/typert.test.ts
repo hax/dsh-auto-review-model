@@ -97,6 +97,7 @@ interface Descriptor {
     name: string;
     wire: string;
     source: string;
+    acceptsUndefined?: true;
     codec: Codec;
   }>;
   cancellation?: { parameter: string };
@@ -258,8 +259,15 @@ function validatedDescriptor(): Descriptor {
     ENDPOINT.endpoint,
     'descriptor endpoint must equal the Gateway endpoint',
   );
-  // The browser supplies nothing, so the sole endpoint has no wire parameters.
-  assert.deepEqual(descriptor.parameters, [], 'the saved-route probe must accept no browser arguments');
+  // The browser may send exactly one optional explicit-route input; no
+  // credential, prompt, URL, or session id is part of the wire contract.
+  assert.equal(descriptor.parameters.length, 1, 'the probe accepts one optional route input');
+  const input = descriptor.parameters[0];
+  assert.equal(input.name, 'input');
+  assert.equal(input.wire, 'input');
+  assert.equal(input.source, 'json');
+  assert.equal(input.acceptsUndefined, true, 'the route input must be optional');
+  assert.equal(input.codec.typeSymbol, `${ENDPOINT.package}#ReviewRouteTestInput`);
 
   // Client mount boundary: `$mount()` checks package plus strict input codecs.
   assert.equal(REMOTE_MODULE.default, REMOTE_MODULE.TYPERT_REMOTE, 'the remote artifact must default-export its contribution');
@@ -282,6 +290,34 @@ test('Host manifest passes the Typert Loader structural contract', () => {
   );
   assert.equal(descriptor.result.mode, 'strict');
   assert.ok(descriptor.result.jsonSchema, 'the strict result codec must publish a JSON Schema projection');
+});
+
+test('the optional input codec accepts only the documented route ids', () => {
+  const descriptor = validatedDescriptor();
+  const inputCodec = descriptor.parameters[0].codec;
+  const schema = inputCodec.create();
+  assert.equal(schema.parse(undefined), undefined, 'an absent input probes the saved row 1');
+  assert.deepEqual(schema.parse({ provider: 'p', model: 'm' }), { provider: 'p', model: 'm' });
+  assert.deepEqual(
+    schema.parse({ provider: 'p', model: 'm', reasoningEffort: 'inherit' }),
+    { provider: 'p', model: 'm', reasoningEffort: 'inherit' },
+  );
+  assert.deepEqual(schema.parse({}), {});
+  for (const [label, value] of [
+    ['a non-object input', 'route'],
+    ['an array input', []],
+    ['an undeclared field', { provider: 'p', model: 'm', apiKey: 'sk-secret' }],
+    ['a non-string provider', { provider: 42 }],
+    ['a non-string model', { model: {} }],
+    ['a non-string effort', { reasoningEffort: false }],
+  ] as const) {
+    assert.throws(() => schema.parse(value), TypeError, `the input codec must reject ${label}`);
+  }
+  assert.ok(inputCodec.jsonSchema, 'the input codec must publish a JSON Schema projection');
+  assert.deepEqual(
+    Object.keys((inputCodec.jsonSchema as { properties: Record<string, unknown> }).properties).sort(),
+    ['model', 'provider', 'reasoningEffort'],
+  );
 });
 
 test('the Host manifest registers no parser-only named schema', () => {

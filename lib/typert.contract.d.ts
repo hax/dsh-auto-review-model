@@ -65,6 +65,25 @@ export type ReviewRouteTestCode = (typeof REVIEW_ROUTE_TEST_CODES)[number];
 export type ReviewRouteTestStatus = 'ok' | 'warning' | 'error' | 'blocked';
 /** How the tested route authenticates, as classified from the provider directory. */
 export type ReviewRouteTestAuthKind = 'account' | 'api-key' | 'unknown';
+/**
+ * Optional explicit route input for one probe.
+ *
+ * Omitting the whole input (or sending an empty provider+model) keeps the
+ * original behavior: probe settings-list row 1. Every field is an id string;
+ * the Host trims and bounds them, and never accepts a URL or a credential.
+ */
+export interface ReviewRouteTestInput {
+    /** Provider id to probe. */
+    provider?: string;
+    /** Model id to probe. */
+    model?: string;
+    /** Effort to probe; `inherit` is sent as the provider default for a probe. */
+    reasoningEffort?: string;
+}
+/** Type name of the optional input codec's stable type symbol. */
+export declare const INPUT_SCHEMA_NAME = "ReviewRouteTestInput";
+/** Stable type symbol of the optional input codec. */
+export declare const INPUT_TYPE_SYMBOL = "@aghost-prj/dsh-auto-review-model#ReviewRouteTestInput";
 /** The exact saved route the test probed. */
 export interface ReviewRouteTestRoute {
     /** Saved provider id. */
@@ -105,9 +124,23 @@ export interface ReviewRouteTestResult {
     retryAfterMs: number;
     /** Provider-neutral failure code observed on the wire, or `''` when none. */
     failureCode: string;
-    /** Short sanitized diagnostic detail, or `''` when none. */
+    /** Short classified diagnostic detail, or `''` when none. */
     detail: string;
 }
+/**
+ * Strict parser for the optional explicit-route input.
+ *
+ * `undefined` (no wire field) is valid and means "probe the saved row 1". Any
+ * present field must be a string; unknown fields are rejected so a caller
+ * cannot smuggle credentials, prompts, or session data through the probe.
+ *
+ * @returns a parser accepting only the documented optional input.
+ */
+export declare function createInputSchema(): {
+    readonly parse: (value: unknown) => ReviewRouteTestInput | undefined;
+};
+/** JSON Schema projection of {@link ReviewRouteTestInput}. */
+export declare const INPUT_JSON_SCHEMA: Readonly<Record<string, unknown>>;
 /**
  * Build the strict result parser.
  *
@@ -159,10 +192,18 @@ export interface ContractCodecSpec {
 export interface ContractParameterSpec {
     /** Source-level parameter name. */
     readonly name: string;
-    /** Required key in the wire `args` object. */
+    /** Wire `args` key. */
     readonly wire: string;
+    /** Optional documentation carried into the generated manifest. */
+    readonly description?: string;
     /** JSON or Host lookup value. */
     readonly source: 'json';
+    /**
+     * Declares an optional parameter: the Gateway then accepts a missing wire
+     * field and the method receives `undefined` (the generated optional-input
+     * shape).
+     */
+    readonly acceptsUndefined?: true;
     /** Strict boundary codec. */
     readonly codec: ContractCodecSpec;
 }
@@ -183,8 +224,9 @@ export interface ContractInvocationDescriptor {
         readonly kind: 'direct';
     };
     /**
-     * Ordered business parameters. Deliberately empty: the browser supplies no
-     * route, credential, or prompt, so the wire carries no arguments at all.
+     * Ordered business parameters: exactly one optional explicit-route input.
+     * The browser supplies ids only; no credential, prompt, session id, or URL
+     * crosses the wire.
      */
     readonly parameters: readonly ContractParameterSpec[];
     /** Transport cancellation injected after business parameters. */

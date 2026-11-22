@@ -66,6 +66,7 @@ interface ListenerRegistration {
 /** Internal state of the test config refs. */
 interface HarnessState {
   enabled: boolean;
+  primaryEnabled: boolean;
   provider: string;
   model: string;
   reasoningEffort: string;
@@ -97,6 +98,10 @@ interface HarnessOptions {
   config?: Partial<HarnessState>;
   modelInfo?: ModelInfoFn;
   providers?: TestProviderInfo[];
+  /** Live effort of the fake session's request header, or `undefined` for none. */
+  sessionEffort?: string;
+  /** Simulate a session id that cannot be resolved. */
+  sessionMissing?: boolean;
 }
 
 /** Fake host environment returned by createHarness. */
@@ -166,9 +171,16 @@ async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
  * Fake host: config refs, listener registration, and a minimal `llm` service.
  * `state` is mutated by tests to simulate a live settings ref change.
  */
-function createHarness({ config = {}, modelInfo = () => ({}), providers = [] }: HarnessOptions = {}): Harness {
+function createHarness({
+  config = {},
+  modelInfo = () => ({}),
+  providers = [],
+  sessionEffort,
+  sessionMissing = false,
+}: HarnessOptions = {}): Harness {
   const state: HarnessState = {
     enabled: true,
+    primaryEnabled: true,
     provider: 'review-provider',
     model: 'review-model',
     reasoningEffort: '',
@@ -176,6 +188,7 @@ function createHarness({ config = {}, modelInfo = () => ({}), providers = [] }: 
   };
   const configRefs: ReviewerConfig = {
     enabled: { get: () => state.enabled },
+    primaryEnabled: { get: () => state.primaryEnabled },
     provider: { get: () => state.provider },
     model: { get: () => state.model },
     reasoningEffort: { get: () => state.reasoningEffort },
@@ -210,6 +223,16 @@ function createHarness({ config = {}, modelInfo = () => ({}), providers = [] }: 
           registerExclusion: () => () => {},
         },
       });
+    },
+    sessions: {
+      get(id: string) {
+        if (sessionMissing || id === '') return undefined;
+        return {
+          requestHeader: () => (sessionEffort === undefined
+            ? undefined
+            : { config: { reasoningEffort: sessionEffort } }),
+        };
+      },
     },
     provide(name: string, value: unknown) {
       provided.set(name, value);
@@ -339,19 +362,27 @@ function assertCapabilityFailure(
 
 test('plugin metadata follows the shared loader contract', () => {
   assert.equal(name, 'auto-review-model');
-  assert.deepEqual(inject, ['llm', 'sessionLogDeepSeek']);
+  assert.deepEqual(inject, ['llm', 'sessionLogDeepSeek', 'sessions']);
   assert.equal(typeof apply, 'function');
 });
 
-test('Config declares four volatile settings with the shared defaults', () => {
+test('Config keeps the deprecated enabled flag plus per-row enable flags and the fallback list', () => {
   const config = Config({}) as unknown as Record<string, { get: () => unknown }>;
-  for (const key of ['enabled', 'provider', 'model', 'reasoningEffort']) {
+  for (const key of ['enabled', 'primaryEnabled', 'provider', 'model', 'reasoningEffort', 'fallbacks']) {
     assert.equal(typeof config[key]?.get, 'function', `${key} must be a volatile ref`);
   }
+  // `enabled` is deprecated and ignored; it stays in the schema only so old
+  // configurations still validate.
   assert.equal(config.enabled.get(), true);
+  assert.equal(config.primaryEnabled.get(), true, 'row 1 is enabled by default');
   assert.equal(config.provider.get(), '');
   assert.equal(config.model.get(), '');
   assert.equal(config.reasoningEffort.get(), '');
+  assert.deepEqual(config.fallbacks.get(), [], 'legacy configs have no fallback routes');
+  const withFallbacks = Config({ fallbacks: [{ provider: 'p', model: 'm' }] }) as unknown as Record<string, { get: () => unknown }>;
+  assert.deepEqual(withFallbacks.fallbacks.get(), [
+    { enabled: true, mode: 'route', provider: 'p', model: 'm', reasoningEffort: '' },
+  ], 'fallback rows default to enabled');
 });
 
 test('capability query deadline is 300000ms (5 min)', () => {
@@ -393,39 +424,48 @@ test('marker recognition accepts only the fixed auto-review prompt', () => {
   assert.equal(isAutoReviewRequest('REVIEW_POLICY\nnot an object'), false);
 });
 
-test('normalizeEffort trims and treats inherit/default as empty', () => {
+test('normalizeEffort trims, keeps the inherit sentinel and treats default as empty', () => {
   assert.equal(normalizeEffort(undefined), '');
   assert.equal(normalizeEffort(null), '');
   assert.equal(normalizeEffort(''), '');
   assert.equal(normalizeEffort('   '), '');
   assert.equal(normalizeEffort('default'), '');
-  assert.equal(normalizeEffort(' inherit '), '');
+  assert.equal(normalizeEffort(' inherit '), 'inherit', 'the inherit sentinel must survive normalization');
   assert.equal(normalizeEffort(' high '), 'high');
   assert.equal(normalizeEffort('xhigh'), 'xhigh');
 });
 
-test('readReviewerSettings reads volatile refs live and defaults enabled', () => {
-  let values: Record<string, unknown> = { enabled: false, provider: 'p1', model: 'm1', reasoningEffort: ' high ' };
+test('readReviewerSettings reads volatile refs live and defaults both enable flags', () => {
+  let values: Record<string, unknown> = {
+    enabled: false,
+    primaryEnabled: false,
+    provider: 'p1',
+    model: 'm1',
+    reasoningEffort: ' high ',
+  };
   const config = Object.fromEntries(
     Object.entries(values).map(([key]) => [key, { get: () => values[key] }]),
   ) as ReviewerConfig;
   assert.deepEqual(readReviewerSettings(config), {
     enabled: false,
+    primaryEnabled: false,
     provider: 'p1',
     model: 'm1',
     reasoningEffort: 'high',
   });
 
-  values = { enabled: true, provider: 'p2', model: 'm2', reasoningEffort: 'inherit' };
+  values = { enabled: true, primaryEnabled: true, provider: 'p2', model: 'm2', reasoningEffort: 'inherit' };
   assert.deepEqual(readReviewerSettings(config), {
     enabled: true,
+    primaryEnabled: true,
     provider: 'p2',
     model: 'm2',
-    reasoningEffort: '',
+    reasoningEffort: 'inherit',
   });
 
   assert.deepEqual(readReviewerSettings(undefined), {
     enabled: true,
+    primaryEnabled: true,
     provider: '',
     model: '',
     reasoningEffort: '',
@@ -470,16 +510,19 @@ test('non-review requests pass through untouched', async () => {
   assert.equal(harness.resolveCalls.length, 0);
 });
 
-test('enabled=false passes the reviewer request through', async () => {
-  const harness = createHarness({ config: { enabled: false, reasoningEffort: 'high' } });
+test('the deprecated enabled=false no longer disables the plugin', async () => {
+  const harness = createHarness({
+    config: { enabled: false, provider: 'review-provider-2', model: 'review-model-2' },
+  });
   const options = reviewOptions();
 
   await collect(harness.ctx.llm.stream(options));
 
   assert.equal(harness.baseCalls.length, 1);
-  assert.equal(harness.baseCalls[0], options);
-  assert.equal(harness.streamCalls.length, 1);
-  assert.equal(harness.resolveCalls.length, 0);
+  assert.notEqual(harness.baseCalls[0], options, 'the plugin must stay active');
+  assert.equal(harness.baseCalls[0].provider, 'review-provider-2');
+  assert.equal(harness.baseCalls[0].model, 'review-model-2');
+  assert.equal(harness.streamCalls.length, 2);
 });
 
 test('whitespace-only provider and model do not override the reviewer route', async () => {
@@ -496,7 +539,7 @@ test('whitespace-only provider and model do not override the reviewer route', as
   assert.equal(harness.resolveCalls.length, 0);
   assert.deepEqual(
     readReviewerSettings({ provider: '  p1  ', model: '  m1  ' }),
-    { enabled: true, provider: 'p1', model: 'm1', reasoningEffort: '' },
+    { enabled: true, primaryEnabled: true, provider: 'p1', model: 'm1', reasoningEffort: '' },
   );
 });
 
@@ -579,7 +622,9 @@ test('capability lookup failure rejects with an actionable error instead of sile
       throw new Error('capability lookup failed');
     },
   });
-  const options = reviewOptions();
+  // The request route equals the explicit route, so the implicit session
+  // fallback is de-duplicated and the capability failure has nowhere to go.
+  const options = reviewOptions({ provider: 'review-provider-2', model: 'review-model-2' });
 
   await assert.rejects(
     collect(harness.ctx.llm.stream(options)),
@@ -596,7 +641,8 @@ test('capability lookup failure rejects with an actionable error instead of sile
     harness.resolveCalls.map((c) => [c.provider, c.model]),
     [['review-provider-2', 'review-model-2']],
   );
-  assert.equal(options.provider, 'request-provider', 'the frozen original request must stay untouched');
+  assert.equal(options.provider, 'review-provider-2', 'the frozen original request must stay untouched');
+  assert.equal(harness.streamCalls.length, 1, 'the deduplicated session route must not be attempted');
 });
 
 test('a failed capability lookup is not cached and every review retries it', async () => {
@@ -611,7 +657,9 @@ test('a failed capability lookup is not cached and every review retries it', asy
 
   for (const attempt of [1, 2]) {
     await assert.rejects(
-      collect(harness.ctx.llm.stream(reviewOptions())),
+      collect(harness.ctx.llm.stream(
+        reviewOptions({ provider: 'review-provider-fail', model: 'review-model-fail' }),
+      )),
       (error: unknown) => {
         assertCapabilityFailure(error, 'review-provider-fail/review-model-fail', false);
         assert.match(error.message, new RegExp(`provider unreachable \\(attempt ${attempt}\\)`));
@@ -653,7 +701,9 @@ test('a capability lookup that exceeds the 300000ms deadline rejects actionably 
     });
 
     await assert.rejects(
-      collect(harness.ctx.llm.stream(reviewOptions())),
+      collect(harness.ctx.llm.stream(
+        reviewOptions({ provider: 'review-provider-timeout', model: 'review-model-timeout' }),
+      )),
       (error: unknown) => {
         assertCapabilityFailure(error, 'review-provider-timeout/review-model-timeout', true);
         assert.match(error.message, /timed out after 300000ms \(5 min\)/);
@@ -665,7 +715,9 @@ test('a capability lookup that exceeds the 300000ms deadline rejects actionably 
     assert.equal(harness.baseCalls.length, 0, 'a timed-out lookup must not fall back to a default effort');
 
     hang = false;
-    await collect(harness.ctx.llm.stream(reviewOptions()));
+    await collect(harness.ctx.llm.stream(
+      reviewOptions({ provider: 'review-provider-timeout', model: 'review-model-timeout' }),
+    ));
     assert.equal(harness.baseCalls.length, 1);
     assert.equal(harness.baseCalls[0].reasoningEffort, 'high', 'the retry after a timeout must use the configured effort');
     assert.equal(harness.resolveCalls.length, 2, 'a timeout must not be cached');
@@ -682,7 +734,9 @@ test('a lookup that yields no model information fails closed', async () => {
   });
 
   await assert.rejects(
-    collect(harness.ctx.llm.stream(reviewOptions())),
+    collect(harness.ctx.llm.stream(
+      reviewOptions({ provider: 'review-provider-empty', model: 'review-model-empty' }),
+    )),
     (error: unknown) => {
       assertCapabilityFailure(error, 'review-provider-empty/review-model-empty', false);
       assert.match(error.message, /no model information/);
@@ -807,11 +861,16 @@ test('config ref changes take effect on the next request', async () => {
     [['second-provider', 'second-model']],
   );
 
-  harness.state.enabled = false;
+  harness.state.primaryEnabled = false;
   const disabled = reviewOptions();
   await collect(harness.ctx.llm.stream(disabled));
-  assert.equal(harness.baseCalls[2], disabled, 'the live enabled toggle must pass through');
-  assert.equal(harness.resolveCalls.length, 1, 'a disabled override must not resolve capabilities');
+  assert.equal(harness.baseCalls[2], disabled, 'disabling row 1 must pass the review through');
+  assert.equal(harness.resolveCalls.length, 1, 'a disabled row must not resolve capabilities');
+  // The deprecated top-level enabled flag is ignored even while row 1 is off.
+  harness.state.enabled = false;
+  harness.state.primaryEnabled = true;
+  await collect(harness.ctx.llm.stream(reviewOptions()));
+  assert.equal(harness.baseCalls[3].provider, 'second-provider');
 });
 
 test('loader/volatile-update clears the effort capability cache', async () => {
@@ -881,9 +940,15 @@ test('late-settling lookup (success) started before cache invalidation does not 
       return deferred2.promise;
     },
   });
+  // The request route equals the explicit route, so the implicit session
+  // fallback is de-duplicated: this test isolates the capability-lookup path.
+  const options = (): TestGenerateOptions => reviewOptions({
+    provider: 'review-provider-race',
+    model: 'review-model-race',
+  });
 
   // Start request 1 (in-flight query with old capabilities)
-  const req1Promise = collect(harness.ctx.llm.stream(reviewOptions()));
+  const req1Promise = collect(harness.ctx.llm.stream(options()));
 
   // Wait a tick to ensure resolveModelInfo was invoked
   await new Promise((r) => setImmediate(r));
@@ -893,7 +958,7 @@ test('late-settling lookup (success) started before cache invalidation does not 
   fireLoaderUpdate(harness);
 
   // Start request 2
-  const req2Promise = collect(harness.ctx.llm.stream(reviewOptions()));
+  const req2Promise = collect(harness.ctx.llm.stream(options()));
   await new Promise((r) => setImmediate(r));
   assert.equal(resolveCallsCount, 2);
 
@@ -907,7 +972,7 @@ test('late-settling lookup (success) started before cache invalidation does not 
   await req1Promise;
 
   // Request 3 should consult the cache. If request 1 overwrote the cache with 'high', this would fail!
-  await collect(harness.ctx.llm.stream(reviewOptions()));
+  await collect(harness.ctx.llm.stream(options()));
   assert.equal(harness.baseCalls.length, 3);
   assert.equal(
     Object.hasOwn(harness.baseCalls[2], 'reasoningEffort'),
@@ -932,8 +997,15 @@ test('late-settling lookup (failure) started before cache invalidation propagate
     },
   });
 
+  // The request route equals the explicit route, so the implicit session
+  // fallback is de-duplicated and a late failure surfaces instead of retrying.
+  const options = (): TestGenerateOptions => reviewOptions({
+    provider: 'review-provider-fail-race',
+    model: 'review-model-fail-race',
+  });
+
   // Start request 1
-  const req1Promise = collect(harness.ctx.llm.stream(reviewOptions()));
+  const req1Promise = collect(harness.ctx.llm.stream(options()));
   await new Promise((r) => setImmediate(r));
   assert.equal(resolveCallsCount, 1);
 
@@ -941,7 +1013,7 @@ test('late-settling lookup (failure) started before cache invalidation propagate
   fireLoaderUpdate(harness);
 
   // Start request 2
-  const req2Promise = collect(harness.ctx.llm.stream(reviewOptions()));
+  const req2Promise = collect(harness.ctx.llm.stream(options()));
   await new Promise((r) => setImmediate(r));
   assert.equal(resolveCallsCount, 2);
 
@@ -961,7 +1033,7 @@ test('late-settling lookup (failure) started before cache invalidation propagate
   assert.equal(harness.baseCalls.length, 1, 'the late failure must not reach the base stream');
 
   // Request 3 should use the cached 'high' from request 2, not a failure entry.
-  await collect(harness.ctx.llm.stream(reviewOptions()));
+  await collect(harness.ctx.llm.stream(options()));
   assert.equal(harness.baseCalls.length, 2);
   assert.equal(
     harness.baseCalls[1].reasoningEffort,
@@ -1070,6 +1142,103 @@ test('pre-aborted request rejects without querying and without caching a failure
   assert.equal(harness.baseCalls[0].reasoningEffort, 'high');
 });
 
+test('inherit resolves the session effort and adapts it to the target route', async () => {
+  const cases: Array<{
+    name: string;
+    sessionEffort: string;
+    advertised: string[];
+    expected: string | undefined;
+  }> = [
+    { name: 'exact match', sessionEffort: 'high', advertised: ['low', 'high', 'max'], expected: 'high' },
+    { name: 'nearest higher', sessionEffort: 'xhigh', advertised: ['max'], expected: 'max' },
+    { name: 'off maps to the lowest advertised', sessionEffort: 'off', advertised: ['low', 'high'], expected: 'low' },
+    { name: 'max maps down to the highest advertised', sessionEffort: 'max', advertised: ['low', 'high'], expected: 'high' },
+    { name: 'tie breaks toward the higher rank', sessionEffort: 'medium', advertised: ['low', 'high'], expected: 'high' },
+    { name: 'no advertised efforts uses the provider default', sessionEffort: 'high', advertised: [], expected: undefined },
+    { name: 'unknown inherited effort uses the provider default', sessionEffort: 'turbo', advertised: ['low', 'high'], expected: undefined },
+  ];
+  for (const entry of cases) {
+    const harness = createHarness({
+      config: { provider: 'review-provider-2', model: 'review-model-2', reasoningEffort: 'inherit' },
+      modelInfo: () => ({ reasoning: { efforts: entry.advertised.map((id) => ({ id })) } }),
+      sessionEffort: entry.sessionEffort,
+    });
+    await collect(harness.ctx.llm.stream(
+      reviewOptions({ provider: 'request-provider', model: 'request-model', sessionId: 'session-1' }),
+    ));
+    const used = harness.baseCalls[0];
+    assert.equal(used.provider, 'review-provider-2', entry.name);
+    assert.equal(used.reasoningEffort, entry.expected, entry.name);
+    assert.deepEqual(
+      harness.resolveCalls.map((call) => `${call.provider}/${call.model}`),
+      ['review-provider-2/review-model-2'],
+      `${entry.name}: the target route capabilities are consulted`,
+    );
+  }
+});
+
+test('inherit without a resolvable session or effort uses the provider default', async () => {
+  for (const options of [
+    { sessionEffort: undefined },
+    { sessionEffort: '' },
+    { sessionMissing: true },
+  ] as const) {
+    const harness = createHarness({
+      config: { provider: 'review-provider-2', model: 'review-model-2', reasoningEffort: 'inherit' },
+      modelInfo: () => ({ reasoning: { efforts: [{ id: 'high' }] } }),
+      ...options,
+    });
+    await collect(harness.ctx.llm.stream(
+      reviewOptions({ sessionId: options.sessionMissing === true ? 'gone' : 'session-1' }),
+    ));
+    assert.equal(harness.baseCalls[0].provider, 'review-provider-2');
+    assert.equal(harness.baseCalls[0].reasoningEffort, undefined);
+    assert.equal(harness.resolveCalls.length, 0, 'nothing to adapt means no capability lookup');
+  }
+});
+
+test('inherit without a session id uses the provider default', async () => {
+  const harness = createHarness({
+    config: { provider: 'review-provider-2', model: 'review-model-2', reasoningEffort: 'inherit' },
+    sessionEffort: 'high',
+  });
+  await collect(harness.ctx.llm.stream(reviewOptions()));
+  assert.equal(harness.baseCalls[0].reasoningEffort, undefined);
+});
+
+test('explicit efforts are never adapted to the target route vocabulary', async () => {
+  const harness = createHarness({
+    config: { provider: 'review-provider-2', model: 'review-model-2', reasoningEffort: 'xhigh' },
+    modelInfo: () => ({ reasoning: { efforts: [{ id: 'max' }] } }),
+    sessionEffort: 'high',
+  });
+  await collect(harness.ctx.llm.stream(
+    reviewOptions({ sessionId: 'session-1' }),
+  ));
+  assert.equal(
+    harness.baseCalls[0].reasoningEffort,
+    undefined,
+    'an explicit xhigh must be omitted, not adapted to max',
+  );
+  assert.deepEqual(
+    harness.resolveCalls.map((call) => call.provider),
+    ['review-provider-2'],
+  );
+});
+
+test('a disabled primary row is skipped even when it is complete', async () => {
+  for (const route of [
+    { enabled: false, primaryEnabled: false, provider: 'review-provider', model: 'review-model' },
+    { enabled: false, primaryEnabled: false, provider: '   ', model: '  ' },
+  ]) {
+    const harness = createHarness({ config: route });
+    const options = reviewOptions();
+    await collect(harness.ctx.llm.stream(options));
+    assert.equal(harness.baseCalls[0], options, JSON.stringify(route));
+    assert.equal(harness.streamCalls.length, 1);
+  }
+});
+
 /* ============================================================
  * Saved review-route test endpoint: Host integration with the
  * hand-written Typert manifest.
@@ -1094,12 +1263,17 @@ test('apply publishes the autoReviewModel service the Typert manifest declares',
     | undefined;
   assert.ok(endpoint, 'apply must publish the autoReviewModel endpoint with ctx.provide');
   assert.equal(typeof endpoint.testReviewRoute, 'function');
-  // The single declared parameter is the transport cancellation signal the
-  // Gateway appends; the wire carries no business arguments.
-  assert.equal(endpoint.testReviewRoute.length, 1);
+  // The declared business parameter is the optional explicit route; the
+  // Gateway appends the transport cancellation signal after it.
+  assert.equal(endpoint.testReviewRoute.length, 2);
 
   const invocation = TYPERT.invocations[0];
-  assert.deepEqual(invocation.parameters, [], 'the manifest must declare no wire parameters');
+  assert.deepEqual(
+    invocation.parameters.map((parameter) => [parameter.name, parameter.wire, parameter.source]),
+    [['input', 'input', 'json']],
+    'the manifest must declare exactly one optional route input',
+  );
+  assert.equal(invocation.parameters[0]?.acceptsUndefined, true);
   assert.equal(invocation.service, 'autoReviewModel');
   assert.equal(invocation.namespace, 'autoReviewModel');
   assert.equal(invocation.method, 'testReviewRoute');
@@ -1169,4 +1343,61 @@ test('the published endpoint probes the saved route with a strict prose-free con
   }
   assert.equal(harness.baseCalls.length, 1, 'the fixed non-reviewer request must reach the base stream unmodified');
   assert.equal(harness.baseCalls[0].purpose, undefined, 'the probe must not masquerade as an auto-review request');
+});
+
+test('the invocation accepts the new client wire input and legacy no-arg calls', async () => {
+  // Regression pin for the live "all row tests fail" report: the current Host
+  // declares exactly one optional `input` parameter and decodes the new client
+  // payload without throwing, while a legacy no-argument call still probes the
+  // saved row 1. A stale Host process (started before this contract existed)
+  // rejects the new client's unexpected argument at the Gateway boundary; that
+  // is a deployment/restart issue, not a defect in this source.
+  const harness = createHarness({ providers: [ACCOUNT_PROVIDER] });
+  const endpoint = harness.provided.get('autoReviewModel') as {
+    testReviewRoute(
+      input?: Record<string, unknown>,
+      signal?: AbortSignal,
+    ): Promise<{ code: string; route: { provider: string; model: string; reasoningEffort: string } }>;
+  };
+  const invocation = TYPERT.invocations[0] as unknown as {
+    parameters: Array<{
+      wire: string;
+      source: string;
+      acceptsUndefined?: boolean;
+      codec: { mode: string; create(): { parse(value: unknown): unknown } };
+    }>;
+  };
+  assert.equal(invocation.parameters.length, 1);
+  assert.equal(invocation.parameters[0].wire, 'input');
+  assert.equal(invocation.parameters[0].source, 'json');
+  assert.equal(invocation.parameters[0].acceptsUndefined, true);
+  assert.equal(invocation.parameters[0].codec.mode, 'strict');
+
+  // The exact args shape the rebuilt client sends: one `input` object.
+  const newClientArgs = {
+    input: { provider: 'review-provider', model: 'review-model', reasoningEffort: 'high' },
+  };
+  const decoded = invocation.parameters[0].codec.create().parse(newClientArgs.input);
+  assert.deepEqual(decoded, newClientArgs.input, 'the strict input codec accepts a valid route');
+  const routed = await endpoint.testReviewRoute(
+    decoded as Record<string, unknown>,
+    new AbortController().signal,
+  );
+  assert.equal(routed.code, 'OK');
+  assert.equal(routed.route.provider, 'review-provider');
+  assert.equal(harness.baseCalls[0]?.provider, 'review-provider');
+
+  // An old-style call with no business argument still probes the saved row 1.
+  // A fresh endpoint keeps this probe outside the host-wide rate-limit window.
+  const legacyHarness = createHarness({ providers: [ACCOUNT_PROVIDER] });
+  const legacyEndpoint = legacyHarness.provided.get('autoReviewModel') as {
+    testReviewRoute(
+      input?: Record<string, unknown>,
+      signal?: AbortSignal,
+    ): Promise<{ code: string; route: { provider: string; model: string; reasoningEffort: string } }>;
+  };
+  const legacy = await legacyEndpoint.testReviewRoute();
+  assert.equal(legacy.code, 'OK');
+  assert.equal(legacy.route.provider, 'review-provider');
+  assert.equal(legacyHarness.baseCalls[0]?.provider, 'review-provider');
 });

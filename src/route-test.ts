@@ -1,15 +1,19 @@
 /**
  * Safe saved-route probe for `@aghost-prj/dsh-auto-review-model`.
  *
- * The settings page can ask the Host to prove that the currently SAVED review
- * route (provider, model, reasoning effort) still answers. The endpoint is
- * deliberately tiny and side-effect free:
+ * The settings page can ask the Host to prove that a review route still
+ * answers. The endpoint is deliberately tiny and side-effect free:
  *
- * - it takes no browser parameters at all (only an optional transport
- *   `AbortSignal`), so a page cannot test an arbitrary route or read a
- *   credential through it;
- * - it reads the live volatile config with {@link readReviewerSettings} on
- *   every call, so it always probes exactly what the Host has saved;
+ * - its only business parameter is an OPTIONAL explicit route
+ *   (`{ provider, model, reasoningEffort? }`). Omitting it (or sending an empty
+ *   provider+model) probes the saved settings-list row 1, which is the original
+ *   behavior; an explicit route is validated against the live provider
+ *   directory and `resolveModelInfo` before any provider request, so the page
+ *   can test an unsaved row without being able to forward an arbitrary URL or
+ *   unknown model. No credential is ever returned through it;
+ * - without an explicit route it reads the live volatile config with
+ *   {@link readReviewerSettings} on every call, so it probes exactly what the
+ *   Host has saved;
  * - it sends one fixed harmless system/user prompt with `maxTokens` at most
  *   {@link ROUTE_TEST_MAX_TOKENS}, `temperature: 0`, and no `sessionId`,
  *   `purpose`, `tools`, `toolHistory`, or conversation history, so no Session
@@ -54,12 +58,22 @@ import {
 import type {
   ReviewRouteTestAuthKind,
   ReviewRouteTestCode,
+  ReviewRouteTestInput,
   ReviewRouteTestResult,
   ReviewRouteTestRoute,
   ReviewRouteTestStatus,
 } from './typert.contract.js';
-import { readReviewerSettings } from './policy.js';
+import { INHERIT_EFFORT, normalizeEffort, readReviewerSettings } from './policy.js';
 import type { ReviewerConfig } from './policy.js';
+import {
+  httpStatusOf,
+  isRecord,
+  normalizeFailureCode,
+  readFinishFailure,
+  readThrownFailure,
+} from './failure.js';
+
+export { normalizeFailureCode, readFinishFailure, readThrownFailure } from './failure.js';
 
 /** Hard deadline for one saved-route probe. */
 export const ROUTE_TEST_TIMEOUT_MS = 20_000;
@@ -106,7 +120,7 @@ const ROUTE_TEST_OVERSIZE_DETAIL =
 
 /** Detail override for a route that answered with no model information. */
 const ROUTE_TEST_UNKNOWN_MODEL_DETAIL =
-  'The saved provider returned no information about the saved model. Choose a model the provider advertises in Auto review model settings, then test the route again.';
+  'The tested provider returned no information about the tested model. Choose a model the provider advertises, then test the route again.';
 
 /** Detail override for a stream that ended without its terminal finish chunk. */
 const ROUTE_TEST_PREMATURE_DETAIL =
@@ -123,7 +137,7 @@ const ROUTE_TEST_DETAILS: Readonly<Record<ReviewRouteTestCode, string>> = {
   ROUTE_DISABLED:
     'Auto review model routing is disabled. Enable it in Auto review model settings, choose a provider and model, then test the route again.',
   ROUTE_INCOMPLETE:
-    'The saved review route is incomplete. Choose both a provider and a model in Auto review model settings, then test the route again.',
+    'The tested review route is incomplete. Choose both a provider and a model, then test the route again.',
   BUSY:
     'Another route test is already running. Wait for it to finish, then test the route again.',
   RATE_LIMITED:
@@ -132,11 +146,11 @@ const ROUTE_TEST_DETAILS: Readonly<Record<ReviewRouteTestCode, string>> = {
   TIMEOUT:
     'The saved review route did not answer before the test deadline. Check that the provider is reachable and properly configured, then test the route again.',
   NO_ADAPTER:
-    'No LLM adapter is registered for the saved provider. Choose a mounted provider in Auto review model settings.',
+    'No LLM adapter is registered for the tested provider. Choose a mounted provider.',
   UNKNOWN_MODEL:
-    'The saved provider does not recognize the saved model. Update the model in Auto review model settings, then test the route again.',
+    'The tested provider does not recognize the tested model. Update the model, then test the route again.',
   MODEL_UNSUPPORTED:
-    'The saved provider rejected this model or the probe request. Choose a supported model in Auto review model settings.',
+    'The tested provider rejected this model or the probe request. Choose a supported model.',
   MISSING_CREDENTIAL:
     'The saved provider has no credential configured. Add its API key in the provider settings, then test the route again.',
   INVALID_CREDENTIAL:
@@ -410,11 +424,6 @@ interface RouteTestDeadline {
   dispose(): void;
 }
 
-/** Reject a non-object JSON value. */
-function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
 /** Whether a value is an AsyncIterable the probe can consume. */
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return false;
@@ -531,106 +540,6 @@ function measureModelField(value: unknown): RouteTestContentMeasure {
   return typeof value === 'string' ? { chars: value.length, exceeded: value.length > ROUTE_TEST_MAX_OUTPUT_CHARS } : measureModelContent(value);
 }
 
-/**
- * Provider-neutral failure codes shipped by the installed `@deepseek-ai/dsh-llm`
- * (0.2.2-rc.3 `src/error.ts` `LLM_FAILURE_CODES`).
- *
- * A wire code is only carried into the result when it is one of these exact
- * official tokens, so an arbitrary provider string — which is what a leaked
- * credential or an unbounded provider message looks like — is dropped instead
- * of being forwarded to the settings page.
- */
-const KNOWN_FAILURE_CODES: ReadonlySet<string> = new Set([
-  'ABORTED',
-  'ACCOUNT_QUOTA',
-  'ACCOUNT_SIGN_IN_REQUIRED',
-  'ACCOUNT_TOKEN_INVALID',
-  'AUTH',
-  'CLIENT_UPGRADE_REQUIRED',
-  'CONTEXT_WINDOW_EXCEEDED',
-  'DISCOVERY_FAILED',
-  'DISCOVERY_UNSUPPORTED',
-  'DUPLICATE_ADAPTER',
-  'DUPLICATE_DIRECTORY',
-  'DUPLICATE_DISCOVERY',
-  'EMPTY_RESPONSE',
-  'FILES_API',
-  'IMAGE_OFFLOAD_REQUIRED',
-  'INVALID_ADAPTER',
-  'INVALID_CATALOG',
-  'INVALID_CONFIG',
-  'INVALID_CREDENTIAL',
-  'INVALID_DIRECTORY',
-  'INVALID_DISCOVERY',
-  'INVALID_MODEL_CONTEXT',
-  'INVALID_MODEL_INFO',
-  'INVALID_MODEL_MAX_TOKENS',
-  'INVALID_MODEL_REASONING',
-  'INVALID_PREPARED_CALL',
-  'INVALID_REPLAY_STATE',
-  'INVALID_REQUEST',
-  'INVALID_RESPONSE',
-  'MALFORMED_RESPONSE',
-  'MISSING_CREDENTIAL',
-  'MODEL_SWITCH_COMPACTION_FAILED',
-  'MODEL_UNSUPPORTED',
-  'NO_ADAPTER',
-  'NO_CREDENTIAL_STORE',
-  'NO_DISCOVERY',
-  'PI_AI_ERROR',
-  'QUOTA',
-  'RATE_LIMIT',
-  'REGISTRATION_DISPOSED',
-  'REQUEST_EXTENSION',
-  'REQUEST_HEADERS',
-  'SERVER',
-  'STREAM_CLOSED',
-  'TIMEOUT',
-  'TRANSPORT',
-  'UNKNOWN',
-  'UNKNOWN_MODEL',
-  'UNSTORABLE_PROVIDER_ID',
-  'UNSUPPORTED_CONTENT',
-  'UNSUPPORTED_OPTION',
-  'UNSUPPORTED_REASONING_EFFORT',
-]);
-
-/** Official shape for an unclassified provider HTTP status (`HTTP_<100..599>`). */
-const HTTP_FAILURE_CODE_PATTERN = /^HTTP_[1-5]\d{2}$/;
-
-/**
- * Keep one wire failure code only when it is an official provider-neutral code.
- *
- * Codes are opaque provider values, so only the exact `LLM_FAILURE_CODES`
- * vocabulary shipped by the installed Harness, or a valid `HTTP_<status>`
- * token, is accepted. Every other token — including an uppercase
- * `SECRET_TOKEN_12345`-shaped string — becomes `''` so it can never reach the
- * wire result or the settings page.
- *
- * @param value - raw provider-neutral failure code.
- * @returns the accepted official token, or `''`.
- */
-export function normalizeFailureCode(value: unknown): string {
-  if (typeof value !== 'string') return '';
-  const code = value.trim().toUpperCase();
-  if (KNOWN_FAILURE_CODES.has(code)) return code;
-  if (HTTP_FAILURE_CODE_PATTERN.test(code)) {
-    const status = Number(code.slice('HTTP_'.length));
-    if (status >= 100 && status <= 599) return code;
-  }
-  return '';
-}
-
-/** Extract the valid HTTP status carried by failure facts or an `HTTP_<status>` code. */
-function httpStatusOf(code: string, status: number | undefined): number | undefined {
-  if (typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599) {
-    return status;
-  }
-  const match = /^HTTP_(\d{3})$/.exec(code);
-  if (match === null) return undefined;
-  const parsed = Number(match[1]);
-  return parsed >= 100 && parsed <= 599 ? parsed : undefined;
-}
 
 /**
  * Map one provider-neutral failure to a stable result code.
@@ -883,53 +792,6 @@ export function markRouteTestStarted(state: RouteTestState, nowMs: number): void
   state.inFlight = true;
   state.lastStartedAt = nowMs;
   state.windowCount += 1;
-}
-
-/**
- * Extract provider-neutral facts from an arbitrary thrown value.
- *
- * Only the stable `code` and a valid HTTP status are retained; messages, causes,
- * request ids, and any other provider payload are deliberately dropped so they
- * cannot reach the result.
- *
- * @param error - caught rejection reason.
- * @returns sanitized failure facts; `code: ''` when nothing stable was carried.
- */
-export function readThrownFailure(error: unknown): RouteTestFailureFacts {
-  if (isRecord(error)) {
-    const failure = isRecord(error.failure) ? error.failure : undefined;
-    const rawCode = typeof error.code === 'string'
-      ? error.code
-      : failure !== undefined && typeof failure.code === 'string'
-        ? failure.code
-        : '';
-    const rawStatus = typeof error.status === 'number'
-      ? error.status
-      : failure !== undefined && typeof failure.status === 'number'
-        ? failure.status
-        : undefined;
-    const code = normalizeFailureCode(rawCode);
-    const status = httpStatusOf(code, rawStatus);
-    if (code !== '' || status !== undefined) {
-      return status === undefined ? { code } : { code, status };
-    }
-    if (error.name === 'AbortError') return { code: 'ABORTED' };
-  }
-  return { code: '' };
-}
-
-/**
- * Extract provider-neutral facts from a terminal `finish` reason.
- *
- * @param reason - finish reason carried by the terminal stream chunk.
- * @returns failure facts for `error`/`aborted` finishes, else `undefined`.
- */
-export function readFinishFailure(reason: unknown): RouteTestFailureFacts | undefined {
-  if (!isRecord(reason)) return undefined;
-  if (reason.kind !== 'error' && reason.kind !== 'aborted') return undefined;
-  const failure = isRecord(reason.failure) ? readThrownFailure(reason.failure) : { code: '' };
-  if (reason.kind === 'aborted' && failure.code === '') return { code: 'ABORTED' };
-  return failure;
 }
 
 /**
@@ -1444,6 +1306,32 @@ function buildRouteTestResult(input: RouteTestResultInput): ReviewRouteTestResul
 }
 
 /**
+ * Normalize the optional explicit route input from the browser.
+ *
+ * Only three bounded id strings are accepted; anything else degrades to `''`.
+ * A provider+model pair is the only meaningful explicit route — an all-empty
+ * input means "probe the saved row 1", which preserves the original contract.
+ * For a probe, the `inherit` and legacy `default` effort sentinels resolve to
+ * the provider default (`''`): the browser cannot know the session's effort,
+ * and the Host must not resolve the main session for a probe.
+ *
+ * @param input - optional wire input.
+ * @returns the explicit route, or `undefined` for the saved-row probe.
+ */
+export function normalizeRouteTestInput(input: unknown): ReviewRouteTestRoute | undefined {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) return undefined;
+  const record = input as Record<string, unknown>;
+  const provider = typeof record.provider === 'string' ? clipText(record.provider.trim(), 200) : '';
+  const model = typeof record.model === 'string' ? clipText(record.model.trim(), 200) : '';
+  if (provider === '' && model === '') return undefined;
+  const rawEffort = typeof record.reasoningEffort === 'string' ? record.reasoningEffort.trim() : '';
+  const effort = rawEffort === '' || rawEffort.toLowerCase() === 'inherit' || rawEffort.toLowerCase() === 'default'
+    ? ''
+    : clipText(rawEffort, 200);
+  return { provider, model, reasoningEffort: effort };
+}
+
+/**
  * Classify one observed failure into a strict result.
  *
  * @param stats - probe stats snapshot.
@@ -1563,24 +1451,34 @@ export function installRouteTestEndpoint(
 
   const endpoint = {
     /**
-     * Probe the currently saved review route once.
+     * Probe one review route once.
      *
+     * @param input - optional explicit route to probe; omitted (or an empty
+     *   provider+model) probes the saved settings-list row 1 exactly as before.
      * @param signal - optional transport cancellation from the Remote carrier.
      * @returns a strict, prose-free probe result.
      */
-    async testReviewRoute(signal?: AbortSignal): Promise<ReviewRouteTestResult> {
+    async testReviewRoute(
+      input?: ReviewRouteTestInput,
+      signal?: AbortSignal,
+    ): Promise<ReviewRouteTestResult> {
       const startedAt = now();
       const settings = readReviewerSettings(config);
-      const route: ReviewRouteTestRoute = {
+      const explicitRoute = normalizeRouteTestInput(input);
+      const savedEffort = normalizeEffort(settings.reasoningEffort);
+      const route: ReviewRouteTestRoute = explicitRoute ?? {
         provider: settings.provider,
         model: settings.model,
-        reasoningEffort: settings.reasoningEffort,
+        // A probe cannot resolve the main session's effort, so an `inherit`
+        // saved row is probed with the provider default.
+        reasoningEffort: savedEffort === INHERIT_EFFORT ? '' : savedEffort,
       };
+      const explicit = explicitRoute !== undefined;
       const stats = createRouteTestStats(route);
 
       /** Build a local refusal or deadline outcome that never reached the provider. */
       const refuse = (
-        code: 'ROUTE_DISABLED' | 'ROUTE_INCOMPLETE' | 'BUSY' | 'RATE_LIMITED' | 'CANCELLED' | 'TIMEOUT',
+        code: 'ROUTE_INCOMPLETE' | 'BUSY' | 'RATE_LIMITED' | 'CANCELLED' | 'TIMEOUT',
         retryAfterMs?: number,
       ): ReviewRouteTestResult => buildRouteTestResult({
         code,
@@ -1591,7 +1489,6 @@ export function installRouteTestEndpoint(
       });
 
       if (signal?.aborted === true) return refuse('CANCELLED');
-      if (!settings.enabled) return refuse('ROUTE_DISABLED');
       if (route.provider === '' || route.model === '') return refuse('ROUTE_INCOMPLETE');
 
       const refusal = checkRouteTestThrottle(state, now(), limits);
@@ -1603,12 +1500,23 @@ export function installRouteTestEndpoint(
       activeFlight = flight;
       const tracker = createTracker(flight);
       try {
+        const directory = readProviderDirectory(ctx.llm);
         applyProviderClassification(
           stats,
-          classifyRouteTestProvider(route.provider, readProviderDirectory(ctx.llm)),
+          classifyRouteTestProvider(route.provider, directory),
         );
 
-        if (route.reasoningEffort !== '') {
+        // An explicit browser-supplied route must name a provider the live
+        // adapter directory knows; otherwise it is the same "no adapter"
+        // failure a saved route would produce. The provider id is never turned
+        // into a URL and no credential is read here.
+        if (explicit && hasProviderDirectory(ctx.llm) && !directory.some(entry => entry.provider === route.provider)) {
+          return buildRouteTestFailure(stats, { code: 'NO_ADAPTER' }, { startedAt, now });
+        }
+
+        // Explicit routes always prove the model exists on the route; a saved
+        // route only needs the lookup when it carries an effort to verify.
+        if (explicit || route.reasoningEffort !== '') {
           const infoPromise = tracker.track(
             () => Promise.resolve().then(
               () => ctx.llm.resolveModelInfo(route.provider, route.model, deadline.signal),
@@ -1633,10 +1541,14 @@ export function installRouteTestEndpoint(
               { startedAt, now, code: 'UNKNOWN_MODEL', detail: ROUTE_TEST_UNKNOWN_MODEL_DETAIL },
             );
           }
-          if (readAdvertisedEfforts(info).has(route.reasoningEffort)) {
-            stats.effortUsed = route.reasoningEffort;
-          } else {
-            stats.effortNotAdvertised = true;
+          // An explicit route is looked up to prove the model exists; only a
+          // non-empty probed effort can be "not advertised".
+          if (route.reasoningEffort !== '') {
+            if (readAdvertisedEfforts(info).has(route.reasoningEffort)) {
+              stats.effortUsed = route.reasoningEffort;
+            } else {
+              stats.effortNotAdvertised = true;
+            }
           }
         }
 
@@ -1733,6 +1645,11 @@ export function installRouteTestEndpoint(
   ctx.provide(REMOTE_SERVICE_KEY, endpoint);
 }
 
+/** Whether the live LLM service can enumerate its configurable providers at all. */
+function hasProviderDirectory(llm: RouteTestLlmLike): boolean {
+  return typeof llm.listConfigurableProviders === 'function';
+}
+
 /** Read the configurable-provider directory; a broken directory degrades to unknown auth. */
 function readProviderDirectory(llm: RouteTestLlmLike): readonly RouteTestProviderLike[] {
   if (typeof llm.listConfigurableProviders !== 'function') return [];
@@ -1773,6 +1690,7 @@ export const __testing = {
   readThrownFailure,
   readFinishFailure,
   buildRouteTestRequest,
+  normalizeRouteTestInput,
   routeTestStatusOf,
   installRouteTestEndpoint,
 };

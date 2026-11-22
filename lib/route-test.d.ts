@@ -1,5 +1,7 @@
 import type { ReviewRouteTestAuthKind, ReviewRouteTestCode, ReviewRouteTestRoute, ReviewRouteTestStatus } from './typert.contract.js';
 import type { ReviewerConfig } from './policy.js';
+import { normalizeFailureCode, readFinishFailure, readThrownFailure } from './failure.js';
+export { normalizeFailureCode, readFinishFailure, readThrownFailure } from './failure.js';
 /** Hard deadline for one saved-route probe. */
 export declare const ROUTE_TEST_TIMEOUT_MS = 20000;
 /** Minimum wall-clock gap between two probes of the same Host endpoint. */
@@ -183,19 +185,6 @@ export interface RouteTestTypertBinding {
     readonly namespace: string;
 }
 /**
- * Keep one wire failure code only when it is an official provider-neutral code.
- *
- * Codes are opaque provider values, so only the exact `LLM_FAILURE_CODES`
- * vocabulary shipped by the installed Harness, or a valid `HTTP_<status>`
- * token, is accepted. Every other token — including an uppercase
- * `SECRET_TOKEN_12345`-shaped string — becomes `''` so it can never reach the
- * wire result or the settings page.
- *
- * @param value - raw provider-neutral failure code.
- * @returns the accepted official token, or `''`.
- */
-export declare function normalizeFailureCode(value: unknown): string;
-/**
  * Map one provider-neutral failure to a stable result code.
  *
  * Account routes translate credential and connectivity failures into
@@ -279,23 +268,19 @@ export declare function checkRouteTestThrottle(state: RouteTestState, nowMs: num
  */
 export declare function markRouteTestStarted(state: RouteTestState, nowMs: number): void;
 /**
- * Extract provider-neutral facts from an arbitrary thrown value.
+ * Normalize the optional explicit route input from the browser.
  *
- * Only the stable `code` and a valid HTTP status are retained; messages, causes,
- * request ids, and any other provider payload are deliberately dropped so they
- * cannot reach the result.
+ * Only three bounded id strings are accepted; anything else degrades to `''`.
+ * A provider+model pair is the only meaningful explicit route — an all-empty
+ * input means "probe the saved row 1", which preserves the original contract.
+ * For a probe, the `inherit` and legacy `default` effort sentinels resolve to
+ * the provider default (`''`): the browser cannot know the session's effort,
+ * and the Host must not resolve the main session for a probe.
  *
- * @param error - caught rejection reason.
- * @returns sanitized failure facts; `code: ''` when nothing stable was carried.
+ * @param input - optional wire input.
+ * @returns the explicit route, or `undefined` for the saved-row probe.
  */
-export declare function readThrownFailure(error: unknown): RouteTestFailureFacts;
-/**
- * Extract provider-neutral facts from a terminal `finish` reason.
- *
- * @param reason - finish reason carried by the terminal stream chunk.
- * @returns failure facts for `error`/`aborted` finishes, else `undefined`.
- */
-export declare function readFinishFailure(reason: unknown): RouteTestFailureFacts | undefined;
+export declare function normalizeRouteTestInput(input: unknown): ReviewRouteTestRoute | undefined;
 /**
  * Install the saved-route test endpoint for this Host plugin.
  *
@@ -343,6 +328,7 @@ export declare const __testing: {
     readThrownFailure: typeof readThrownFailure;
     readFinishFailure: typeof readFinishFailure;
     buildRouteTestRequest: typeof buildRouteTestRequest;
+    normalizeRouteTestInput: typeof normalizeRouteTestInput;
     routeTestStatusOf: typeof routeTestStatusOf;
     installRouteTestEndpoint: typeof installRouteTestEndpoint;
 };

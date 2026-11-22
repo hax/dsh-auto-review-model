@@ -1,13 +1,12 @@
 /**
- * Component-level tests for ReviewerModelConfig and ARMSelect in `@aghost-prj/dsh-auto-review-model`.
+ * Component-level tests for ReviewerModelConfig in `@aghost-prj/dsh-auto-review-model`.
  *
- * Exercises the actual React component functions and event handlers using a minimal
- * deterministic React hook driver. Verifies:
- * 1. Saved unknown reasoning effort display and preservation when catalog fails or model lacks effort
- * 2. Explicit clearing of unknown reasoning effort to default
- * 3. Non-blocking UX notice when provider is set but model is empty (in both zh and en)
- * 4. Summary line correction for incomplete routes (inheriting session model instead of provider default)
- * 5. Ordinary save, discard, reload, and revision conflict handling
+ * Exercises the actual React component functions and event handlers using a
+ * minimal deterministic React hook driver. Verifies the single ordered route
+ * list: per-row enable checkboxes, the inherit effort option, disabled-row
+ * styling, the per-row test button and its independent inline result, and the
+ * absence of the master switch, the visible index text and the fixed session
+ * row.
  */
 
 import assert from 'node:assert/strict';
@@ -159,6 +158,27 @@ function findNodeByClass(
   return nodes.find((n) => typeof n.props?.className === 'string' && n.props.className.includes(className));
 }
 
+/** Find one ARMSelect/button/input element by its action attribute. */
+function findByAction(
+  nodes: Array<{ type: unknown; props: Record<string, any> }>,
+  action: string,
+): { type: unknown; props: Record<string, any> } | undefined {
+  return nodes.find((node) => node.props?.['data-arm-action'] === action);
+}
+
+/** Find one ARMSelect element by its `testId` prop (the driver never renders it). */
+function findByTestId(
+  nodes: Array<{ type: unknown; props: Record<string, any> }>,
+  testId: string,
+): { type: unknown; props: Record<string, any> } | undefined {
+  return nodes.find((node) => node.props?.testId === testId);
+}
+
+/** Every rendered explicit route row, in DOM order. */
+function routeRows(nodes: Array<{ type: unknown; props: Record<string, any> }>) {
+  return nodes.filter((node) => node.props?.['data-route-index'] !== undefined);
+}
+
 interface ClientPluginExports {
   apply(ctx: unknown): unknown;
   inject: string[];
@@ -189,24 +209,35 @@ test.before(() => {
   clientPlugin = mainEntry.factory(requireFromTable) as unknown as ClientPluginExports;
 });
 
+interface FallbackSetting {
+  mode: string;
+  enabled?: boolean;
+  provider: string;
+  model: string;
+  reasoningEffort: string;
+}
+
 interface SetupTestEnvOptions {
   savedSettings?: {
-    enabled?: boolean;
+    primaryEnabled?: boolean;
     provider?: string;
     model?: string;
     reasoningEffort?: string;
+    fallbacks?: FallbackSetting[];
   };
   revision?: number;
   catalogAvailable?: boolean;
   catalogGroups?: any[];
   lang?: 'zh' | 'en';
-  /** Response returned by the mounted saved-route test endpoint. */
+  /** Response returned by the mounted per-row test endpoint. */
   testResponse?: { ok: boolean; value?: unknown; error?: unknown };
+  /** Response selector based on the probed input. */
+  testResponseFor?: (input: { provider?: string; model?: string; reasoningEffort?: string }) => { ok: boolean; value?: unknown; error?: unknown };
   /** Simulate the Remote endpoint failing to mount (optional action unavailable). */
   endpointUnavailable?: boolean;
   /** Simulate the Remote call itself rejecting. */
   testRejects?: boolean;
-  /** Hold the Remote call open until this promise settles (independent testing state). */
+  /** Hold the Remote call open until this promise settles. */
   testPending?: Promise<{ ok: boolean; value?: unknown; error?: unknown }>;
 }
 
@@ -230,10 +261,7 @@ function testResult(overrides: Record<string, unknown> = {}): Record<string, unk
   };
 }
 
-/**
- * Reject with the caller's signal as soon as it aborts, like a real Remote call.
- * The pending promise still settles later, but its result is ignored.
- */
+/** Reject with the caller's signal as soon as it aborts, like a real Remote call. */
 function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
   if (signal === undefined) return promise;
   if (signal.aborted) return Promise.reject(signal.reason ?? new Error('aborted'));
@@ -256,7 +284,7 @@ function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Pro
 async function setupComponent(options: SetupTestEnvOptions = {}) {
   resetDriver();
   const saved = {
-    enabled: true,
+    primaryEnabled: true,
     provider: '',
     model: '',
     reasoningEffort: '',
@@ -268,21 +296,14 @@ async function setupComponent(options: SetupTestEnvOptions = {}) {
   let currentRevision = revision;
 
   const endpoint = {
-    calls: [] as Array<{ signal?: AbortSignal }>,
-    /** Signals passed by the component, one per probe call. */
-    signals: [] as Array<AbortSignal | undefined>,
-    /** Reasons collected from abort events, proving the probe was cancelled. */
-    aborts: [] as unknown[],
-    async testReviewRoute(signal?: AbortSignal) {
-      endpoint.calls.push({ signal });
-      endpoint.signals.push(signal);
-      if (signal !== undefined) {
-        signal.addEventListener('abort', () => {
-          endpoint.aborts.push(signal.reason);
-        }, { once: true });
-      }
+    calls: [] as Array<{ input?: { provider?: string; model?: string; reasoningEffort?: string }; signal?: AbortSignal }>,
+    inputs: [] as Array<{ provider?: string; model?: string; reasoningEffort?: string } | undefined>,
+    async testReviewRoute(input?: { provider?: string; model?: string; reasoningEffort?: string }, signal?: AbortSignal) {
+      endpoint.calls.push({ input, signal });
+      endpoint.inputs.push(input);
       if (options.testPending !== undefined) return await raceAbort(options.testPending, signal);
       if (options.testRejects === true) throw new Error('remote call failed');
+      if (options.testResponseFor !== undefined) return options.testResponseFor(input ?? {});
       return options.testResponse ?? { ok: true, value: testResult() };
     },
   };
@@ -326,24 +347,7 @@ async function setupComponent(options: SetupTestEnvOptions = {}) {
         return {
           ok: true,
           value: {
-            groups: options.catalogGroups ?? [
-              {
-                id: 'provider-a',
-                name: 'Provider A',
-                models: [
-                  {
-                    id: 'model-a1',
-                    name: 'Model A1',
-                    reasoning: {
-                      efforts: [
-                        { id: 'low', name: 'Low' },
-                        { id: 'high', name: 'High' },
-                      ],
-                    },
-                  },
-                ],
-              },
-            ],
+            groups: options.catalogGroups ?? DEFAULT_CATALOG,
           },
         };
       },
@@ -433,61 +437,73 @@ async function setupComponent(options: SetupTestEnvOptions = {}) {
     render,
     flush,
     mountedContributions: () => mountedContributions,
-    /** Run the component's effect cleanups, as an actual unmount would. */
     unmount: () => resetDriver(),
   };
 }
 
+/** Default catalog with one provider carrying two efforts. */
+const DEFAULT_CATALOG = [
+  {
+    id: 'provider-a',
+    name: 'Provider A',
+    models: [
+      {
+        id: 'model-a1',
+        name: 'Model A1',
+        reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }] },
+      },
+    ],
+  },
+];
+
+/** Catalog with two providers so rows can pick different routes. */
+const ROUTE_CATALOG = [
+  ...DEFAULT_CATALOG,
+  {
+    id: 'provider-b',
+    name: 'Provider B',
+    models: [{ id: 'model-b1', name: 'Model B1' }],
+  },
+];
+
+/** A saved route the default fake catalog can represent. */
+const SAVED_ROUTE = {
+  primaryEnabled: true,
+  provider: 'provider-a',
+  model: 'model-a1',
+  reasoningEffort: 'high',
+} as const;
+
+/** Toggle row 1's enable checkbox to create a dirty edit. */
+function toggleRow(nodes: Array<{ type: unknown; props: Record<string, any> }>, index: number, enabled: boolean): void {
+  findByAction(nodes, `route-${index}-enable`)?.props.onChange({ target: { checked: enabled } });
+}
+
+/* ============================================================
+ * Saved effort display and editing
+ * ============================================================ */
+
 test('unknown saved effort is displayed and preserved when model catalog fails', async () => {
   const env = await setupComponent({
-    savedSettings: {
-      enabled: true,
-      provider: 'provider-a',
-      model: 'model-a1',
-      reasoningEffort: 'high',
-    },
-    catalogAvailable: false, // Catalog fails
+    savedSettings: { ...SAVED_ROUTE },
+    catalogAvailable: false,
   });
 
-  // Initial render and effect flush
   env.render();
-  const tree = await env.flush();
-
-  const allNodes = flattenNodes(tree);
-  const effortControl = allNodes.find((n) => n.props?.label === env.t('effort'));
+  let tree = await env.flush();
+  let allNodes = flattenNodes(tree);
+  const effortControl = allNodes.find((n) => n.props?.label === env.t('routeEffort') + ' 1');
   assert.ok(effortControl, 'reasoning effort control must exist');
-
-  // Should display the saved effort 'high', NOT reset to empty ''
-  assert.equal(
-    effortControl.props.value,
-    'high',
-    'effort control value must be "high" when catalog is offline, not empty default',
-  );
-
-  // Options must include the unknown/unavailable effort
+  assert.equal(effortControl.props.value, 'high');
   const effortOptions = effortControl.props.options as Array<{ value: string; label: string }>;
   const highOption = effortOptions.find((o) => o.value === 'high');
-  assert.ok(highOption, 'options must include an entry for the saved unknown effort');
-  assert.match(
-    highOption.label,
-    /high.*未验证|high.*unverified/i,
-    'saved unknown effort label must indicate it is unverified when catalog failed',
-  );
+  assert.ok(highOption, 'options must include the saved unknown effort');
+  assert.match(highOption.label, /high.*未验证|high.*unverified/i);
+  assert.equal(effortControl.props.disabled, false);
 
-  // The control MUST NOT be disabled so the user can explicitly clear it
-  assert.equal(
-    effortControl.props.disabled,
-    false,
-    'effort control must remain enabled so user can clear an unknown effort',
-  );
+  toggleRow(allNodes, 0, false);
+  tree = env.render();
 
-  // If user modifies another field (e.g. toggles enabled), high must not be lost on save
-  const checkbox = allNodes.find((n) => n.type === 'input' && n.props?.type === 'checkbox');
-  assert.ok(checkbox, 'enabled checkbox must exist');
-  checkbox.props.onChange({ target: { checked: false } });
-  env.render();
-
-  // Allow catalog to recover on save re-read, but return a catalog where model-a1 does NOT advertise 'high'
   env.remote.session.modelCatalog = async () => ({
     ok: true,
     value: {
@@ -499,9 +515,7 @@ test('unknown saved effort is displayed and preserved when model catalog fails',
             {
               id: 'model-a1',
               name: 'Model A1',
-              reasoning: {
-                efforts: [{ id: 'low', name: 'Low' }],
-              },
+              reasoning: { efforts: [{ id: 'low', name: 'Low' }] },
             },
           ],
         },
@@ -512,379 +526,195 @@ test('unknown saved effort is displayed and preserved when model catalog fails',
   const saveButton = findButton(flattenNodes(env.render()), env.t('save'));
   assert.ok(saveButton);
   assert.equal(saveButton.props.disabled, false);
-
   saveButton.props.onClick();
   const postSaveTree = await env.flush();
 
   assert.equal(env.writes.length, 1);
-  assert.equal(
-    env.writes[0].nextSettings.reasoningEffort,
-    'high',
-    'saving after changing enabled must preserve unverified reasoningEffort="high"',
-  );
-
-  // Transition verification: once catalog recovered upon successful save re-read,
-  // catalogError should be cleared snapshot-wise so unadvertised effort label switches from '未验证' to '未声明'
-  const postSaveNodes = flattenNodes(postSaveTree);
-  const postSaveEffort = postSaveNodes.find((n) => n.props?.label === env.t('effort'));
+  assert.equal(env.writes[0].nextSettings.reasoningEffort, 'high');
+  assert.equal(env.writes[0].nextSettings.primaryEnabled, false);
+  const postSaveEffort = flattenNodes(postSaveTree).find((n) => n.props?.label === env.t('routeEffort') + ' 1');
   assert.ok(postSaveEffort);
-  const postSaveOptions = postSaveEffort.props.options as Array<{ value: string; label: string }>;
-  const postSaveHighOption = postSaveOptions.find((o) => o.value === 'high');
-  assert.ok(postSaveHighOption, 'options must still include the unadvertised effort high');
-  assert.match(
-    postSaveHighOption.label,
-    /high.*未声明|high.*not advertised/i,
-    'label must switch from unverified to not advertised once catalog recovers upon save re-read',
-  );
+  const postSaveHigh = (postSaveEffort.props.options as Array<{ value: string; label: string }>)
+    .find((o) => o.value === 'high');
+  assert.ok(postSaveHigh);
+  assert.match(postSaveHigh.label, /high.*未声明|high.*not advertised/i);
 });
 
-test('unknown saved effort is displayed and preserved when model has no reasoning metadata or lacks effort', async () => {
+test('unknown saved effort is displayed when the model has no reasoning metadata', async () => {
   const env = await setupComponent({
-    savedSettings: {
-      enabled: true,
-      provider: 'provider-a',
-      model: 'model-no-reasoning',
-      reasoningEffort: 'high',
-    },
-    catalogAvailable: true,
+    savedSettings: { ...SAVED_ROUTE, model: 'model-no-reasoning' },
     catalogGroups: [
       {
         id: 'provider-a',
         name: 'Provider A',
-        models: [
-          {
-            id: 'model-no-reasoning',
-            name: 'Model Without Reasoning',
-            // No reasoning metadata
-          },
-        ],
+        models: [{ id: 'model-no-reasoning', name: 'Model Without Reasoning' }],
       },
     ],
   });
-
   env.render();
   const tree = await env.flush();
-
-  const effortControl = flattenNodes(tree).find((n) => n.props?.label === env.t('effort'));
+  const effortControl = flattenNodes(tree).find((n) => n.props?.label === env.t('routeEffort') + ' 1');
   assert.ok(effortControl);
-
-  assert.equal(
-    effortControl.props.value,
-    'high',
-    'effort control value must be "high" when model lacks reasoning metadata',
-  );
-  assert.equal(
-    effortControl.props.disabled,
-    false,
-    'effort control must remain enabled so user can clear it',
-  );
-
-  const effortOptions = effortControl.props.options as Array<{ value: string; label: string }>;
-  const highOption = effortOptions.find((o) => o.value === 'high');
-  assert.ok(highOption, 'options must include the unadvertised effort');
+  assert.equal(effortControl.props.value, 'high');
+  assert.equal(effortControl.props.disabled, false);
+  const highOption = (effortControl.props.options as Array<{ value: string; label: string }>)
+    .find((o) => o.value === 'high');
+  assert.ok(highOption);
   assert.match(highOption.label, /high.*未声明|high.*not advertised/i);
 });
 
 test('user can explicitly clear an unknown effort to default when catalog fails', async () => {
-  const env = await setupComponent({
-    savedSettings: {
-      enabled: true,
-      provider: 'provider-a',
-      model: 'model-a1',
-      reasoningEffort: 'high',
-    },
-    catalogAvailable: false,
-  });
-
+  const env = await setupComponent({ savedSettings: { ...SAVED_ROUTE }, catalogAvailable: false });
   env.render();
   let tree = await env.flush();
-
-  const effortControl = flattenNodes(tree).find((n) => n.props?.label === env.t('effort'));
+  const effortControl = flattenNodes(tree).find((n) => n.props?.label === env.t('routeEffort') + ' 1');
   assert.ok(effortControl);
-
-  // Clear effort by selecting ''
   effortControl.props.onChange('');
   tree = env.render();
-
-  const updatedEffort = flattenNodes(tree).find((n) => n.props?.label === env.t('effort'));
-  assert.ok(updatedEffort);
-  assert.equal(updatedEffort.props.value, '');
-
-  const saveButton = findButton(flattenNodes(tree), env.t('save'));
-  assert.ok(saveButton);
-  saveButton.props.onClick();
+  const updated = flattenNodes(tree).find((n) => n.props?.label === env.t('routeEffort') + ' 1');
+  assert.equal(updated?.props.value, '');
+  findButton(flattenNodes(tree), env.t('save'))?.props.onClick();
   await env.flush();
-
   assert.equal(env.writes.length, 1);
-  assert.equal(
-    env.writes[0].nextSettings.reasoningEffort,
-    '',
-    'explicitly clearing effort must persist empty effort',
-  );
+  assert.equal(env.writes[0].nextSettings.reasoningEffort, '');
 });
 
 test('saved non-empty effort with empty model can be explicitly cleared in UI', async () => {
   const env = await setupComponent({
-    savedSettings: {
-      enabled: true,
-      provider: 'provider-a',
-      model: '',
-      reasoningEffort: 'high',
-    },
+    savedSettings: { ...SAVED_ROUTE, model: '' },
     catalogAvailable: true,
   });
-
   env.render();
   let tree = await env.flush();
-
-  const allNodes = flattenNodes(tree);
-  const effortControl = allNodes.find((n) => n.props?.label === env.t('effort'));
-  assert.ok(effortControl, 'effort control must exist');
-
-  // Value displays 'high' as-is
+  const effortControl = flattenNodes(tree).find((n) => n.props?.label === env.t('routeEffort') + ' 1');
+  assert.ok(effortControl);
   assert.equal(effortControl.props.value, 'high');
-
-  // Control must NOT be disabled, allowing user to clear legacy effort even when model is empty
-  assert.equal(
-    effortControl.props.disabled,
-    false,
-    'effort control must remain enabled when draft has non-empty reasoningEffort even if model is empty',
-  );
-
-  // User clears effort
+  assert.equal(effortControl.props.disabled, false);
   effortControl.props.onChange('');
   tree = env.render();
+  const updated = flattenNodes(tree).find((n) => n.props?.label === env.t('routeEffort') + ' 1');
+  assert.equal(updated?.props.value, '');
+  assert.equal(updated?.props.disabled, true);
+  const saveButton = findButton(flattenNodes(tree), env.t('save'));
+  assert.ok(saveButton);
+  saveButton.props.onClick();
+  await env.flush();
+  assert.equal(env.writes.length, 1);
+  assert.equal(env.writes[0].nextSettings.reasoningEffort, '');
+  assert.equal(env.writes[0].nextSettings.model, '');
+});
 
-  const updatedEffort = flattenNodes(tree).find((n) => n.props?.label === env.t('effort'));
-  assert.ok(updatedEffort);
-  assert.equal(updatedEffort.props.value, '');
+test('re-selecting current provider or model is a no-op and preserves dirty state', async () => {
+  const env = await setupComponent({ savedSettings: { ...SAVED_ROUTE } });
+  env.render();
+  let tree = await env.flush();
+  let allNodes = flattenNodes(tree);
 
-  // Once cleared, with model still empty, the effort control should now be disabled
+  assert.equal(findNodeByClass(allNodes, 'dsh_arm_unsaved'), undefined);
+
+  allNodes.find((n) => n.props?.label === env.t('routeModel') + ' 1')?.props.onChange('model-a1');
+  allNodes = flattenNodes(env.render());
+  assert.equal(findNodeByClass(allNodes, 'dsh_arm_unsaved'), undefined, 're-selecting the model is a no-op');
   assert.equal(
-    updatedEffort.props.disabled,
-    true,
-    'effort control should become disabled once effort is cleared and model is empty',
+    allNodes.find((n) => n.props?.label === env.t('routeEffort') + ' 1')?.props.value,
+    'high',
   );
 
+  allNodes.find((n) => n.props?.label === env.t('routeProvider') + ' 1')?.props.onChange('provider-a');
+  allNodes = flattenNodes(env.render());
+  assert.equal(findNodeByClass(allNodes, 'dsh_arm_unsaved'), undefined, 're-selecting the provider is a no-op');
+  assert.equal(
+    allNodes.find((n) => n.props?.label === env.t('routeModel') + ' 1')?.props.value,
+    'model-a1',
+  );
+  tree = env.render();
+  assert.ok(tree);
+});
+
+/* ============================================================
+ * Incomplete rows and summary
+ * ============================================================ */
+
+test('an incomplete row is marked as skipped and save is still permitted', async () => {
+  const env = await setupComponent({
+    savedSettings: { primaryEnabled: true, provider: 'provider-a', model: '' },
+  });
+  env.render();
+  let tree = await env.flush();
+  let allNodes = flattenNodes(tree);
+  const hints = allNodes.filter(
+    (node) => node.props?.className?.includes('dsh_arm_routeHintCell')
+      && typeof node.props?.children === 'string',
+  );
+  assert.ok(
+    hints.some((node) => node.props.children === env.t('routeIncompleteHint')),
+    'an incomplete row must say it will be skipped',
+  );
+
+  toggleRow(allNodes, 0, false);
+  tree = env.render();
   const saveButton = findButton(flattenNodes(tree), env.t('save'));
   assert.ok(saveButton);
   assert.equal(saveButton.props.disabled, false);
-
   saveButton.props.onClick();
   await env.flush();
-
   assert.equal(env.writes.length, 1);
-  assert.equal(
-    env.writes[0].nextSettings.reasoningEffort,
-    '',
-    'persisted settings must have empty reasoningEffort',
-  );
-  assert.equal(
-    env.writes[0].nextSettings.model,
-    '',
-    'persisted settings must preserve empty model',
-  );
-});
-
-test('re-selecting current provider or model dropdown item is a no-op and preserves dirty state', async () => {
-  const env = await setupComponent({
-    savedSettings: {
-      enabled: true,
-      provider: 'provider-a',
-      model: 'model-a1',
-      reasoningEffort: 'high',
-    },
-    catalogAvailable: true,
-  });
-
-  env.render();
-  let tree = await env.flush();
-
-  let allNodes = flattenNodes(tree);
-  const providerControl = allNodes.find((n) => n.props?.label === env.t('provider'));
-  const modelControl = allNodes.find((n) => n.props?.label === env.t('model'));
-  const effortControl = allNodes.find((n) => n.props?.label === env.t('effort'));
-
-  assert.ok(providerControl && modelControl && effortControl);
-
-  // Initially not dirty
-  assert.equal(findNodeByClass(allNodes, 'dsh_arm_unsaved'), undefined);
-
-  // Re-selecting current model 'model-a1'
-  modelControl.props.onChange('model-a1');
-  tree = env.render();
-  allNodes = flattenNodes(tree);
-  assert.equal(
-    findNodeByClass(allNodes, 'dsh_arm_unsaved'),
-    undefined,
-    're-selecting current model must not produce dirty state',
-  );
-  assert.equal(
-    allNodes.find((n) => n.props?.label === env.t('effort'))?.props.value,
-    'high',
-    'effort must not be cleared when re-selecting current model',
-  );
-
-  // Re-selecting current provider 'provider-a'
-  providerControl.props.onChange('provider-a');
-  tree = env.render();
-  allNodes = flattenNodes(tree);
-  assert.equal(
-    findNodeByClass(allNodes, 'dsh_arm_unsaved'),
-    undefined,
-    're-selecting current provider must not produce dirty state',
-  );
-  assert.equal(
-    allNodes.find((n) => n.props?.label === env.t('model'))?.props.value,
-    'model-a1',
-    'model must not be cleared when re-selecting current provider',
-  );
-  assert.equal(
-    allNodes.find((n) => n.props?.label === env.t('effort'))?.props.value,
-    'high',
-    'effort must not be cleared when re-selecting current provider',
-  );
-});
-
-test('non-blocking notice is displayed when provider is non-empty but model is empty', async () => {
-  const env = await setupComponent({
-    savedSettings: {
-      enabled: true,
-      provider: 'provider-a',
-      model: '',
-    },
-    catalogAvailable: true,
-    lang: 'zh',
-  });
-
-  env.render();
-  let tree = await env.flush('page');
-
-  const allNodes = flattenNodes(tree);
-  const hintNode = allNodes.find((n) => n.props?.className?.includes('dsh_arm_hint'));
-  assert.ok(hintNode, 'a visible hint element must appear when provider is set but model is empty');
-  assert.match(
-    String(hintNode.props?.children ?? ''),
-    /模型未选择.*覆盖未生效.*会话模型/,
-    'hint text must clearly explain that route override is inactive and session model is used',
-  );
-
-  // It is non-blocking: save is still permitted.
-  // Test 4 strengthening: edit enabled to make form dirty, then assert save button becomes enabled,
-  // clicks save, and remote.settings.replace receives model as empty string.
-  const checkbox = allNodes.find((n) => n.type === 'input' && n.props?.type === 'checkbox');
-  assert.ok(checkbox, 'checkbox must exist');
-  checkbox.props.onChange({ target: { checked: false } });
-  tree = env.render();
-
-  const saveButton = findButton(flattenNodes(tree), env.t('save'));
-  assert.ok(saveButton);
-  assert.equal(saveButton.props.disabled, false, 'save button must be enabled when dirty even if route is incomplete');
-
-  saveButton.props.onClick();
-  await env.flush();
-
-  assert.equal(env.writes.length, 1);
-  assert.equal(env.writes[0].nextSettings.model, '', 'saving incomplete route must preserve model as empty string');
-  assert.equal(env.writes[0].nextSettings.enabled, false);
+  assert.equal(env.writes[0].nextSettings.model, '');
+  assert.equal(env.writes[0].nextSettings.primaryEnabled, false);
   assert.equal(env.writes[0].nextSettings.provider, 'provider-a');
 });
 
-test('non-blocking notice localized in English', async () => {
+test('the English incomplete-row hint matches the Chinese meaning', async () => {
   const env = await setupComponent({
-    savedSettings: {
-      enabled: true,
-      provider: 'provider-a',
-      model: '',
-    },
-    catalogAvailable: true,
+    savedSettings: { primaryEnabled: true, provider: 'provider-a', model: '' },
     lang: 'en',
   });
-
   env.render();
-  const tree = await env.flush('page');
-
-  const allNodes = flattenNodes(tree);
-  const hintNode = allNodes.find((n) => n.props?.className?.includes('dsh_arm_hint'));
-  assert.ok(hintNode, 'hint element must appear in English');
-  assert.match(
-    String(hintNode.props?.children ?? ''),
-    /model not selected.*inactive.*session model/i,
-    'English hint text must match Chinese meaning',
+  const allNodes = flattenNodes(await env.flush());
+  const hint = allNodes.find(
+    (node) => node.props?.className?.includes('dsh_arm_routeHintCell')
+      && node.props?.children === env.t('routeIncompleteHint'),
   );
+  assert.ok(hint, 'the incomplete-row hint must render in English');
+  assert.match(String(hint?.props?.children ?? ''), /incomplete.*skipped during review/i);
 });
 
-test('summaryLine correctly reports session model inherit when provider is set but model is empty', async () => {
+test('summaryLine reports the implicit session fallback when row 1 is incomplete', async () => {
   const env = await setupComponent({
-    savedSettings: {
-      enabled: true,
-      provider: 'provider-a',
-      model: '',
-    },
-    catalogAvailable: true,
+    savedSettings: { primaryEnabled: true, provider: 'provider-a', model: '' },
   });
-
   env.render();
   const tree = await env.flush('summary');
-
   const summaryNode = flattenNodes(tree).find((n) => n.props?.className?.includes('dsh_arm_summary'));
-  assert.ok(summaryNode, 'summary element must exist');
+  assert.ok(summaryNode);
   const summaryText = String(summaryNode.props?.children ?? '');
-
-  // Must NOT display "provider-a / 默认模型"
-  assert.doesNotMatch(
-    summaryText,
-    /provider-a\s*\/\s*默认模型/,
-    'summary must not claim provider default model is used when model is empty',
-  );
-  assert.match(
-    summaryText,
-    /继承当前会话模型/,
-    'summary must indicate current session model is inherited',
-  );
+  assert.doesNotMatch(summaryText, /provider-a\s*\//);
+  assert.match(summaryText, /主会话模型/);
 });
+
+/* ============================================================
+ * Save / reload / discard
+ * ============================================================ */
 
 test('handles save, reload, discard and revision conflicts correctly', async () => {
   let conflictOnSave = true;
-  const env = await setupComponent({
-    savedSettings: {
-      enabled: true,
-      provider: 'provider-a',
-      model: 'model-a1',
-      reasoningEffort: 'low',
-    },
-    catalogAvailable: true,
-  });
-
-  // Override replace to simulate conflict on first try
+  const env = await setupComponent({ savedSettings: { ...SAVED_ROUTE } });
   const originalReplace = env.remote.settings.replace;
   env.remote.settings.replace = async (ns: string, settings: any, expectedRevision?: number) => {
     if (conflictOnSave) {
       conflictOnSave = false;
-      return {
-        ok: false,
-        error: { code: 'settings/conflict', message: 'revision mismatch' },
-      };
+      return { ok: false, error: { code: 'settings/conflict', message: 'revision mismatch' } };
     }
     return originalReplace(ns, settings, expectedRevision);
   };
 
   env.render();
   let tree = await env.flush();
-
-  // Modify model
-  const modelControl = flattenNodes(tree).find((n) => n.props?.label === env.t('model'));
-  assert.ok(modelControl);
-  modelControl.props.onChange('model-a1');
-
-  // Modify enabled
-  const checkbox = flattenNodes(tree).find((n) => n.type === 'input' && n.props?.type === 'checkbox');
-  assert.ok(checkbox);
-  checkbox.props.onChange({ target: { checked: false } });
+  let allNodes = flattenNodes(tree);
+  toggleRow(allNodes, 0, false);
   tree = env.render();
 
-  // Try saving -> should encounter conflict
-  const saveButton = findButton(flattenNodes(tree), env.t('save'));
+  let saveButton = findButton(flattenNodes(tree), env.t('save'));
   assert.ok(saveButton);
   saveButton.props.onClick();
   tree = await env.flush();
@@ -893,41 +723,29 @@ test('handles save, reload, discard and revision conflicts correctly', async () 
   assert.ok(statusNode, 'status error element should appear on conflict');
   assert.match(String(statusNode.props?.children ?? ''), /设置已被其他窗口修改/);
 
-  // Click reload
-  const reloadButton = findButton(flattenNodes(tree), env.t('reload'));
-  assert.ok(reloadButton);
-  reloadButton.props.onClick();
+  findButton(flattenNodes(tree), env.t('reload'))?.props.onClick();
   tree = await env.flush();
-
-  // Status error cleared after reload
   statusNode = flattenNodes(tree).find((n) => n.props?.className?.includes('dsh_arm_statusError'));
   assert.equal(statusNode, undefined);
 
-  // Modify again and save
-  const checkboxAgain = flattenNodes(tree).find((n) => n.type === 'input' && n.props?.type === 'checkbox');
-  assert.ok(checkboxAgain);
-  checkboxAgain.props.onChange({ target: { checked: false } });
+  allNodes = flattenNodes(tree);
+  toggleRow(allNodes, 0, false);
   tree = env.render();
-
-  const saveButtonAgain = findButton(flattenNodes(tree), env.t('save'));
-  assert.ok(saveButtonAgain);
-  saveButtonAgain.props.onClick();
+  saveButton = findButton(flattenNodes(tree), env.t('save'));
+  assert.ok(saveButton);
+  saveButton.props.onClick();
   tree = await env.flush();
 
   const statusOk = flattenNodes(tree).find((n) => n.props?.className?.includes('dsh_arm_statusOk'));
   assert.ok(statusOk, 'status ok element should appear on successful save');
   assert.equal(statusOk.props?.children, env.t('saved'));
 
-  // Now test discard: modify enabled
-  checkboxAgain.props.onChange({ target: { checked: true } });
+  allNodes = flattenNodes(tree);
+  toggleRow(allNodes, 0, true);
   tree = env.render();
   assert.ok(findNodeByClass(flattenNodes(tree), 'dsh_arm_unsaved'));
-
-  const discardButton = findButton(flattenNodes(tree), env.t('discard'));
-  assert.ok(discardButton);
-  discardButton.props.onClick();
+  findButton(flattenNodes(tree), env.t('discard'))?.props.onClick();
   tree = env.render();
-
   assert.equal(findNodeByClass(flattenNodes(tree), 'dsh_arm_unsaved'), undefined);
 });
 
@@ -935,13 +753,7 @@ test('handles save re-read failure with fallback to response snapshot and revisi
   for (const variant of ['viewRevision', 'responseRevision'] as const) {
     let reReadFails = false;
     const env = await setupComponent({
-      savedSettings: {
-        enabled: true,
-        provider: 'provider-a',
-        model: 'model-a1',
-        reasoningEffort: 'low',
-      },
-      catalogAvailable: true,
+      savedSettings: { ...SAVED_ROUTE },
       revision: 10,
     });
 
@@ -956,158 +768,398 @@ test('handles save re-read failure with fallback to response snapshot and revisi
       return originalDescribe();
     };
 
-    // Replace implementation returning namespace view or direct revision
     env.remote.settings.replace = async (ns: string, nextSettings: any, expectedRevision?: number) => {
       env.writes.push({ ns, nextSettings, expectedRevision });
       if (variant === 'viewRevision') {
         return {
           ok: true,
-          revision: 999, // Intentional different top-level revision to verify view.revision takes priority
-          value: {
-            ns,
-            value: nextSettings,
-            revision: 15,
-          },
+          revision: 999,
+          value: { ns, value: nextSettings, revision: 15 },
         };
       }
-      // variant === 'responseRevision' (response.revision top-level, value has no revision)
-      return {
-        ok: true,
-        revision: 15,
-        value: {
-          ns,
-          value: nextSettings,
-        },
-      };
+      return { ok: true, revision: 15, value: { ns, value: nextSettings } };
     };
 
     env.render();
     let tree = await env.flush();
-
-    // Modify enabled to make dirty
-    const checkbox = flattenNodes(tree).find((n) => n.type === 'input' && n.props?.type === 'checkbox');
-    assert.ok(checkbox);
-    checkbox.props.onChange({ target: { checked: false } });
+    toggleRow(flattenNodes(tree), 0, false);
     tree = env.render();
 
-    // Trigger save and ensure re-read fails
     reReadFails = true;
-    const saveButton = findButton(flattenNodes(tree), env.t('save'));
-    assert.ok(saveButton);
-    saveButton.props.onClick();
+    findButton(flattenNodes(tree), env.t('save'))?.props.onClick();
     tree = await env.flush();
 
-    // Must report reloadFailed
     const statusError = flattenNodes(tree).find((n) => n.props?.className?.includes('dsh_arm_statusError'));
-    assert.ok(statusError, `[${variant}] status error element should appear on re-read failure`);
-    assert.match(
-      String(statusError.props?.children ?? ''),
-      /已保存.*重新读取.*失败|saved.*reloading.*failed/i,
-      `[${variant}] error message must indicate reload failed after save`,
-    );
-
-    // Form must NOT revert to unsaved dirty state
+    assert.ok(statusError, `[${variant}] a re-read failure must be reported`);
+    assert.match(String(statusError.props?.children ?? ''), /已保存.*重新读取.*失败|saved.*reloading.*failed/i);
     assert.equal(
       findNodeByClass(flattenNodes(tree), 'dsh_arm_unsaved'),
       undefined,
-      `[${variant}] form should not show unsaved changes after successful save with re-read failure`,
+      `[${variant}] the form must not look dirty after a successful save`,
     );
 
-    // A subsequent save should carry the new revision 15 from response snapshot
-    reReadFails = false; // allow re-read on second save
-    checkbox.props.onChange({ target: { checked: true } });
+    reReadFails = false;
+    toggleRow(flattenNodes(tree), 0, true);
     tree = env.render();
-
-    const saveButton2 = findButton(flattenNodes(tree), env.t('save'));
-    assert.ok(saveButton2);
-    saveButton2.props.onClick();
+    findButton(flattenNodes(tree), env.t('save'))?.props.onClick();
     await env.flush();
 
     assert.equal(env.writes.length, 2);
-    assert.equal(
-      env.writes[1].expectedRevision,
-      15,
-      `[${variant}] next save must carry revision recovered from response fallback (15)`,
-    );
+    assert.equal(env.writes[1].expectedRevision, 15);
   }
 });
 
 /* ============================================================
- * Saved review-route test action
+ * Single ordered route list
  * ============================================================ */
 
-/** Deferred promise helper for independent-state tests. */
-function createDeferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {
-  let resolve!: (value: T) => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
+test('rows have no visible index text, a position-based accessible name and no session row', async () => {
+  const env = await setupComponent({
+    savedSettings: {
+      ...SAVED_ROUTE,
+      fallbacks: [
+        { mode: 'route', enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: '' },
+      ],
+    },
+    catalogGroups: ROUTE_CATALOG,
   });
-  return { promise, resolve, reject };
+  env.render();
+  const nodes = flattenNodes(await env.flush());
+  const rows = routeRows(nodes);
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map((row) => row.props['data-route-index']), [0, 1]);
+  assert.equal(rows[0].props['aria-label'], env.t('routeRowLabel').replace('{index}', '1'));
+  assert.equal(rows[1].props['aria-label'], env.t('routeRowLabel').replace('{index}', '2'));
+
+  // No visible "#n" ordinal anywhere in the rendered page.
+  assert.equal(
+    nodes.some((node) => typeof node.props?.children === 'string' && /^#\d+$/.test(node.props.children)),
+    false,
+    'no visible ordinal label may be rendered',
+  );
+
+  // No fixed session-model row and no master enable checkbox.
+  assert.equal(nodes.some((node) => node.props?.['data-route-session'] === 'true'), false);
+  const checkboxes = nodes.filter((node) => node.type === 'input' && node.props?.type === 'checkbox');
+  assert.ok(checkboxes.length >= 2);
+  for (const checkbox of checkboxes) {
+    assert.match(String(checkbox.props['data-arm-action'] ?? ''), /^route-\d+-enable$/);
+  }
+
+  // No standalone test section with duplicated hint text.
+  assert.equal(nodes.some((node) => node.props?.className === 'dsh_arm_test'), false);
+  assert.equal(nodes.some((node) => node.props?.['data-arm-test'] === 'true'), false);
+
+  // Real table semantics: one table, a colgroup and one header cell per column.
+  const table = nodes.find((node) => node.type === 'table' && node.props?.['data-arm-table'] === 'true');
+  assert.ok(table, 'the routes must render as a real table');
+  assert.equal(table.props.className, 'dsh_arm_table');
+  assert.equal(nodes.filter((node) => node.type === 'col').length, 6, 'six fixed columns');
+  assert.equal(nodes.filter((node) => node.type === 'th').length, 6, 'six scoped column headers');
+  for (const header of nodes.filter((node) => node.type === 'th')) {
+    assert.equal(header.props.scope, 'col');
+  }
+  assert.equal(routeRows(nodes).length, 2, 'one <tr data-route-index> per route');
+  for (const row of rows) assert.equal(row.type, 'tr');
+});
+
+test('each row shows an enabled checkbox and the inherit effort option', async () => {
+  const env = await setupComponent({
+    savedSettings: {
+      ...SAVED_ROUTE,
+      fallbacks: [
+        { mode: 'route', enabled: false, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'inherit' },
+      ],
+    },
+    catalogGroups: ROUTE_CATALOG,
+  });
+  env.render();
+  const nodes = flattenNodes(await env.flush());
+
+  assert.equal(findByAction(nodes, 'route-0-enable')?.props.checked, true);
+  assert.equal(findByAction(nodes, 'route-1-enable')?.props.checked, false);
+
+  const effort1 = findByTestId(nodes, 'route-1-effort');
+  assert.equal(effort1?.props.value, 'inherit');
+  const effectOptions = effort1?.props.options as Array<{ value: string; label: string }>;
+  assert.ok(effectOptions.some((option) => option.value === 'inherit' && option.label === env.t('effortInherit')));
+
+  // A disabled row is de-emphasised but stays editable and testable.
+  assert.match(String(rowClassName(nodes, 1)), /dsh_arm_rowDisabled/);
+  assert.equal(findByTestId(nodes, 'route-1-provider')?.props.disabled, false);
+  assert.equal(findByAction(nodes, 'route-1-test')?.props.disabled, false);
+});
+
+/** Read one route row's class name by index. */
+function rowClassName(nodes: Array<{ type: unknown; props: Record<string, any> }>, index: number): string {
+  return String(routeRows(nodes)[index]?.props?.className ?? '');
 }
 
-/** A saved route the default fake catalog can represent. */
-const SAVED_ROUTE = {
-  enabled: true,
-  provider: 'provider-a',
-  model: 'model-a1',
-  reasoningEffort: 'high',
-} as const;
-
-/** Find one rendered string child that contains `fragment`. */
-function findTextNode(
-  nodes: Array<{ type: unknown; props: Record<string, any> }>,
-  fragment: string,
-): { type: unknown; props: Record<string, any> } | undefined {
-  return nodes.find((node) => {
-    const children = node.props?.children;
-    return typeof children === 'string' && children.includes(fragment);
+test('new rows default to the inherit effort and are saved enabled', async () => {
+  const env = await setupComponent({
+    savedSettings: { primaryEnabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: '' },
+    catalogGroups: ROUTE_CATALOG,
   });
-}
-
-test('saved-route test action is discoverable and always names the saved route', async () => {
-  const env = await setupComponent({ savedSettings: { ...SAVED_ROUTE } });
   env.render();
   let nodes = flattenNodes(await env.flush());
+  findByAction(nodes, 'route-add')?.props.onClick();
+  nodes = flattenNodes(await env.flush());
+  assert.equal(routeRows(nodes).length, 2);
+  assert.equal(findByTestId(nodes, 'route-1-effort')?.props.value, 'inherit');
+  assert.equal(findByAction(nodes, 'route-1-enable')?.props.checked, true);
+  assert.ok(findNodeByClass(nodes, 'dsh_arm_unsaved'));
 
-  const section = findNodeByClass(nodes, 'dsh_arm_test');
-  assert.ok(section, 'the saved-route test section must be rendered on the settings page');
-
-  const testButton = findButton(nodes, env.t('test'));
-  assert.ok(testButton, 'the test button must be discoverable by its localized label');
-  assert.equal(testButton.type, 'button');
-  assert.equal(testButton.props.disabled, false, 'the test action must be available for a complete saved route');
-  assert.ok(
-    findTextNode(nodes, `${SAVED_ROUTE.provider} / ${SAVED_ROUTE.model} · ${SAVED_ROUTE.reasoningEffort}`),
-    'the hint must name the saved route',
-  );
-  assert.ok(
-    findTextNode(nodes, env.t('testHint').split('{')[0] ?? env.t('testHint')),
-    'the hint must explain that only the saved route is tested',
-  );
-
-  // Make the draft dirty: the hint must say the draft is not tested while the
-  // saved-route description stays the same.
-  const effortControl = nodes.find((node) => node.props?.label === env.t('effort'));
-  assert.ok(effortControl, 'effort control must exist');
-  effortControl.props.onChange('low');
-  env.render();
+  findByTestId(nodes, 'route-1-provider')?.props.onChange('provider-b');
+  nodes = flattenNodes(await env.flush());
+  findByTestId(nodes, 'route-1-model')?.props.onChange('model-b1');
   nodes = flattenNodes(await env.flush());
 
-  assert.ok(findTextNode(nodes, env.t('testHintDirty')), 'a dirty draft must be called out as not tested');
-  assert.ok(
-    findTextNode(nodes, `${SAVED_ROUTE.provider} / ${SAVED_ROUTE.model} · ${SAVED_ROUTE.reasoningEffort}`),
-    'the saved-route description must not follow the dirty draft',
+  findButton(nodes, env.t('save'))?.props.onClick();
+  await env.flush();
+  assert.equal(env.writes.length, 1);
+  assert.deepEqual(env.writes[0].nextSettings.fallbacks, [
+    { mode: 'route', enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'inherit' },
+  ]);
+});
+
+test('rows can be reordered, removed and saved with their enable flags', async () => {
+  const env = await setupComponent({
+    savedSettings: { primaryEnabled: true, provider: '', model: '', reasoningEffort: '' },
+    catalogGroups: ROUTE_CATALOG,
+  });
+  env.render();
+  let nodes = flattenNodes(await env.flush());
+  assert.equal(routeRows(nodes).length, 0);
+  assert.ok(nodes.some((node) => node.props?.children === env.t('reviewRoutesEmpty')));
+
+  findByAction(nodes, 'route-add')?.props.onClick();
+  nodes = flattenNodes(await env.flush());
+  findByTestId(nodes, 'route-0-provider')?.props.onChange('provider-b');
+  nodes = flattenNodes(await env.flush());
+  findByTestId(nodes, 'route-0-model')?.props.onChange('model-b1');
+  nodes = flattenNodes(await env.flush());
+
+  findByAction(nodes, 'route-add')?.props.onClick();
+  nodes = flattenNodes(await env.flush());
+  findByTestId(nodes, 'route-1-provider')?.props.onChange('provider-a');
+  nodes = flattenNodes(await env.flush());
+  findByTestId(nodes, 'route-1-model')?.props.onChange('model-a1');
+  nodes = flattenNodes(await env.flush());
+
+  // Disable the second row, then move it up: enable flags travel with rows.
+  findByAction(nodes, 'route-1-enable')?.props.onChange({ target: { checked: false } });
+  nodes = flattenNodes(await env.flush());
+  findByAction(nodes, 'route-1-up')?.props.onClick();
+  nodes = flattenNodes(await env.flush());
+  assert.equal(findByTestId(nodes, 'route-0-provider')?.props.value, 'provider-a');
+  assert.equal(findByAction(nodes, 'route-0-enable')?.props.checked, false);
+  assert.equal(findByTestId(nodes, 'route-1-provider')?.props.value, 'provider-b');
+  assert.equal(findByAction(nodes, 'route-1-enable')?.props.checked, true);
+
+  assert.equal(findByAction(nodes, 'route-0-up')?.props.disabled, true);
+  assert.equal(findByAction(nodes, 'route-1-down')?.props.disabled, true);
+
+  findButton(nodes, env.t('save'))?.props.onClick();
+  await env.flush();
+  assert.equal(env.writes.length, 1);
+  assert.deepEqual(env.writes[0].nextSettings, {
+    primaryEnabled: false,
+    provider: 'provider-a',
+    model: 'model-a1',
+    reasoningEffort: 'inherit',
+    fallbacks: [
+      { mode: 'route', enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'inherit' },
+    ],
+  });
+});
+
+test('removing the first of two rows promotes the second into row 1', async () => {
+  const env = await setupComponent({
+    savedSettings: {
+      primaryEnabled: true,
+      provider: 'provider-a',
+      model: 'model-a1',
+      reasoningEffort: 'high',
+      fallbacks: [
+        { mode: 'route', enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: '' },
+      ],
+    },
+    catalogGroups: ROUTE_CATALOG,
+  });
+  env.render();
+  let nodes = flattenNodes(await env.flush());
+  findByAction(nodes, 'route-0-remove')?.props.onClick();
+  nodes = flattenNodes(await env.flush());
+  assert.equal(findByTestId(nodes, 'route-0-provider')?.props.value, 'provider-b');
+  findButton(nodes, env.t('save'))?.props.onClick();
+  await env.flush();
+  assert.deepEqual(env.writes[0].nextSettings, {
+    primaryEnabled: true,
+    provider: 'provider-b',
+    model: 'model-b1',
+    reasoningEffort: '',
+  });
+});
+
+test('the route list is capped at ten rows', async () => {
+  const env = await setupComponent({
+    savedSettings: {
+      primaryEnabled: true,
+      provider: 'provider-a',
+      model: 'model-a1',
+      reasoningEffort: '',
+      fallbacks: Array.from({ length: 9 }, () => ({
+        mode: 'route' as const,
+        enabled: true,
+        provider: 'provider-a',
+        model: 'model-a1',
+        reasoningEffort: '',
+      })),
+    },
+    catalogGroups: ROUTE_CATALOG,
+  });
+  env.render();
+  const nodes = flattenNodes(await env.flush());
+  assert.equal(routeRows(nodes).length, 10);
+  assert.equal(findByAction(nodes, 'route-add')?.props.disabled, true);
+  assert.ok(nodes.some((node) => node.props?.children === env.t('routeCapHint')));
+});
+
+test('legacy { mode: session } rows are ignored and dropped on the next save', async () => {
+  const env = await setupComponent({
+    savedSettings: {
+      primaryEnabled: true,
+      provider: 'provider-a',
+      model: 'model-a1',
+      reasoningEffort: '',
+      fallbacks: [
+        { mode: 'route', enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: '' },
+        { mode: 'session', provider: 'stale-provider', model: 'stale-model', reasoningEffort: '' },
+      ],
+    },
+    catalogGroups: ROUTE_CATALOG,
+  });
+  env.render();
+  let nodes = flattenNodes(await env.flush());
+  assert.equal(routeRows(nodes).length, 2);
+  assert.equal(findByTestId(nodes, 'route-1-provider')?.props.value, 'provider-b');
+  assert.equal(findByTestId(nodes, 'route-2-provider'), undefined);
+  assert.equal(findNodeByClass(nodes, 'dsh_arm_unsaved'), undefined);
+
+  toggleRow(nodes, 0, false);
+  nodes = flattenNodes(await env.flush());
+  findButton(nodes, env.t('save'))?.props.onClick();
+  await env.flush();
+  assert.equal(env.writes.length, 1);
+  assert.deepEqual(env.writes[0].nextSettings.fallbacks, [
+    { mode: 'route', enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: '' },
+  ]);
+  assert.ok(!JSON.stringify(env.writes[0].nextSettings).includes('session'));
+});
+
+/* ============================================================
+ * Per-row test action
+ * ============================================================ */
+
+test('each row has its own test button that probes that row\'s current values', async () => {
+  const env = await setupComponent({
+    savedSettings: {
+      primaryEnabled: true,
+      provider: 'provider-a',
+      model: 'model-a1',
+      reasoningEffort: 'high',
+      fallbacks: [
+        { mode: 'route', enabled: false, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'inherit' },
+      ],
+    },
+    catalogGroups: ROUTE_CATALOG,
+    testResponse: { ok: true, value: testResult() },
+  });
+  env.render();
+  let nodes = flattenNodes(await env.flush());
+  assert.equal(findByAction(nodes, 'route-0-test')?.props.children, env.t('test'));
+  assert.equal(findByAction(nodes, 'route-1-test')?.props.children, env.t('test'));
+
+  // A dirty, disabled row is still testable with its CURRENT draft values.
+  findByTestId(nodes, 'route-1-model')?.props.onChange('model-b1');
+  nodes = flattenNodes(await env.flush());
+  findByAction(nodes, 'route-1-test')?.props.onClick();
+  nodes = flattenNodes(await env.flush());
+
+  assert.equal(env.endpoint.calls.length, 1);
+  assert.deepEqual(env.endpoint.inputs[0], {
+    provider: 'provider-b',
+    model: 'model-b1',
+    reasoningEffort: 'inherit',
+  });
+  const status = findNodeByClass(nodes, 'dsh_arm_routeTestStatus');
+  assert.ok(status, 'the tested row must render its inline result');
+  assert.equal(status.props.children, env.t('testResultPrefix') + ': ' + env.t('testOkMessage'));
+  assert.equal(
+    routeRows(nodes)[0].props['data-route-index'],
+    0,
+    'the other row is unaffected by the probe',
+  );
+
+  // The result is a full-width row directly under its own route row, not a
+  // cell that could stretch the provider/model/effort columns.
+  const resultRow = nodes.find((node) => node.props?.['data-route-result'] === 1);
+  assert.ok(resultRow, 'the tested row gets a dedicated result row');
+  assert.equal(resultRow.type, 'tr');
+  const resultCell = resultRow.props.children;
+  assert.equal(resultCell.type, 'td');
+  assert.equal(resultCell.props.colSpan, 6, 'the result spans every table column');
+  assert.match(String(resultCell.props.className), /dsh_arm_routeResultCell/);
+  const tbody = nodes.find((node) => node.type === 'tbody');
+  const bodyRows = (Array.isArray(tbody?.props?.children) ? tbody.props.children : [])
+    .flat(Infinity)
+    .filter((node: unknown) => node !== null && typeof node === 'object' && (node as ReactElementLike).type === 'tr');
+  const testedIndex = bodyRows.findIndex((row: ReactElementLike) => row.props['data-route-index'] === 1);
+  assert.equal(
+    bodyRows[testedIndex + 1]?.props?.['data-route-result'],
+    1,
+    'the result row directly follows its route row',
   );
   assert.equal(
-    findButton(nodes, env.t('test'))?.props.disabled,
+    nodes.some((node) => node.props?.['data-route-result'] === 0),
     false,
-    'a dirty draft must still allow testing the saved route',
+    'no result row is rendered for an untested row',
   );
 });
 
-test('the saved-route test renders classified outcomes instead of model output', async () => {
+test('per-row probe busy state is independent and results are replaced on edit', async () => {
+  let resolvePending!: (value: { ok: boolean; value?: unknown }) => void;
+  const pending = new Promise<{ ok: boolean; value?: unknown }>((resolve) => { resolvePending = resolve; });
+  const env = await setupComponent({
+    savedSettings: {
+      ...SAVED_ROUTE,
+      fallbacks: [
+        { mode: 'route', enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: '' },
+      ],
+    },
+    catalogGroups: ROUTE_CATALOG,
+    testPending: pending,
+  });
+  env.render();
+  let nodes = flattenNodes(await env.flush());
+  findByAction(nodes, 'route-0-test')?.props.onClick();
+  nodes = flattenNodes(await env.flush());
+
+  assert.equal(findByAction(nodes, 'route-0-test')?.props.children, env.t('testing'));
+  assert.equal(findByAction(nodes, 'route-0-test')?.props.disabled, true);
+  assert.equal(findByAction(nodes, 'route-1-test')?.props.children, env.t('test'));
+  assert.equal(findByAction(nodes, 'route-1-test')?.props.disabled, false, 'other rows stay idle and clickable');
+
+  // Editing any row clears every stale result and aborts the in-flight probe.
+  findByTestId(nodes, 'route-1-model')?.props.onChange('model-b1');
+  nodes = flattenNodes(await env.flush());
+  assert.equal(findByAction(nodes, 'route-0-test')?.props.children, env.t('test'));
+  resolvePending({ ok: true, value: testResult() });
+  nodes = flattenNodes(await env.flush());
+  assert.equal(findNodeByClass(nodes, 'dsh_arm_routeTestStatus'), undefined, 'an abandoned probe result is dropped');
+});
+
+test('the nested route result is localized with an actionable inline hint', async () => {
   const env = await setupComponent({
     savedSettings: { ...SAVED_ROUTE },
     testResponse: {
@@ -1122,229 +1174,66 @@ test('the saved-route test renders classified outcomes instead of model output',
     },
   });
   env.render();
-  let nodes = flattenNodes(await env.flush());
-  const testButton = findButton(nodes, env.t('test'));
-  assert.ok(testButton);
-  testButton.props.onClick();
-  nodes = flattenNodes(await env.flush());
-
-  assert.equal(env.endpoint.calls.length, 1, 'one click must issue one probe');
-  assert.ok(
-    env.endpoint.calls[0].signal instanceof AbortSignal,
-    'the component must pass its own cancellation signal to the Remote call',
-  );
-  assert.equal(env.endpoint.signals[0]?.aborted, false, 'the signal stays live while the probe runs');
-
-  const resultNode = findNodeByClass(nodes, 'dsh_arm_testError');
-  assert.ok(resultNode, 'a failed probe must render in the error tone');
+  const nodes = flattenNodes(await env.flush());
+  findByAction(nodes, 'route-0-test')?.props.onClick();
+  const after = flattenNodes(await env.flush());
+  const status = findNodeByClass(after, 'dsh_arm_routeTestStatus');
+  assert.ok(status);
   assert.equal(
-    resultNode.props.children,
+    status.props.children,
     env.t('testResultPrefix') + ': ' + env.t('testAccountSignInMessage'),
   );
   assert.ok(
-    findTextNode(nodes, env.t('testAccountSignInHint').split('{')[0]),
-    'the account sign-in failure must render an actionable hint',
+    after.some((node) => typeof node.props?.children === 'string'
+      && node.props.children.includes(env.t('testAccountSignInHint').split('{')[0])),
+    'the inline result must carry the actionable hint',
   );
   assert.equal(
-    nodes.some((node) => typeof node.props?.children === 'string' && node.props.children.includes('the model wrote')),
+    after.some((node) => typeof node.props?.children === 'string' && node.props.children.includes('the model wrote')),
     false,
     'no model prose may be rendered',
   );
 });
 
-test('credential failures render the provider and environment hint', async () => {
-  const env = await setupComponent({
-    savedSettings: { ...SAVED_ROUTE },
-    testResponse: {
-      ok: true,
-      value: testResult({
-        status: 'error',
-        code: 'MISSING_CREDENTIAL',
-        authKind: 'api-key',
-        providerName: 'Provider A',
-        credentialEnv: ['PROVIDER_A_API_KEY'],
-        failureCode: 'HTTP_401',
-        detail: 'Host advisory sentence that must not be duplicated',
-      }),
-    },
-  });
-  env.render();
-  const nodes = flattenNodes(await env.flush());
-  const testButton = findButton(nodes, env.t('test'));
-  testButton?.props.onClick();
-  const after = flattenNodes(await env.flush());
-  assert.ok(findTextNode(after, 'Provider A'), 'the hint must name the provider');
-  assert.ok(findTextNode(after, 'PROVIDER_A_API_KEY'), 'the hint must name the credential environment variable');
-  assert.ok(
-    findTextNode(after, env.t('testFailureCode') + ': HTTP_401'),
-    'the machine-shaped failure code must be shown as data',
-  );
-  assert.equal(
-    findTextNode(after, 'Host advisory sentence that must not be duplicated'),
-    undefined,
-    'classified outcomes must not duplicate untranslated host advice',
-  );
-});
-
-test('a transport failure is localized instead of showing raw prose', async () => {
+test('a transport failure is localized inline instead of showing raw prose', async () => {
   const env = await setupComponent({ savedSettings: { ...SAVED_ROUTE }, testRejects: true });
   env.render();
   const nodes = flattenNodes(await env.flush());
-  findButton(nodes, env.t('test'))?.props.onClick();
+  findByAction(nodes, 'route-0-test')?.props.onClick();
   const after = flattenNodes(await env.flush());
-  const failed = findNodeByClass(after, 'dsh_arm_testError');
-  assert.ok(failed);
-  assert.equal(failed.props.children, env.t('testResultPrefix') + ': ' + env.t('testTransportFailed'));
-  assert.ok(findTextNode(after, env.t('testTransportHint')), 'a transport failure must offer retry guidance');
+  const status = findNodeByClass(after, 'dsh_arm_routeTestStatus');
+  assert.ok(status);
+  assert.equal(status.props.children, env.t('testResultPrefix') + ': ' + env.t('testTransportFailed'));
+  assert.ok(after.some((node) => node.props?.children === env.t('testTransportHint')));
   assert.equal(
-    nodes.some((node) => typeof node.props?.children === 'string' && node.props.children.includes('remote call failed')),
+    after.some((node) => typeof node.props?.children === 'string' && node.props.children.includes('remote call failed')),
     false,
-    'arbitrary error messages must not be rendered',
   );
 });
 
-test('the testing state is independent from save state and blocks duplicate probes', async () => {
-  const deferred = createDeferred<{ ok: boolean; value?: unknown }>();
-  const env = await setupComponent({
-    savedSettings: { ...SAVED_ROUTE },
-    testPending: deferred.promise,
-  });
-  env.render();
-  let nodes = flattenNodes(await env.flush());
-
-  // Dirty the draft so Save is enabled, then start a probe.
-  const effortControl = nodes.find((node) => node.props?.label === env.t('effort'));
-  assert.ok(effortControl);
-  effortControl.props.onChange('low');
-  env.render();
-  nodes = flattenNodes(await env.flush());
-  findButton(nodes, env.t('test'))?.props.onClick();
-  nodes = flattenNodes(await env.flush());
-
-  const busyButton = findButton(nodes, env.t('testing'));
-  assert.ok(busyButton, 'the probe button must show its own testing label');
-  assert.equal(busyButton?.props.disabled, true, 'the probe button must be disabled while testing');
-  const saveButton = findButton(nodes, env.t('save'));
-  assert.ok(saveButton, 'the save button must remain rendered');
-  assert.equal(
-    saveButton?.props.disabled,
-    false,
-    'the independent test state must not disable (or reuse) the save busy state',
-  );
-  const section = findNodeByClass(nodes, 'dsh_arm_section');
-  assert.ok(section);
-  assert.equal(
-    section.props['aria-busy'],
-    false,
-    'a saved-route probe must not mark the whole settings section busy',
-  );
-  const testRow = findNodeByClass(nodes, 'dsh_arm_test');
-  assert.ok(testRow);
-  assert.equal(testRow.props['aria-busy'], true, 'the probe row itself is busy while testing');
-  busyButton?.props.onClick();
-  busyButton?.props.onClick();
-  assert.equal(env.endpoint.calls.length, 1, 'repeated taps while testing must not issue more probes');
-
-  deferred.resolve({ ok: true, value: testResult() });
-  nodes = flattenNodes(await env.flush());
-  assert.ok(findButton(nodes, env.t('test')), 'the button must return to its idle label after the probe');
-  const okNode = findNodeByClass(nodes, 'dsh_arm_testOk');
-  assert.ok(okNode, 'a healthy probe must render in the success tone');
-});
-
-test('the test action is visibly unavailable when its endpoint did not mount', async () => {
+test('the test action is unavailable without a mounted endpoint', async () => {
   const env = await setupComponent({ savedSettings: { ...SAVED_ROUTE }, endpointUnavailable: true });
   env.render();
   const nodes = flattenNodes(await env.flush());
-  const testButton = findButton(nodes, env.t('test'));
-  assert.ok(testButton);
-  assert.equal(testButton?.props.disabled, true, 'the test action must be disabled without a mounted endpoint');
-  assert.ok(findTextNode(nodes, env.t('testUnavailableHint')), 'the page must explain why the test is unavailable');
+  assert.equal(findByAction(nodes, 'route-0-test')?.props.disabled, true);
+  const note = nodes.filter((node) => node.props?.children === env.t('testUnavailableHint'));
+  assert.equal(note.length, 1, 'exactly one unavailable note is rendered for the whole section');
 });
 
-test('a pending probe result is dropped when the saved route changes', async () => {
-  const deferred = createDeferred<{ ok: boolean; value?: unknown }>();
-  const env = await setupComponent({
-    savedSettings: { ...SAVED_ROUTE },
-    testPending: deferred.promise,
-  });
+test('unmounting the page aborts in-flight row probes', async () => {
+  let resolvePending!: (value: { ok: boolean; value?: unknown }) => void;
+  const pending = new Promise<{ ok: boolean; value?: unknown }>((resolve) => { resolvePending = resolve; });
+  const env = await setupComponent({ savedSettings: { ...SAVED_ROUTE }, testPending: pending });
   env.render();
   let nodes = flattenNodes(await env.flush());
-  findButton(nodes, env.t('test'))?.props.onClick();
+  findByAction(nodes, 'route-0-test')?.props.onClick();
   nodes = flattenNodes(await env.flush());
-  assert.ok(findButton(nodes, env.t('testing')), 'the probe must still be in flight');
-
-  // Save a different reasoning effort for the SAME save cycle while the probe
-  // is pending; the saved route displayed by the form changes.
-  const effortControl = nodes.find((node) => node.props?.label === env.t('effort'));
-  assert.ok(effortControl);
-  effortControl.props.onChange('low');
-  env.render();
-  nodes = flattenNodes(await env.flush());
-  const saveButton = findButton(nodes, env.t('save'));
-  assert.ok(saveButton);
-  saveButton.props.onClick();
-  nodes = flattenNodes(await env.flush());
-  assert.ok(findNodeByClass(nodes, 'dsh_arm_testOk') === undefined);
-  // Saving a different saved route aborts the probe for the previous route.
-  assert.equal(env.endpoint.signals[0]?.aborted, true, 'a saved-route change must abort the pending probe');
-  assert.equal(env.endpoint.aborts.length, 1, 'the abort must reach the Remote call exactly once');
-  assert.ok(findButton(nodes, env.t('test')), 'the probe button must be idle again after the aborted probe');
-
-  // Route A's late answer must not be presented beside saved route B.
-  deferred.resolve({ ok: true, value: testResult() });
-  nodes = flattenNodes(await env.flush());
-  assert.equal(env.endpoint.calls.length, 1);
-  assert.equal(
-    findNodeByClass(nodes, 'dsh_arm_testOk'),
-    undefined,
-    'a stale success must not be rendered after the saved route moved',
-  );
-  assert.equal(
-    nodes.some((node) => typeof node.props?.children === 'string' && node.props.children.includes(env.t('testOkMessage'))),
-    false,
-    'no stale outcome text may remain visible',
-  );
-  assert.ok(findButton(nodes, env.t('test')), 'the probe button must return to idle after the late answer');
-});
-
-test('unmounting the page aborts an in-flight probe and discards its late result', async () => {
-  const deferred = createDeferred<{ ok: boolean; value?: unknown }>();
-  const env = await setupComponent({
-    savedSettings: { ...SAVED_ROUTE },
-    testPending: deferred.promise,
-  });
-  env.render();
-  let nodes = flattenNodes(await env.flush());
-  findButton(nodes, env.t('test'))?.props.onClick();
-  nodes = flattenNodes(await env.flush());
-  assert.ok(findButton(nodes, env.t('testing')), 'the probe must be in flight before unmount');
-  const signal = env.endpoint.signals[0];
+  const signal = env.endpoint.calls[0]?.signal;
   assert.ok(signal instanceof AbortSignal);
   assert.equal(signal.aborted, false);
 
   env.unmount();
-  assert.equal(signal.aborted, true, 'unmount must abort the in-flight probe');
-  assert.equal(env.endpoint.aborts.length, 1, 'the abort must reach the Remote call');
-
-  // A late answer after unmount must be ignored and must not throw.
-  deferred.resolve({ ok: true, value: testResult() });
+  assert.equal(signal.aborted, true, 'unmount must abort the row probe');
+  resolvePending({ ok: true, value: testResult() });
   await new Promise((resolve) => setImmediate(resolve));
-});
-
-test('starting a probe keeps exactly one cancellation signal live', async () => {
-  const deferred = createDeferred<{ ok: boolean; value?: unknown }>();
-  const env = await setupComponent({
-    savedSettings: { ...SAVED_ROUTE },
-    testPending: deferred.promise,
-  });
-  env.render();
-  const nodes = flattenNodes(await env.flush());
-  findButton(nodes, env.t('test'))?.props.onClick();
-  await env.flush();
-  assert.equal(env.endpoint.signals.length, 1);
-  assert.equal(env.endpoint.signals[0]?.aborted, false);
-  deferred.resolve({ ok: true, value: testResult() });
-  await env.flush();
-  assert.equal(env.endpoint.signals[0]?.aborted, false, 'a completed probe is not aborted');
 });

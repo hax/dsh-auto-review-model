@@ -16,9 +16,30 @@
  *
  * A configured reasoning effort is verified against the reviewer route's live
  * capabilities before the first review. If that lookup fails or exceeds its
- * five-minute deadline, the review rejects immediately with an actionable error
- * that names the exact route and repair steps; the failed lookup is not cached
- * and the review never silently degrades to the provider's default effort.
+ * five-minute deadline, the review either moves on to the next configured
+ * fallback route or rejects immediately with an actionable error that names the
+ * exact route and repair steps; the failed lookup is not cached and the review
+ * never silently degrades to the provider's default effort.
+ *
+ * Optional ordered multi-route review: row 1 is the legacy primary route
+ * (`provider`/`model`/`reasoningEffort`), followed by the ordered `fallbacks`
+ * array of explicit routes. The intercepted review request's own
+ * provider/model is ALWAYS the implicit final fallback (reasoning effort `''`),
+ * so it is never configurable, never stored as a settings row, and never
+ * duplicated when an explicit attempt already uses the same provider+model.
+ * With no usable explicit route the listener does not rewrite at all and the
+ * native session model serves the review. Legacy `{ mode: 'session' }` entries
+ * are ignored because that fallback is implicit now. Only route-level failures
+ * — capability lookup failure, a thrown provider stream, or a terminal `finish`
+ * whose official failure code is a quota / auth / credential / rate-limit /
+ * server / timeout / transport / adapter failure — advance to the next route.
+ * A caller abort is propagated untouched, and content/protocol failures are
+ * surfaced instead of retried. Chunks are forwarded to the caller immediately:
+ * a route may only be replaced before its first chunk is emitted. Once output
+ * has crossed that commit point, a later failure is surfaced as an actionable
+ * error instead of retrying, so the caller's single-decision stream never sees
+ * chunks from two different routes. When every route fails before any output,
+ * one aggregate error lists each attempted route with its code and raw provider message.
  *
  * The same plugin instance publishes one small Typert Remote endpoint,
  * `autoReviewModel/testReviewRoute`, so the settings page can probe the SAVED
@@ -32,9 +53,12 @@
  * @module @aghost-prj/dsh-auto-review-model
  */
 import z from '@deepseek-ai/schemastery';
-import { effortCacheKey, isAutoReviewRequest, normalizeEffort, readReviewerSettings, shouldOverrideRoute } from './policy.js';
+import { adaptEffortToAdvertised, effortCacheKey, effortRank, isAutoReviewRequest, normalizeEffort, readReviewerSettings, shouldOverrideRoute } from './policy.js';
 import type { ReviewerConfig } from './policy.js';
 import { installRouteTestEndpoint } from './route-test.js';
+import { readThrownFailure } from './failure.js';
+export { ReviewerRouteError, ReviewerRoutesError } from './fallback.js';
+import { ReviewerRouteError, ReviewerRoutesError, buildReviewPlan, failureFromFinish, failureFromThrown, isAsyncIterable, isFallbackEligibleFailure, readFallbackEntries } from './fallback.js';
 /** One adapter-owned reasoning effort advertised for an exact route. */
 interface LlmEffortInfo {
     id?: string;
@@ -51,6 +75,8 @@ interface GenerateOptions {
     model: string;
     system?: string;
     reasoningEffort?: string;
+    /** Session that issued the review; used to resolve an `inherit` effort. */
+    sessionId?: string;
     signal?: AbortSignal;
 }
 /** One adapter-provided configurable-provider directory entry (subset). */
@@ -81,9 +107,25 @@ interface SessionLogDeepSeek {
         purpose?: string;
     }) => boolean): unknown;
 }
+/** The live request header fields this plugin reads from one session. */
+interface SessionRequestHeaderLike {
+    config?: {
+        reasoningEffort?: string;
+    };
+}
+/** The structural subset of one resolved session needed for `inherit`. */
+interface SessionLike {
+    requestHeader?(): SessionRequestHeaderLike | undefined;
+}
+/** The structural subset of the `sessions` service needed for `inherit`. */
+interface SessionDirectory {
+    get(id: string): SessionLike | undefined;
+}
 /** The subset of the host context used by this plugin. */
 interface HostContext {
     llm: LlmService;
+    /** Session directory used to resolve the `inherit` reasoning effort. */
+    sessions: SessionDirectory;
     on(event: string, listener: (...args: any[]) => any, options?: ListenerOptions): unknown;
     inject(services: readonly string[], callback: (child: {
         sessionLogDeepSeek: SessionLogDeepSeek;
@@ -101,18 +143,15 @@ export declare const inject: string[];
 /**
  * Review-model settings. All fields are volatile so the settings UI can update
  * them in place; the listener always reads their current values per request.
+ *
+ * The schema is annotated with the plain `z` type on purpose: the inferred type
+ * of the volatile array would mention the schemastery-internal
+ * `@deepseek-ai/cosmokit` `Volatile` helper, which this package must not add as
+ * a dependency just to emit a portable declaration file. Runtime validation is
+ * unchanged; the Host reads the live values through `readReviewerSettings` and
+ * `readFallbackEntries`.
  */
-export declare const Config: z<Schemastery.ObjectS<NoInfer<{
-    enabled: z<boolean, boolean, "volatile-defined">;
-    provider: z<string, string, "volatile-defined">;
-    model: z<string, string, "volatile-defined">;
-    reasoningEffort: z<string, string, "volatile-defined">;
-}>>, Schemastery.ObjectT<NoInfer<{
-    enabled: z<boolean, boolean, "volatile-defined">;
-    provider: z<string, string, "volatile-defined">;
-    model: z<string, string, "volatile-defined">;
-    reasoningEffort: z<string, string, "volatile-defined">;
-}>>, "plain">;
+export declare const Config: z;
 /**
  * Failure raised when the configured reviewer route cannot prove its reasoning
  * capabilities.
@@ -156,8 +195,32 @@ export declare const __testing: {
     normalizeEffort: typeof normalizeEffort;
     shouldOverrideRoute: typeof shouldOverrideRoute;
     effortCacheKey: typeof effortCacheKey;
+    effortRank: typeof effortRank;
+    adaptEffortToAdvertised: typeof adaptEffortToAdvertised;
+    INHERIT_EFFORT: string;
     CAPABILITY_TIMEOUT_MS: number;
     ReviewerCapabilityError: typeof ReviewerCapabilityError;
+    /** Fallback policy and streaming helpers exported by `./fallback.js` for Host tests. */
+    fallback: {
+        MAX_FALLBACK_ENTRIES: number;
+        ROUTES_ERROR_NAME: string;
+        ROUTES_ERROR_CODE: string;
+        ROUTE_ERROR_NAME: string;
+        ROUTE_ERROR_CODE: string;
+        PROTOCOL_FAILURE_CODE: string;
+        normalizeFallbackEntry: typeof import("./fallback.js").normalizeFallbackEntry;
+        isLegacySessionEntry: typeof import("./fallback.js").isLegacySessionEntry;
+        readFallbackEntries: typeof readFallbackEntries;
+        buildReviewPlan: typeof buildReviewPlan;
+        isFallbackEligibleFailure: typeof isFallbackEligibleFailure;
+        failureFromThrown: typeof failureFromThrown;
+        failureFromFinish: typeof failureFromFinish;
+        isAsyncIterable: typeof isAsyncIterable;
+        ReviewerRoutesError: typeof ReviewerRoutesError;
+        ReviewerRouteError: typeof ReviewerRouteError;
+    };
+    ReviewerRoutesError: typeof ReviewerRoutesError;
+    ReviewerRouteError: typeof ReviewerRouteError;
     /** Saved-route probe helpers exported by `./route-test.js` for Host tests. */
     routeTest: {
         ROUTE_TEST_TIMEOUT_MS: number;
@@ -179,12 +242,12 @@ export declare const __testing: {
         markRouteTestStarted: typeof import("./route-test.js").markRouteTestStarted;
         classifyRouteTestFailure: typeof import("./route-test.js").classifyRouteTestFailure;
         classifyRouteTestProvider: typeof import("./route-test.js").classifyRouteTestProvider;
-        normalizeFailureCode: typeof import("./route-test.js").normalizeFailureCode;
-        readThrownFailure: typeof import("./route-test.js").readThrownFailure;
-        readFinishFailure: typeof import("./route-test.js").readFinishFailure;
+        normalizeFailureCode: typeof import("./failure.js").normalizeFailureCode;
+        readThrownFailure: typeof readThrownFailure;
+        readFinishFailure: typeof import("./failure.js").readFinishFailure;
         buildRouteTestRequest: typeof import("./route-test.js").buildRouteTestRequest;
+        normalizeRouteTestInput: typeof import("./route-test.js").normalizeRouteTestInput;
         routeTestStatusOf: typeof import("./route-test.js").routeTestStatusOf;
         installRouteTestEndpoint: typeof installRouteTestEndpoint;
     };
 };
-export {};

@@ -34,7 +34,7 @@ import type {
   RouteTestProviderLike,
 } from '../src/route-test.js';
 import { createResultSchema } from '../src/typert.contract.js';
-import type { ReviewRouteTestResult } from '../src/typert.contract.js';
+import type { ReviewRouteTestInput, ReviewRouteTestResult } from '../src/typert.contract.js';
 import type { ReviewerConfig } from '../src/policy.js';
 
 /** One fake stream chunk; the shape is intentionally loose like real wire chunks. */
@@ -56,6 +56,7 @@ type StreamFactory = (options?: RouteTestGenerateOptions) => AsyncIterable<TestC
 /** Mutable reviewer settings the live config refs read. */
 interface ReviewerState {
   enabled: boolean;
+  primaryEnabled: boolean;
   provider: string;
   model: string;
   reasoningEffort: string;
@@ -80,12 +81,15 @@ interface Harness {
   resolveCalls: Array<{ provider: string; model: string; signal?: AbortSignal }>;
   endpoint: TestRouteEndpoint;
   advance(ms: number): void;
-  invoke(options?: { signal?: AbortSignal; extraArgs?: unknown[] }): Promise<ReviewRouteTestResult>;
+  invoke(options?: { signal?: AbortSignal; input?: unknown }): Promise<ReviewRouteTestResult>;
 }
 
 /** The published endpoint shape as the Remote carrier calls it. */
 interface TestRouteEndpoint {
-  testReviewRoute(signal?: AbortSignal): Promise<ReviewRouteTestResult>;
+  testReviewRoute(
+    input?: ReviewRouteTestInput,
+    signal?: AbortSignal,
+  ): Promise<ReviewRouteTestResult>;
 }
 
 /** Strict codec the Gateway and Client mount validate results with. */
@@ -394,6 +398,7 @@ function llmError(
 function createReviewerConfig(state: ReviewerState): ReviewerConfig {
   return {
     enabled: { get: () => state.enabled },
+    primaryEnabled: { get: () => state.primaryEnabled },
     provider: { get: () => state.provider },
     model: { get: () => state.model },
     reasoningEffort: { get: () => state.reasoningEffort },
@@ -409,6 +414,7 @@ function createReviewerConfig(state: ReviewerState): ReviewerConfig {
 function createHarness(options: HarnessOptions = {}): Harness {
   const state: ReviewerState = {
     enabled: true,
+    primaryEnabled: true,
     provider: 'deepseek-account',
     model: 'deepseek-flash',
     reasoningEffort: '',
@@ -471,13 +477,10 @@ function createHarness(options: HarnessOptions = {}): Harness {
       clock += ms;
     },
     invoke(invokeOptions = {}): Promise<ReviewRouteTestResult> {
-      const method = endpoint.testReviewRoute as unknown as (
-        signal?: AbortSignal,
-        ...rest: unknown[]
-      ) => Promise<ReviewRouteTestResult>;
-      return invokeOptions.extraArgs === undefined
-        ? method.call(endpoint, invokeOptions.signal)
-        : method.call(endpoint, invokeOptions.signal, ...invokeOptions.extraArgs);
+      return endpoint.testReviewRoute(
+        invokeOptions.input as ReviewRouteTestInput | undefined,
+        invokeOptions.signal,
+      );
     },
   };
 }
@@ -573,6 +576,7 @@ test('probe reads the saved route live and never mutates settings', async () => 
   assert.equal(harness.state.model, 'second-model');
   assert.equal(JSON.stringify(harness.state), JSON.stringify({
     enabled: true,
+    primaryEnabled: true,
     provider: 'second-provider',
     model: 'second-model',
     reasoningEffort: 'max',
@@ -1037,10 +1041,12 @@ test('the Host rate limit enforces the minimum interval and the window budget', 
   assert.equal(harness.streamCalls.length, 4, 'only admitted probes reach the provider');
 });
 
-test('ROUTE_DISABLED and ROUTE_INCOMPLETE are blocked before any provider call', async () => {
+test('the deprecated enabled=false is ignored and ROUTE_INCOMPLETE stays blocked', async () => {
+  // The plugin is always active now, so a saved enabled:false must not block
+  // the row-1 probe.
   const disabled = createHarness({ config: { enabled: false } });
-  assertResultCode(await disabled.invoke(), 'ROUTE_DISABLED', 'blocked');
-  assert.equal(disabled.streamCalls.length, 0);
+  assertResultCode(await disabled.invoke(), 'OK', 'ok');
+  assert.equal(disabled.streamCalls.length, 1);
 
   const incompleteProvider = createHarness({ config: { provider: '' } });
   assertResultCode(await incompleteProvider.invoke(), 'ROUTE_INCOMPLETE', 'blocked');
@@ -1049,6 +1055,15 @@ test('ROUTE_DISABLED and ROUTE_INCOMPLETE are blocked before any provider call',
   const incompleteModel = createHarness({ config: { model: '' } });
   assertResultCode(await incompleteModel.invoke(), 'ROUTE_INCOMPLETE', 'blocked');
   assert.equal(incompleteModel.streamCalls.length, 0);
+
+  // An explicit input naming only one half is incomplete too.
+  const explicitIncomplete = createHarness();
+  assertResultCode(
+    await explicitIncomplete.invoke({ input: { provider: 'deepseek-account', model: '' } }),
+    'ROUTE_INCOMPLETE',
+    'blocked',
+  );
+  assert.equal(explicitIncomplete.streamCalls.length, 0);
 });
 
 test('a premature stream end is reported as a connection failure', async () => {
@@ -1343,21 +1358,119 @@ test('a terminal stream without return() still releases the slot', async () => {
   assert.equal(endedCalls, 2, 'a natural step.done must not lock the slot');
 });
 
-test('the endpoint probes the SAVED route even when a caller injects arguments', async () => {
-  const harness = createHarness();
-  // A malicious page can only call the Remote method; extra positional values
-  // must be ignored rather than used as a route or credential.
+test('an omitted or empty input still probes the saved row 1', async () => {
+  for (const input of [undefined, {}, { provider: '', model: '' }, { reasoningEffort: 'high' }]) {
+    const harness = createHarness();
+    const result = await harness.invoke({ input });
+    assertResultCode(result, 'OK', 'ok');
+    assert.equal(harness.streamCalls[0]!.provider, 'deepseek-account');
+    assert.equal(harness.streamCalls[0]!.model, 'deepseek-flash');
+    assert.equal(result.route.provider, 'deepseek-account');
+    assert.equal(result.route.model, 'deepseek-flash');
+  }
+});
+
+test('an explicit route input probes exactly that route and validates it', async () => {
+  const harness = createHarness({
+    directory: [DEEPSEEK_ACCOUNT_OFFICIAL_ENTRY, DEEPSEEK_API_KEY_OFFICIAL_ENTRY],
+    modelInfo: () => ({ reasoning: { efforts: [{ id: 'low' }, { id: 'high' }] } }),
+  });
   const result = await harness.invoke({
-    extraArgs: [{ provider: 'evil-provider', model: 'evil-model', apiKey: 'sk-evil-credential' }],
+    input: { provider: 'deepseek-official', model: 'deepseek-chat', reasoningEffort: 'high' },
   });
   assertResultCode(result, 'OK', 'ok');
-  assert.equal(harness.streamCalls[0]!.provider, 'deepseek-account');
-  assert.equal(harness.streamCalls[0]!.model, 'deepseek-flash');
-  assert.equal(result.route.provider, 'deepseek-account');
-  const wire = JSON.stringify(result);
-  assert.ok(!wire.includes('evil-provider'));
-  assert.ok(!wire.includes('sk-evil-credential'));
-  assert.ok(!Object.hasOwn(harness.streamCalls[0]!, 'apiKey'));
+  assert.deepEqual(result.route, {
+    provider: 'deepseek-official',
+    model: 'deepseek-chat',
+    reasoningEffort: 'high',
+  });
+  assert.equal(result.effortUsed, 'high');
+  assert.equal(harness.streamCalls.length, 1);
+  const request = harness.streamCalls[0]!;
+  assert.equal(request.provider, 'deepseek-official');
+  assert.equal(request.model, 'deepseek-chat');
+  assert.equal(request.reasoningEffort, 'high');
+  for (const forbidden of ['sessionId', 'purpose', 'tools', 'toolHistory', 'history', 'apiKey']) {
+    assert.ok(!(forbidden in request), `explicit-route probe must not carry ${forbidden}`);
+  }
+  assert.equal(result.authKind, 'api-key', 'the explicit provider is classified from the directory');
+});
+
+test('an explicit route naming an unknown provider is refused without a provider call', async () => {
+  const harness = createHarness();
+  const result = await harness.invoke({
+    input: { provider: 'evil-provider', model: 'evil-model', apiKey: 'sk-evil-credential' } as never,
+  });
+  assertResultCode(result, 'NO_ADAPTER', 'error');
+  assert.equal(result.failureCode, 'NO_ADAPTER');
+  assert.equal(harness.streamCalls.length, 0);
+  assert.equal(harness.resolveCalls.length, 0);
+  // The probed route ids are returned as data (never as prose), and the
+  // injected credential is not part of the contract.
+  assert.ok(!JSON.stringify(result).includes('sk-evil-credential'));
+  assert.equal('apiKey' in result.route, false);
+});
+
+test('an explicit route whose model cannot be resolved is classified, not streamed', async () => {
+  const unknownModel = createHarness({ modelInfo: () => undefined });
+  const unknown = await unknownModel.invoke({
+    input: { provider: 'deepseek-account', model: 'missing-model' },
+  });
+  assertResultCode(unknown, 'UNKNOWN_MODEL', 'error');
+  assert.equal(unknownModel.streamCalls.length, 0);
+  assert.equal(unknownModel.resolveCalls.length, 1);
+
+  const thrown = createHarness({ modelInfo: () => { throw llmError('MODEL_UNSUPPORTED'); } });
+  const unsupported = await thrown.invoke({
+    input: { provider: 'deepseek-account', model: 'bad-model' },
+  });
+  assertResultCode(unsupported, 'UNKNOWN_MODEL', 'error');
+  assert.equal(thrown.streamCalls.length, 0);
+});
+
+test('an inherit effort is probed as the provider default without failing', async () => {
+  const harness = createHarness({
+    modelInfo: () => ({ reasoning: { efforts: [{ id: 'high' }] } }),
+  });
+  const result = await harness.invoke({
+    input: { provider: 'deepseek-account', model: 'deepseek-flash', reasoningEffort: 'inherit' },
+  });
+  assertResultCode(result, 'OK', 'ok');
+  assert.equal(result.effortUsed, '');
+  assert.equal(result.effortNotAdvertised, false);
+  assert.equal('reasoningEffort' in harness.streamCalls[0]!, false);
+  assert.equal(result.route.reasoningEffort, '', 'the probe never claims to resolve the session effort');
+});
+
+test('an explicit unadvertised effort is omitted, never adapted', async () => {
+  const harness = createHarness({
+    modelInfo: () => ({ reasoning: { efforts: [{ id: 'max' }] } }),
+  });
+  const result = await harness.invoke({
+    input: { provider: 'deepseek-account', model: 'deepseek-flash', reasoningEffort: 'xhigh' },
+  });
+  assertResultCode(result, 'OK', 'ok');
+  assert.equal(result.effortUsed, '');
+  assert.equal(result.effortNotAdvertised, true);
+  assert.equal('reasoningEffort' in harness.streamCalls[0]!, false);
+});
+
+test('extra or non-string input fields never become a route or credential', () => {
+  const normalized = __testing.normalizeRouteTestInput({
+    provider: ' deepseek-account ',
+    model: ' deepseek-flash ',
+    reasoningEffort: ' inherit ',
+    apiKey: 'sk-evil-credential',
+    signal: {},
+  });
+  assert.deepEqual(normalized, {
+    provider: 'deepseek-account',
+    model: 'deepseek-flash',
+    reasoningEffort: '',
+  });
+  assert.equal(__testing.normalizeRouteTestInput(undefined), undefined);
+  assert.equal(__testing.normalizeRouteTestInput({ provider: '', model: '' }), undefined);
+  assert.equal(normalized !== undefined && 'apiKey' in normalized, false);
 });
 
 test('latencyMs is a bounded wall-clock measurement of the probe attempt', async () => {

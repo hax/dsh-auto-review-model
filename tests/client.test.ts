@@ -88,11 +88,29 @@ try {
   importError = error as Error;
 }
 
-interface ReviewerSettings {
+/** One explicit route saved in the `fallbacks` array. */
+interface FallbackEntry {
+  mode: 'route';
   enabled: boolean;
   provider: string;
   model: string;
   reasoningEffort: string;
+}
+
+/** One editable row of the ordered review-route list. */
+interface ReviewRoute {
+  enabled: boolean;
+  provider: string;
+  model: string;
+  reasoningEffort: string;
+}
+
+interface ReviewerSettings {
+  primaryEnabled: boolean;
+  provider: string;
+  model: string;
+  reasoningEffort: string;
+  fallbacks?: FallbackEntry[];
 }
 
 interface EffortInfo {
@@ -150,21 +168,26 @@ interface ClientTesting {
   providerGroups(catalog: unknown): ProviderGroup[];
   modelsFor(groups: unknown, provider: unknown): ModelInfo[];
   effortsFor(model: unknown): EffortInfo[];
-  draftAfterProvider(draft: unknown, provider: unknown): ReviewerSettings;
-  draftAfterModel(draft: unknown, modelId: unknown, groups: unknown): ReviewerSettings;
   reconcileDraft(value: unknown, groups?: unknown): ReviewerSettings;
+  MAX_ROUTES: number;
+  INHERIT_EFFORT: string;
+  isLegacySessionEntry(raw: unknown): boolean;
+  normalizeRoute(raw: unknown): ReviewRoute;
+  normalizeRoutes(raw: unknown): ReviewRoute[];
+  storedFallback(route: unknown): FallbackEntry;
+  rowsFromSettings(raw: unknown): ReviewRoute[];
+  settingsFromRows(rows: unknown): ReviewerSettings;
+  routesEqual(left: unknown, right: unknown): boolean;
+  routeAfterProvider(route: unknown, provider: unknown): ReviewRoute;
+  routeAfterModel(route: unknown, modelId: unknown, groups: unknown): ReviewRoute;
+  replaceRoute(list: unknown, index: number, next: unknown): ReviewRoute[];
+  addRoute(list: unknown): ReviewRoute[];
+  removeRoute(list: unknown, index: number): ReviewRoute[];
+  moveRoute(list: unknown, index: number, delta: number): ReviewRoute[];
   summaryLine(draft: ReviewerSettings, loading: boolean, t: (key: string) => string): string;
   loadReviewerSettings(remote: unknown, ns: string): Promise<LoadResult>;
   saveReviewerSettings(remote: unknown, ns: string, draft: unknown, revision?: number): Promise<RemoteResponse>;
   formatText(template: string, values: Record<string, string>): string;
-  savedRouteText(saved: ReviewerSettings, t: (key: string) => string): string;
-  savedRouteHintText(
-    saved: ReviewerSettings,
-    dirty: boolean,
-    available: boolean,
-    loaded: boolean,
-    t: (key: string) => string,
-  ): string;
   delayText(milliseconds: number, fallbackSeconds: number, t: (key: string) => string): string;
   mapTestResult(result: unknown, t: (key: string) => string): TestOutcome;
   mapTestTransportFailure(error: unknown, t: (key: string) => string): TestOutcome;
@@ -273,15 +296,24 @@ test('exports the plugin surface expected by the client loader', () => {
     'namespaceSection',
     'modelsFor',
     'effortsFor',
-    'draftAfterProvider',
-    'draftAfterModel',
+    'isLegacySessionEntry',
+    'normalizeRoute',
+    'normalizeRoutes',
+    'storedFallback',
+    'rowsFromSettings',
+    'settingsFromRows',
+    'routesEqual',
+    'routeAfterProvider',
+    'routeAfterModel',
+    'replaceRoute',
+    'addRoute',
+    'removeRoute',
+    'moveRoute',
     'reconcileDraft',
     'summaryLine',
     'loadReviewerSettings',
     'saveReviewerSettings',
     'formatText',
-    'savedRouteText',
-    'savedRouteHintText',
     'delayText',
     'mapTestResult',
     'mapTestTransportFailure',
@@ -502,9 +534,14 @@ test('apply mounts the ./remote contribution and registers the configuration pag
   const zhKeys = Object.keys(dicts.zh).sort();
   const enKeys = Object.keys(dicts.en).sort();
   assert.deepEqual(zhKeys, enKeys, 'zh and en dictionary keys must be identical');
+  assert.equal(zhKeys.includes('enabled'), false, 'the master-enable copy must be removed');
+  assert.equal(zhKeys.includes('enabledDesc'), false, 'the master-enable copy must be removed');
   assert.equal(zhKeys.includes('summaryModelFallback'), false, 'dead key summaryModelFallback must be removed');
+  assert.equal(zhKeys.includes('sessionRowTitle'), false, 'the fixed session row copy must be removed');
   assert.ok(zhKeys.includes('unverified'), 'unverified key must exist');
   assert.ok(zhKeys.includes('notAdvertised'), 'notAdvertised key must exist');
+  assert.ok(zhKeys.includes('effortInherit'), 'the inherit effort option must be localized');
+  assert.ok(zhKeys.includes('routeEnabled'), 'the per-row enable copy must be localized');
 
   // Resource cleanup: UI first, then the mounted Remote namespace.
   assert.equal(typeof dispose, 'function');
@@ -523,41 +560,6 @@ test('apply keeps the settings body usable when the endpoint cannot mount', asyn
   assert.equal(typeof dispose, 'function', 'apply still returns a disposer');
   await (dispose as () => Promise<void>)();
   assert.ok(!harness.events.includes('unmount'), 'nothing is unmounted when the mount failed');
-});
-
-test('savedRouteText names the saved route instead of the draft', () => {
-  const { savedRouteText } = testing();
-  const t = (key: string) => `[${key}]`;
-  assert.equal(
-    savedRouteText({ enabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: '' }, t),
-    'provider-a / model-a1',
-  );
-  assert.equal(
-    savedRouteText({ enabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' }, t),
-    'provider-a / model-a1 · high',
-  );
-  assert.equal(
-    savedRouteText({ enabled: false, provider: 'provider-a', model: 'model-a1', reasoningEffort: '' }, t),
-    '[testRouteDisabled]',
-  );
-  assert.equal(
-    savedRouteText({ enabled: true, provider: 'provider-a', model: '', reasoningEffort: '' }, t),
-    '[testRouteIncomplete]',
-  );
-});
-
-test('savedRouteHintText always states that the saved route is tested', () => {
-  const { savedRouteHintText } = testing();
-  const t = (key: string) => (key === 'testHint' ? 'the saved route {route}' : `[${key}]`);
-  const saved = { enabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' };
-  assert.equal(
-    savedRouteHintText(saved, false, true, true, t),
-    'the saved route provider-a / model-a1 · high',
-  );
-  const dirty = savedRouteHintText(saved, true, true, true, t);
-  assert.ok(dirty.includes('[testHintDirty]'), 'a dirty draft must say it is not tested');
-  assert.equal(savedRouteHintText(saved, false, false, true, t), '[testUnavailableHint]');
-  assert.equal(savedRouteHintText(saved, false, true, false, t), '[testLoadingHint]');
 });
 
 test('formatText interpolates route facts and leaves unknown placeholders alone', () => {
@@ -710,9 +712,9 @@ test('client retry delay text is locale-driven', () => {
   assert.equal(delayText(500, 30, t), '1s');
 });
 
-test('normalizeSettings supplies the four defaults for missing input', () => {
+test('normalizeSettings supplies the route defaults and ignores the deprecated enabled knob', () => {
   const expected: ReviewerSettings = {
-    enabled: true,
+    primaryEnabled: true,
     provider: '',
     model: '',
     reasoningEffort: '',
@@ -720,18 +722,28 @@ test('normalizeSettings supplies the four defaults for missing input', () => {
   assert.deepEqual(testing().normalizeSettings(), expected);
   assert.deepEqual(testing().normalizeSettings(undefined), expected);
   assert.deepEqual(testing().normalizeSettings(null), expected);
+  const withDeprecated = testing().normalizeSettings({
+    enabled: false,
+    primaryEnabled: true,
+    provider: 'p',
+    model: 'm',
+    reasoningEffort: '',
+  });
+  assert.equal(Object.hasOwn(withDeprecated, 'enabled'), false, 'the deprecated knob is never loaded');
+  assert.equal(withDeprecated.primaryEnabled, true);
 });
 
-test('normalizeSettings trims strings and honors an explicit disabled flag', () => {
+test('normalizeSettings trims strings and honors explicit enable flags', () => {
   assert.deepEqual(
     testing().normalizeSettings({
       enabled: false,
+      primaryEnabled: false,
       provider: '  provider-a  ',
       model: '  model-a1  ',
       reasoningEffort: '  high  ',
     }),
     {
-      enabled: false,
+      primaryEnabled: false,
       provider: 'provider-a',
       model: 'model-a1',
       reasoningEffort: 'high',
@@ -742,17 +754,18 @@ test('normalizeSettings trims strings and honors an explicit disabled flag', () 
 test('normalizeSettings tolerates dirty field values without throwing', () => {
   const normalized = testing().normalizeSettings({
     enabled: 'not-a-boolean',
+    primaryEnabled: 'not-a-boolean',
     provider: 42,
     model: { unexpected: true },
     reasoningEffort: false,
   });
   assert.deepEqual(Object.keys(normalized).sort(), [
-    'enabled',
     'model',
+    'primaryEnabled',
     'provider',
     'reasoningEffort',
   ]);
-  assert.equal(typeof normalized.enabled, 'boolean');
+  assert.equal(typeof normalized.primaryEnabled, 'boolean');
   assert.equal(typeof normalized.provider, 'string');
   assert.equal(typeof normalized.model, 'string');
   assert.equal(typeof normalized.reasoningEffort, 'string');
@@ -761,11 +774,10 @@ test('normalizeSettings tolerates dirty field values without throwing', () => {
 test('namespaceSection unwraps namespace view and leaves regular sections intact', () => {
   const { namespaceSection } = testing();
 
-  // Namespace view object { ns, value, revision } -> extracts value
   const view = {
     ns: 'auto-review-model',
     value: {
-      enabled: false,
+      primaryEnabled: false,
       provider: 'prov-1',
       model: 'mod-1',
       reasoningEffort: 'low',
@@ -774,14 +786,11 @@ test('namespaceSection unwraps namespace view and leaves regular sections intact
   };
   assert.deepEqual(namespaceSection(view), view.value);
 
-  // View with primitive value
   assert.equal(namespaceSection({ ns: 'test', value: 'hello', revision: 1 }), 'hello');
 
-  // Plain section object without ns -> returns as-is
-  const plain = { enabled: true, provider: 'prov-2' };
+  const plain = { primaryEnabled: true, provider: 'prov-2' };
   assert.equal(namespaceSection(plain), plain);
 
-  // Primitive inputs -> returns as-is
   assert.equal(namespaceSection(null), null);
   assert.equal(namespaceSection(undefined), undefined);
   assert.equal(namespaceSection('string-val'), 'string-val');
@@ -789,32 +798,28 @@ test('namespaceSection unwraps namespace view and leaves regular sections intact
   assert.equal(namespaceSection(false), false);
 });
 
-test('reconcileDraft retains provider, model, and reasoningEffort when catalog is empty or missing', () => {
+test('reconcileDraft retains provider, model, effort and enable flags when catalog is empty or missing', () => {
   const { reconcileDraft } = testing();
   const savedSettings: ReviewerSettings = {
-    enabled: true,
+    primaryEnabled: true,
     provider: 'provider-custom',
     model: 'model-custom',
     reasoningEffort: 'high',
   };
 
-  // With empty catalog groups
   assert.deepEqual(reconcileDraft(savedSettings, []), savedSettings);
-
-  // With undefined / null groups
   assert.deepEqual(reconcileDraft(savedSettings, undefined), savedSettings);
   assert.deepEqual(reconcileDraft(savedSettings, null), savedSettings);
 
-  // Normalizes whitespace in fields without dropping any field
   assert.deepEqual(
     reconcileDraft({
-      enabled: false,
+      primaryEnabled: false,
       provider: '  prov  ',
       model: '  mod  ',
       reasoningEffort: '  med  ',
     }, []),
     {
-      enabled: false,
+      primaryEnabled: false,
       provider: 'prov',
       model: 'mod',
       reasoningEffort: 'med',
@@ -855,91 +860,76 @@ test('effortsFor normalizes advertised reasoning efforts to id/name entries', ()
   assert.deepEqual(testing().effortsFor({ reasoning: { efforts: [] } }), []);
 });
 
-test('draftAfterProvider clears model and effort on switch, but is a no-op when selecting current provider', () => {
-  const draft: ReviewerSettings = {
-    enabled: false,
-    provider: 'provider-a',
-    model: 'model-a1',
-    reasoningEffort: 'high',
-  };
-  // Switching provider clears model and effort
-  assert.deepEqual(testing().draftAfterProvider(draft, 'provider-b'), {
-    enabled: false,
+test('routeAfterProvider clears model and effort on switch, but is a no-op when selecting the current provider', () => {
+  const route: ReviewRoute = { enabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' };
+  assert.deepEqual(testing().routeAfterProvider(route, 'provider-b'), {
+    enabled: true,
     provider: 'provider-b',
     model: '',
     reasoningEffort: '',
   });
-  assert.deepEqual(testing().draftAfterProvider(draft, ''), {
-    enabled: false,
+  assert.deepEqual(testing().routeAfterProvider(route, ''), {
+    enabled: true,
     provider: '',
     model: '',
     reasoningEffort: '',
   });
-  // Re-selecting the same provider is a no-op and preserves model and effort
-  assert.deepEqual(testing().draftAfterProvider(draft, 'provider-a'), draft);
-  assert.deepEqual(testing().draftAfterProvider(draft, '  provider-a  '), draft);
-
-  // Original draft remains intact
-  assert.deepEqual(draft, {
-    enabled: false,
-    provider: 'provider-a',
-    model: 'model-a1',
-    reasoningEffort: 'high',
-  });
-});
-
-test('draftAfterModel drops effort when switching model, but is a no-op when selecting current model', () => {
-  const draft: ReviewerSettings = {
+  assert.deepEqual(testing().routeAfterProvider(route, 'provider-a'), route);
+  assert.deepEqual(testing().routeAfterProvider(route, '  provider-a  '), route);
+  assert.deepEqual(
+    testing().routeAfterProvider({ ...route, reasoningEffort: 'inherit' }, 'provider-b'),
+    { enabled: true, provider: 'provider-b', model: '', reasoningEffort: 'inherit' },
+    'the route-independent inherit sentinel survives a provider change',
+  );
+  assert.deepEqual(route, {
     enabled: true,
     provider: 'provider-a',
     model: 'model-a1',
     reasoningEffort: 'high',
-  };
-  // Switching to model without high drops reasoningEffort
-  assert.deepEqual(testing().draftAfterModel(draft, 'model-a2', GROUPS), {
+  }, 'the input row must stay untouched');
+});
+
+test('routeAfterModel drops effort when switching model, but is a no-op when selecting the current model', () => {
+  const route: ReviewRoute = { enabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' };
+  assert.deepEqual(testing().routeAfterModel(route, 'model-a2', GROUPS), {
     enabled: true,
     provider: 'provider-a',
     model: 'model-a2',
     reasoningEffort: '',
   });
-  assert.deepEqual(testing().draftAfterModel(draft, 'model-a3', GROUPS), {
+  assert.deepEqual(testing().routeAfterModel(route, 'model-a3', GROUPS), {
     enabled: true,
     provider: 'provider-a',
     model: 'model-a3',
     reasoningEffort: '',
   });
-  // Re-selecting the same model preserves existing draft even if not in catalog
-  assert.deepEqual(testing().draftAfterModel(draft, 'model-a1', GROUPS), draft);
-  assert.deepEqual(testing().draftAfterModel(draft, '  model-a1  ', GROUPS), draft);
+  assert.deepEqual(testing().routeAfterModel(route, 'model-a1', GROUPS), route);
+  assert.deepEqual(testing().routeAfterModel(route, '  model-a1  ', GROUPS), route);
 
-  const unknownDraft: ReviewerSettings = {
-    enabled: true,
-    provider: 'provider-a',
-    model: 'model-unknown-not-in-catalog',
-    reasoningEffort: 'high',
-  };
+  const unknown: ReviewRoute = { enabled: true, provider: 'provider-a', model: 'model-unknown-not-in-catalog', reasoningEffort: 'high' };
   assert.deepEqual(
-    testing().draftAfterModel(unknownDraft, 'model-unknown-not-in-catalog', GROUPS),
-    unknownDraft,
-    're-selecting current unknown model must not clear reasoningEffort',
+    testing().routeAfterModel(unknown, 'model-unknown-not-in-catalog', GROUPS),
+    unknown,
+    're-selecting the current unknown model must not clear reasoningEffort',
   );
-
   assert.deepEqual(
-    testing().draftAfterModel({ ...draft, reasoningEffort: '' }, 'model-a2', GROUPS),
-    { ...draft, model: 'model-a2', reasoningEffort: '' },
+    testing().routeAfterModel({ ...route, reasoningEffort: '' }, 'model-a2', GROUPS),
+    { ...route, model: 'model-a2', reasoningEffort: '' },
+  );
+  assert.deepEqual(
+    testing().routeAfterModel({ ...route, reasoningEffort: 'inherit' }, 'model-a2', GROUPS),
+    { ...route, model: 'model-a2', reasoningEffort: 'inherit' },
+    'the inherit sentinel survives a model change',
   );
 });
 
 test('loadReviewerSettings reads settings and the model catalog', async () => {
   let describeCalls = 0;
   let catalogCalls = 0;
-  let describeArgs: unknown[] | null = null;
-  let catalogArgs: unknown[] | null = null;
   const remote = {
     settings: {
-      describe: async (...args: unknown[]) => {
+      describe: async () => {
         describeCalls += 1;
-        describeArgs = args;
         return {
           ok: true,
           value: {
@@ -949,6 +939,7 @@ test('loadReviewerSettings reads settings and the model catalog', async () => {
                 ns: SETTINGS_NS,
                 value: {
                   enabled: false,
+                  primaryEnabled: false,
                   provider: 'provider-a',
                   model: 'model-a1',
                   reasoningEffort: 'high',
@@ -964,9 +955,8 @@ test('loadReviewerSettings reads settings and the model catalog', async () => {
       },
     },
     session: {
-      modelCatalog: async (...args: unknown[]) => {
+      modelCatalog: async () => {
         catalogCalls += 1;
-        catalogArgs = args;
         return { ok: true, value: { groups: GROUPS } };
       },
     },
@@ -976,53 +966,38 @@ test('loadReviewerSettings reads settings and the model catalog', async () => {
   assert.equal(loaded.ok, true);
   if (!loaded.ok) return;
   assert.deepEqual(loaded.value, {
-    enabled: false,
+    primaryEnabled: false,
     provider: 'provider-a',
     model: 'model-a1',
     reasoningEffort: 'high',
-  });
+  }, 'the deprecated enabled knob is not loaded');
   assert.equal(loaded.revision, 11);
   assert.deepEqual(loaded.groups, GROUPS);
   assert.equal(loaded.catalogError, '');
   assert.equal(describeCalls, 1);
   assert.equal(catalogCalls, 1);
-  assert.deepEqual(describeArgs, [], 'settings.describe takes no arguments');
-  assert.deepEqual(catalogArgs, [], 'session.modelCatalog takes no arguments');
 });
 
 test('loadReviewerSettings returns ok:true with empty groups and catalogError when modelCatalog fails or throws', async () => {
   const expectedSettings: ReviewerSettings = {
-    enabled: true,
+    primaryEnabled: true,
     provider: 'provider-saved',
     model: 'model-saved',
     reasoningEffort: 'low',
   };
 
-  // Case 1: session.modelCatalog returns ok: false
   const remoteCatalogFailed = {
     settings: {
       describe: async () => ({
         ok: true,
-        value: {
-          namespaces: [
-            {
-              ns: SETTINGS_NS,
-              value: expectedSettings,
-              revision: 20,
-            },
-          ],
-        },
+        value: { namespaces: [{ ns: SETTINGS_NS, value: expectedSettings, revision: 20 }] },
       }),
       replace: async () => ({ ok: true }),
     },
     session: {
-      modelCatalog: async () => ({
-        ok: false,
-        error: { message: 'catalog service timeout' },
-      }),
+      modelCatalog: async () => ({ ok: false, error: { message: 'catalog service timeout' } }),
     },
   };
-
   const res1 = await testing().loadReviewerSettings(remoteCatalogFailed, SETTINGS_NS);
   assert.equal(res1.ok, true);
   if (res1.ok) {
@@ -1032,20 +1007,11 @@ test('loadReviewerSettings returns ok:true with empty groups and catalogError wh
     assert.match(res1.catalogError, /catalog service timeout/);
   }
 
-  // Case 2: session.modelCatalog throws an exception
   const remoteCatalogThrows = {
     settings: {
       describe: async () => ({
         ok: true,
-        value: {
-          namespaces: [
-            {
-              ns: SETTINGS_NS,
-              value: expectedSettings,
-              revision: 21,
-            },
-          ],
-        },
+        value: { namespaces: [{ ns: SETTINGS_NS, value: expectedSettings, revision: 21 }] },
       }),
       replace: async () => ({ ok: true }),
     },
@@ -1055,7 +1021,6 @@ test('loadReviewerSettings returns ok:true with empty groups and catalogError wh
       },
     },
   };
-
   const res2 = await testing().loadReviewerSettings(remoteCatalogThrows, SETTINGS_NS);
   assert.equal(res2.ok, true);
   if (res2.ok) {
@@ -1073,9 +1038,7 @@ test('loadReviewerSettings reports settings RPC failures as { ok: false, error }
         describe: async () => ({ ok: false, error: { message: 'settings unavailable' } }),
         replace: async () => ({ ok: true }),
       },
-      session: {
-        modelCatalog: async () => ({ ok: true, value: { groups: [] } }),
-      },
+      session: { modelCatalog: async () => ({ ok: true, value: { groups: [] } }) },
     },
     SETTINGS_NS,
   );
@@ -1090,9 +1053,7 @@ test('loadReviewerSettings reports settings RPC failures as { ok: false, error }
         },
         replace: async () => ({ ok: true }),
       },
-      session: {
-        modelCatalog: async () => ({ ok: true, value: { groups: [] } }),
-      },
+      session: { modelCatalog: async () => ({ ok: true, value: { groups: [] } }) },
     },
     SETTINGS_NS,
   );
@@ -1100,82 +1061,404 @@ test('loadReviewerSettings reports settings RPC failures as { ok: false, error }
   assert.ok((thrown as LoadResultErr).error, 'a thrown load must carry an error');
 });
 
-test('summaryLine correctly reflects enabled, loading, and incomplete routes', () => {
+test('summaryLine reflects loading, enabled rows and the implicit session fallback', () => {
   const { summaryLine } = testing();
   const t = (key: string) => `[${key}]`;
 
-  // Loading
   assert.equal(
-    summaryLine({ enabled: true, provider: 'p1', model: 'm1', reasoningEffort: '' }, true, t),
+    summaryLine({ primaryEnabled: true, provider: 'p1', model: 'm1', reasoningEffort: '' }, true, t),
     '[summaryLabel]: [summaryLoading]',
   );
-
-  // Disabled
   assert.equal(
-    summaryLine({ enabled: false, provider: 'p1', model: 'm1', reasoningEffort: 'high' }, false, t),
-    '[summaryLabel]: [summaryOff]',
+    summaryLine({ primaryEnabled: true, provider: '', model: '', reasoningEffort: '' }, false, t),
+    '[summaryLabel]: [summarySession]',
   );
-
-  // Inherit session model when provider is empty
   assert.equal(
-    summaryLine({ enabled: true, provider: '', model: '', reasoningEffort: '' }, false, t),
-    '[summaryLabel]: [summaryInherit]',
+    summaryLine({ primaryEnabled: false, provider: 'p1', model: 'm1', reasoningEffort: 'high' }, false, t),
+    '[summaryLabel]: [summarySession]',
+    'a disabled row is not summarized as the active route',
   );
-
-  // Incomplete route: provider set but model empty -> must inherit session model
   assert.equal(
-    summaryLine({ enabled: true, provider: 'p1', model: '', reasoningEffort: '' }, false, t),
-    '[summaryLabel]: [summaryInherit]',
+    summaryLine({ primaryEnabled: true, provider: 'p1', model: '', reasoningEffort: '' }, false, t),
+    '[summaryLabel]: [summarySession]',
   );
-
-  // Complete route without reasoning effort
   assert.equal(
-    summaryLine({ enabled: true, provider: 'p1', model: 'm1', reasoningEffort: '' }, false, t),
+    summaryLine({ primaryEnabled: true, provider: 'p1', model: 'm1', reasoningEffort: '' }, false, t),
     '[summaryLabel]: p1 / m1',
   );
-
-  // Complete route with reasoning effort
   assert.equal(
-    summaryLine({ enabled: true, provider: 'p1', model: 'm1', reasoningEffort: 'high' }, false, t),
+    summaryLine({ primaryEnabled: true, provider: 'p1', model: 'm1', reasoningEffort: 'high' }, false, t),
     '[summaryLabel]: p1 / m1 · high',
+  );
+  assert.equal(
+    summaryLine({ primaryEnabled: true, provider: 'p1', model: 'm1', reasoningEffort: 'inherit' }, false, t),
+    '[summaryLabel]: p1 / m1 · inherit',
   );
 });
 
-test('saveReviewerSettings writes exactly the four fields with the revision', async () => {
-  let replaceCalls = 0;
+test('saveReviewerSettings writes row 1 with primaryEnabled and no deprecated enabled field', async () => {
   let replaceArgs: unknown[] | null = null;
-  const response: RemoteResponse = { ok: true, revision: 12 };
   const remote = {
     settings: {
       describe: async () => ({ ok: true, value: { namespaces: [] } }),
       replace: async (...args: unknown[]) => {
-        replaceCalls += 1;
         replaceArgs = args;
-        return response;
+        return { ok: true };
       },
     },
-    session: {
-      modelCatalog: async () => ({ ok: true, value: { groups: [] } }),
-    },
+    session: { modelCatalog: async () => ({ ok: true, value: { groups: [] } }) },
   };
   const draft: ReviewerSettings = {
-    enabled: false,
+    primaryEnabled: false,
     provider: 'provider-a',
     model: 'model-a1',
     reasoningEffort: 'high',
   };
 
-  const saved = await testing().saveReviewerSettings(remote, SETTINGS_NS, draft, 11);
-  assert.equal(saved, response);
-  assert.equal(replaceCalls, 1);
+  await testing().saveReviewerSettings(remote, SETTINGS_NS, draft, 11);
   assert.deepEqual(replaceArgs, [
     SETTINGS_NS,
     {
-      enabled: false,
+      primaryEnabled: false,
       provider: 'provider-a',
       model: 'model-a1',
       reasoningEffort: 'high',
     },
     11,
   ]);
+});
+
+/* ============================================================
+ * Ordered review-route list
+ *
+ * Row 1 maps to the top-level primaryEnabled/provider/model/reasoningEffort
+ * fields and rows 2..N to the `fallbacks` array with a per-row `enabled` flag.
+ * The session model is the implicit final fallback: it is never a row and
+ * never persisted. The deprecated top-level `enabled` knob is never read or
+ * written.
+ * ============================================================ */
+
+/** One explicit saved fallback entry (row 2..N shape). */
+const SAVED_FALLBACK: FallbackEntry = {
+  mode: 'route',
+  enabled: true,
+  provider: 'provider-b',
+  model: 'model-b1',
+  reasoningEffort: 'high',
+};
+
+/** One enabled explicit row in the catalog shared with the fallback rows. */
+const ROUTE_A_ROW: ReviewRoute = {
+  enabled: true,
+  provider: 'provider-a',
+  model: 'model-a1',
+  reasoningEffort: 'high',
+};
+
+test('normalizeSettings keeps legacy sections without a fallbacks key', () => {
+  const legacy = testing().normalizeSettings({
+    provider: 'provider-a',
+    model: 'model-a1',
+    reasoningEffort: 'high',
+  });
+  assert.deepEqual(Object.keys(legacy).sort(), [
+    'model',
+    'primaryEnabled',
+    'provider',
+    'reasoningEffort',
+  ]);
+  assert.ok(!Object.hasOwn(legacy, 'fallbacks'), 'a legacy section must not gain a fallbacks key');
+  assert.equal(legacy.primaryEnabled, true);
+});
+
+test('normalizeSettings drops legacy { mode: session } rows and keeps per-row enable flags', () => {
+  const normalized = testing().normalizeSettings({
+    primaryEnabled: true,
+    provider: 'provider-a',
+    model: 'model-a1',
+    reasoningEffort: '',
+    fallbacks: [
+      { mode: 'session', provider: 'stale', model: 'stale', reasoningEffort: '' },
+      { mode: ' ROUTE ', enabled: false, provider: ' provider-b ', model: ' model-b1 ', reasoningEffort: ' high ' },
+      { mode: 'nonsense', provider: 'provider-a', model: 'model-a1' },
+      'not-an-object',
+    ],
+  });
+  assert.deepEqual(normalized.fallbacks, [
+    { mode: 'route', enabled: false, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'high' },
+    { mode: 'route', enabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: '' },
+    { mode: 'route', enabled: true, provider: '', model: '', reasoningEffort: '' },
+  ], 'only the legacy session row is dropped');
+
+  assert.equal(testing().isLegacySessionEntry({ mode: 'SESSION' }), true);
+  assert.equal(testing().isLegacySessionEntry({ mode: 'route' }), false);
+  assert.equal(testing().isLegacySessionEntry(undefined), false);
+  assert.deepEqual(testing().normalizeRoutes(undefined), []);
+  assert.deepEqual(testing().normalizeRoutes('nope'), []);
+});
+
+test('rowsFromSettings maps row 1 and keeps incomplete or disabled rows visible', () => {
+  assert.deepEqual(
+    testing().rowsFromSettings({ primaryEnabled: true, provider: '', model: '', reasoningEffort: '' }),
+    [],
+    'an empty, enabled section has no explicit row',
+  );
+  assert.deepEqual(
+    testing().rowsFromSettings({
+      primaryEnabled: false,
+      provider: '',
+      model: '',
+      reasoningEffort: '',
+    }),
+    [{ enabled: false, provider: '', model: '', reasoningEffort: '' }],
+    'an explicitly disabled empty row 1 stays visible',
+  );
+  assert.deepEqual(
+    testing().rowsFromSettings({
+      primaryEnabled: true,
+      provider: 'provider-a',
+      model: 'model-a1',
+      reasoningEffort: 'high',
+      fallbacks: [SAVED_FALLBACK],
+    }),
+    [
+      { enabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' },
+      { enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'high' },
+    ],
+  );
+  assert.deepEqual(
+    testing().rowsFromSettings({
+      primaryEnabled: true,
+      provider: 'provider-a',
+      model: '',
+      reasoningEffort: '',
+      fallbacks: [SAVED_FALLBACK],
+    }),
+    [
+      { enabled: true, provider: 'provider-a', model: '', reasoningEffort: '' },
+      { enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'high' },
+    ],
+    'an incomplete saved row 1 must stay visible',
+  );
+});
+
+test('settingsFromRows splits row 1 and keeps per-row enable flags', () => {
+  assert.deepEqual(
+    testing().settingsFromRows([
+      { enabled: false, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' },
+      { enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: '' },
+    ]),
+    {
+      primaryEnabled: false,
+      provider: 'provider-a',
+      model: 'model-a1',
+      reasoningEffort: 'high',
+      fallbacks: [{ mode: 'route', enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: '' }],
+    },
+  );
+  assert.deepEqual(
+    testing().settingsFromRows([]),
+    { primaryEnabled: true, provider: '', model: '', reasoningEffort: '' },
+    'an empty list keeps the legacy shape without a fallbacks key',
+  );
+  assert.deepEqual(
+    testing().settingsFromRows([{ enabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: '' }]),
+    { primaryEnabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: '' },
+    'a single row needs no fallbacks key',
+  );
+});
+
+test('settingsFromRows and rowsFromSettings round-trip the whole ordered list', () => {
+  const rows: ReviewRoute[] = [
+    { enabled: true, provider: 'p1', model: 'm1', reasoningEffort: 'inherit' },
+    { enabled: false, provider: 'p2', model: 'm2', reasoningEffort: '' },
+    { enabled: true, provider: '', model: '', reasoningEffort: '' },
+  ];
+  assert.deepEqual(testing().rowsFromSettings(testing().settingsFromRows(rows)), rows);
+});
+
+test('routesEqual detects enable changes and every meaningful list change', () => {
+  const { routesEqual } = testing();
+  const a: ReviewRoute[] = [ROUTE_A_ROW, { enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'high' }];
+  const b = [
+    { reasoningEffort: 'high', model: 'model-a1', provider: 'provider-a', enabled: true },
+    { reasoningEffort: 'high', model: 'model-b1', provider: 'provider-b', enabled: true },
+  ];
+  assert.equal(routesEqual(a, b), true);
+  assert.equal(routesEqual(undefined, []), true);
+  assert.equal(routesEqual(a, [b[1], b[0]]), false, 'order must matter');
+  assert.equal(routesEqual(a, [{ ...b[0], enabled: false }, b[1]]), false, 'enable flags must matter');
+  assert.equal(routesEqual(a, [{ ...b[0], model: 'model-a2' }, b[1]]), false);
+});
+
+test('route row helpers keep the list immutable, ordered and capped at ten rows', () => {
+  const {
+    addRoute, removeRoute, moveRoute, replaceRoute, MAX_ROUTES, INHERIT_EFFORT,
+  } = testing();
+  assert.equal(MAX_ROUTES, 10);
+  assert.equal(INHERIT_EFFORT, 'inherit');
+  const base: ReviewRoute[] = [
+    { enabled: true, provider: 'p1', model: 'm1', reasoningEffort: '' },
+    { enabled: true, provider: 'p2', model: 'm2', reasoningEffort: '' },
+    { enabled: true, provider: 'p3', model: 'm3', reasoningEffort: '' },
+  ];
+  const snapshot = structuredClone(base);
+
+  const added = addRoute(base);
+  assert.equal(added.length, 4);
+  assert.deepEqual(added[3], {
+    enabled: true,
+    provider: '',
+    model: '',
+    reasoningEffort: 'inherit',
+  }, 'a new row defaults to the inherit effort');
+  assert.deepEqual(base, snapshot, 'the input list must not be mutated');
+
+  assert.deepEqual(removeRoute(base, 1).map((route) => route.provider), ['p1', 'p3']);
+  assert.deepEqual(removeRoute(base, 9), base);
+  assert.deepEqual(moveRoute(base, 2, -1).map((route) => route.provider), ['p1', 'p3', 'p2']);
+  assert.deepEqual(moveRoute(base, 0, 1).map((route) => route.provider), ['p2', 'p1', 'p3']);
+  assert.deepEqual(moveRoute(base, 0, -1), base);
+  assert.deepEqual(moveRoute(base, 2, 1), base);
+  assert.deepEqual(
+    replaceRoute(base, 1, { enabled: false, provider: 'px', model: 'mx', reasoningEffort: 'low' }),
+    [
+      base[0],
+      { enabled: false, provider: 'px', model: 'mx', reasoningEffort: 'low' },
+      base[2],
+    ],
+  );
+  assert.deepEqual(base, snapshot);
+
+  const full: ReviewRoute[] = Array.from({ length: MAX_ROUTES }, () => ({
+    enabled: true,
+    provider: 'p',
+    model: 'm',
+    reasoningEffort: '',
+  }));
+  assert.equal(addRoute(full).length, MAX_ROUTES, 'the whole explicit list is capped at 10 rows');
+});
+
+test('saveReviewerSettings persists enable flags with the split list', async () => {
+  let replaceArgs: unknown[] | null = null;
+  const remote = {
+    settings: {
+      describe: async () => ({ ok: true, value: { namespaces: [] } }),
+      replace: async (...args: unknown[]) => {
+        replaceArgs = args;
+        return { ok: true };
+      },
+    },
+    session: { modelCatalog: async () => ({ ok: true, value: { groups: [] } }) },
+  };
+  const saved = await testing().saveReviewerSettings(
+    remote,
+    SETTINGS_NS,
+    {
+      primaryEnabled: false,
+      provider: 'provider-a',
+      model: 'model-a1',
+      reasoningEffort: 'inherit',
+      fallbacks: [
+        { mode: 'route', enabled: false, provider: ' provider-b ', model: ' model-b1 ', reasoningEffort: 'high' },
+        { mode: 'route', enabled: true, provider: '', model: '', reasoningEffort: '' },
+      ],
+    },
+    7,
+  );
+  assert.deepEqual(saved, { ok: true });
+  assert.deepEqual(replaceArgs, [
+    SETTINGS_NS,
+    {
+      primaryEnabled: false,
+      provider: 'provider-a',
+      model: 'model-a1',
+      reasoningEffort: 'inherit',
+      fallbacks: [
+        { mode: 'route', enabled: false, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'high' },
+        { mode: 'route', enabled: true, provider: '', model: '', reasoningEffort: '' },
+      ],
+    },
+    7,
+  ]);
+  const payload = (replaceArgs as unknown[])[1] as Record<string, unknown>;
+  assert.ok(!('enabled' in payload), 'the deprecated knob is never written');
+});
+
+test('summaryLine counts only enabled later rows', () => {
+  const { summaryLine } = testing();
+  const t = (key: string) => {
+    if (key === 'summaryFallbacks') return '+{count} more routes';
+    return `[${key}]`;
+  };
+  assert.equal(
+    summaryLine(
+      {
+        primaryEnabled: true,
+        provider: 'p1',
+        model: 'm1',
+        reasoningEffort: '',
+        fallbacks: [SAVED_FALLBACK, { ...SAVED_FALLBACK, enabled: false }],
+      },
+      false,
+      t,
+    ),
+    '[summaryLabel]: p1 / m1 · +1 more routes',
+  );
+});
+
+test('the locale dictionaries cover the per-row enable, inherit and inline test copy', async () => {
+  const harness = createApplyHarness();
+  await client.apply(harness.ctx);
+  const registered = harness.localeRegistrations.find(({ ns }) => ns === SETTINGS_NS);
+  assert.ok(registered !== undefined, 'the client must register its dictionaries');
+  const reg = registered.dictionaries as { zh: Record<string, string>; en: Record<string, string> };
+  const zhKeys = Object.keys(reg.zh).sort();
+  const enKeys = Object.keys(reg.en).sort();
+  assert.deepEqual(zhKeys, enKeys);
+  for (const key of [
+    'reviewRoutesTitle',
+    'reviewRoutesHint',
+    'reviewRoutesEmpty',
+    'routeAdd',
+    'routeCapHint',
+    'routeEnabled',
+    'routeRowLabel',
+    'routeTableLabel',
+    'routeActions',
+    'routeProvider',
+    'routeProviderPlaceholder',
+    'routeModel',
+    'routeModelPlaceholder',
+    'routeEffort',
+    'routeIncompleteHint',
+    'routeMoveUp',
+    'routeMoveDown',
+    'routeRemove',
+    'effortInherit',
+    'summarySession',
+    'summaryFallbacks',
+    'testUnavailableHint',
+  ]) {
+    assert.equal(typeof reg.zh[key], 'string', `${key} missing from zh`);
+    assert.equal(typeof reg.en[key], 'string', `${key} missing from en`);
+  }
+  for (const removed of [
+    'enabled',
+    'enabledDesc',
+    'fallbackMode',
+    'fallbackModeRoute',
+    'fallbackModeSession',
+    'fallbackSessionHint',
+    'fallbacksTitle',
+    'summaryInherit',
+    'sessionRowTitle',
+    'sessionRowDesc',
+    'testLabel',
+    'testHint',
+    'testHintDirty',
+    'testOtherRoutesNote',
+  ]) {
+    assert.equal(zhKeys.includes(removed), false, `${removed} must be removed from zh`);
+  }
 });
