@@ -52,6 +52,10 @@
  *
  * @module @aghost-prj/dsh-auto-review-model
  */
+import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { zstdCompressSync } from 'node:zlib';
 import z from '@deepseek-ai/schemastery';
 import {
   INHERIT_EFFORT,
@@ -670,6 +674,8 @@ interface BufferedAnswer {
   text: string;
   /** The terminal `finish` chunk. */
   finish: unknown;
+  usage?: Record<string, unknown>;
+  decision?: { risk?: string; decision?: string };
 }
 
 /** A buffered answer could not be produced; the route failed. */
@@ -723,6 +729,7 @@ async function collectAnswer(
 ): Promise<{ answer: BufferedAnswer } | { failure: AnswerFailure }> {
   const chunks: unknown[] = [];
   let text = '';
+  let usage: Record<string, unknown> | undefined;
   try {
     for (;;) {
       signal?.throwIfAborted();
@@ -746,6 +753,9 @@ async function collectAnswer(
       const chunk = step.value;
       if (!isRecord(chunk) || chunk.type !== 'finish') {
         chunks.push(chunk);
+        if (isRecord(chunk) && chunk.type === 'usage' && isRecord(chunk.usage)) {
+          usage = chunk.usage as Record<string, unknown>;
+        }
         if (isRecord(chunk) && chunk.type === 'text-delta' && typeof chunk.text === 'string') {
           text += chunk.text;
           if (text.length > ANSWER_BUFFER_LIMIT) {
@@ -776,11 +786,17 @@ async function collectAnswer(
           },
         };
       }
+      const parsed = JSON.parse(text.trim()) as Record<string, unknown>;
       return {
         answer: {
           chunks,
           text,
           finish: chunk,
+          ...(usage === undefined ? {} : { usage }),
+          decision: {
+            ...(typeof parsed['risk'] === 'string' ? { risk: parsed['risk'] } : {}),
+            ...(typeof parsed['decision'] === 'string' ? { decision: parsed['decision'] } : {}),
+          },
         },
       };
     }
@@ -796,6 +812,67 @@ async function collectAnswer(
 /** Convert an observed thrown failure to one attempt record. */
 function routeFailureFromThrown(attempt: ReviewRouteAttempt, error: unknown): ReviewerRouteFailure {
   return failureFromThrown(attempt, error);
+}
+
+/** Directory holding one append-only measured ledger per ISO week. */
+export const REVIEW_LEDGER_DIR = join(homedir(), '.dsh');
+
+function isoWeekOf(date: Date): { year: number; week: number } {
+  const shifted = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  const day = shifted.getUTCDay() || 7;
+  shifted.setUTCDate(shifted.getUTCDate() + 4 - day);
+  const yearStart = new Date(Date.UTC(shifted.getUTCFullYear(), 0, 1));
+  const week = Math.ceil(((shifted.getTime() - yearStart.getTime()) / 86400000 + 1) / 7);
+  return { year: shifted.getUTCFullYear(), week };
+}
+
+export function reviewLedgerPath(now: Date = new Date()): string {
+  const { year, week } = isoWeekOf(now);
+  return join(REVIEW_LEDGER_DIR, `auto-review-ledger-${year}-W${String(week).padStart(2, '0')}.jsonl`);
+}
+
+function ledgerEnabled(): boolean { return process.env['DSH_AUTO_REVIEW_LEDGER'] !== '0'; }
+
+interface ReviewLedgerRecord {
+  v: 1;
+  t: number;
+  local: string;
+  sid?: string;
+  totalMs: number;
+  fallback: boolean;
+  stickyUsed?: string;
+  attempts: Array<Record<string, unknown>>;
+  winner?: string;
+}
+
+let sealedWeek: string | undefined;
+function sealPreviousWeek(now: Date): void {
+  const current = isoWeekOf(now);
+  const currentId = `${current.year}-W${String(current.week).padStart(2, '0')}`;
+  if (sealedWeek === currentId) return;
+  sealedWeek = currentId;
+  try {
+    const previous = new Date(now.getTime());
+    previous.setUTCDate(previous.getUTCDate() - 7);
+    const { year, week } = isoWeekOf(previous);
+    const plain = join(REVIEW_LEDGER_DIR, `auto-review-ledger-${year}-W${String(week).padStart(2, '0')}.jsonl`);
+    if (!existsSync(plain)) return;
+    writeFileSync(`${plain}.zst`, zstdCompressSync(readFileSync(plain)));
+    rmSync(plain);
+  } catch {
+    // Housekeeping failures leave the plain ledger intact for a later retry.
+  }
+}
+
+function writeLedger(record: ReviewLedgerRecord): void {
+  if (!ledgerEnabled()) return;
+  try {
+    const now = new Date();
+    sealPreviousWeek(now);
+    appendFileSync(reviewLedgerPath(now), `${JSON.stringify(record)}\n`);
+  } catch {
+    // Ledger capture must never affect review delivery.
+  }
 }
 
 /** Session-scoped preferred route, learned only from a usable answer. */
@@ -828,7 +905,7 @@ async function tryReviewRoute(
   attempt: ReviewRouteAttempt,
   patchedRequests: WeakSet<object>,
   effortCache: CapabilityCache,
-): Promise<{ ok: true; chunks: unknown[]; finish: unknown } | { ok: false; failure: ReviewerRouteFailure }> {
+): Promise<{ ok: true; chunks: unknown[]; finish: unknown; usage?: Record<string, unknown>; decision?: { risk?: string; decision?: string } } | { ok: false; failure: ReviewerRouteFailure }> {
   let patched: GenerateOptions;
   try {
     patched = await buildRoutedRequest(ctx, options, attempt.provider, attempt.model, attempt.reasoningEffort, effortCache);
@@ -852,7 +929,7 @@ async function tryReviewRoute(
     options.signal?.throwIfAborted();
     return { ok: false, failure: { attempt, code: outcome.failure.code, detail: outcome.failure.detail } };
   }
-  return { ok: true, chunks: outcome.answer.chunks, finish: outcome.answer.finish };
+  return { ok: true, chunks: outcome.answer.chunks, finish: outcome.answer.finish, ...(outcome.answer.usage === undefined ? {} : { usage: outcome.answer.usage }), ...(outcome.answer.decision === undefined ? {} : { decision: outcome.answer.decision }) };
 }
 
 async function* streamReviewWithFallback(
@@ -868,30 +945,52 @@ async function* streamReviewWithFallback(
   const tried = new Set<string>();
   let candidates: readonly ReviewRouteAttempt[] = preferStickyRoute(plan, sessionId);
   let restartedFromTop = false;
+  const startedAt = Date.now();
+  const attempts: Array<Record<string, unknown>> = [];
+  const recordReview = (winner?: ReviewRouteAttempt): void => {
+    writeLedger({
+      v: 1,
+      t: startedAt,
+      local: new Date(startedAt).toISOString(),
+      ...(sessionId === undefined || sessionId === '' ? {} : { sid: sessionId }),
+      totalMs: Date.now() - startedAt,
+      fallback: attempts.length > 1,
+      ...(sticky === undefined ? {} : { stickyUsed: sticky }),
+      attempts,
+      ...(winner === undefined ? {} : { winner: `${winner.provider}/${winner.model}` }),
+    });
+  };
   for (;;) {
     let restart = false;
     for (const attempt of candidates) {
       const key = reviewRouteKey(attempt);
       if (tried.has(key)) continue;
       tried.add(key);
+      const attemptStarted = Date.now();
       const outcome = await tryReviewRoute(ctx, options, attempt, patchedRequests, effortCache);
+      const base = { route: `${attempt.provider}/${attempt.model}`, effort: attempt.reasoningEffort, mode: attempt.mode, ms: Date.now() - attemptStarted };
       if (outcome.ok) {
+        attempts.push({ ...base, ok: true, ...(outcome.usage === undefined ? {} : { usage: outcome.usage }), ...(outcome.decision === undefined ? {} : { decision: outcome.decision }) });
         noteReviewRoute(sessionId, attempt, true);
+        recordReview(attempt);
         for (const chunk of outcome.chunks) yield chunk;
         yield outcome.finish;
         return;
       }
+      attempts.push({ ...base, ok: false, code: outcome.failure.code, detail: outcome.failure.detail.slice(0, 300) });
       noteReviewRoute(sessionId, attempt, false);
       failures.push(outcome.failure);
       if (!restartedFromTop && sticky !== undefined && key === sticky) {
         restartedFromTop = true;
         restart = true;
         candidates = plan;
+        attempts.push({ event: 'sticky-failed-restart-from-top' });
         break;
       }
     }
     if (!restart) break;
   }
+  recordReview();
   throw new ReviewerRoutesError(failures);
 }
 
