@@ -263,6 +263,35 @@ function testResult(overrides: Record<string, unknown> = {}): Record<string, unk
   };
 }
 
+/** Measured ledger health the page reads once on mount. */
+const healthSnapshot = {
+  ledger: 'auto-review-ledger-2026-W48.jsonl',
+  week: '2026-W48',
+  records: 12,
+  routes: [
+    {
+      provider: 'provider-a',
+      model: 'model-a1',
+      attempts: 8,
+      answered: 7,
+      failed: 1,
+      avgMs: 2100,
+      lastAt: 1,
+      lastFailureCode: 'QUOTA',
+    },
+    {
+      provider: 'provider-b',
+      model: 'model-b1',
+      attempts: 4,
+      answered: 4,
+      failed: 0,
+      avgMs: 900,
+      lastAt: 2,
+      lastFailureCode: '',
+    },
+  ],
+};
+
 /** Reject with the caller's signal as soon as it aborts, like a real Remote call. */
 function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
   if (signal === undefined) return promise;
@@ -299,8 +328,18 @@ async function setupComponent(options: SetupTestEnvOptions = {}) {
 
   const endpoint = {
     calls: [] as Array<{ input?: { provider?: string; model?: string; reasoningEffort?: string }; signal?: AbortSignal }>,
-    inputs: [] as Array<{ provider?: string; model?: string; reasoningEffort?: string } | undefined>,
-    async testReviewRoute(input?: { provider?: string; model?: string; reasoningEffort?: string }, signal?: AbortSignal) {
+    inputs: [] as Array<{ mode?: string; provider?: string; model?: string; reasoningEffort?: string } | undefined>,
+    healthCalls: 0,
+    async testReviewRoute(
+      input?: { mode?: string; provider?: string; model?: string; reasoningEffort?: string },
+      signal?: AbortSignal,
+    ) {
+      // The page reads the measured ledger once on mount; that read is not a
+      // probe and must not consume the probe call log the tests assert on.
+      if (input?.mode === 'health') {
+        endpoint.healthCalls += 1;
+        return { ok: true, value: { ...testResult(), health: healthSnapshot } };
+      }
       endpoint.calls.push({ input, signal });
       endpoint.inputs.push(input);
       if (options.testPending !== undefined) return await raceAbort(options.testPending, signal);
@@ -1151,10 +1190,12 @@ test('each row has its own test button that probes that row\'s current values', 
     .flat(Infinity)
     .filter((node: unknown) => node !== null && typeof node === 'object' && (node as ReactElementLike).type === 'tr');
   const testedIndex = bodyRows.findIndex((row: ReactElementLike) => row.props['data-route-index'] === 1);
-  assert.equal(
-    bodyRows[testedIndex + 1]?.props?.['data-route-result'],
-    1,
-    'the result row directly follows its route row',
+  const afterTested = bodyRows.slice(testedIndex + 1);
+  const resultOffset = afterTested.findIndex((row: ReactElementLike) => row.props['data-route-result'] === 1);
+  assert.ok(resultOffset >= 0, 'the tested row must own a result row');
+  assert.ok(
+    afterTested.slice(0, resultOffset).every((row: ReactElementLike) => row.props['data-route-health'] !== undefined),
+    'only the measured-health row may sit between a route row and its result row',
   );
   assert.equal(
     nodes.some((node) => node.props?.['data-route-result'] === 0),
@@ -1244,6 +1285,55 @@ test('a transport failure is localized inline instead of showing raw prose', asy
   assert.equal(
     after.some((node) => typeof node.props?.children === 'string' && node.props.children.includes('remote call failed')),
     false,
+  );
+});
+
+test('the page reads measured health once and shows it under its route', async () => {
+  const env = await setupComponent({
+    savedSettings: { ...SAVED_ROUTE },
+    catalogGroups: ROUTE_CATALOG,
+  });
+  env.render();
+  const nodes = flattenNodes(await env.flush());
+  assert.equal(env.endpoint.healthCalls, 1, 'health must be read exactly once per page');
+  assert.equal(env.endpoint.calls.length, 0, 'reading health must not probe a provider');
+  const healthCell = nodes.find((node) => node.props?.className?.includes('dsh_arm_routeHealthCell'));
+  assert.ok(healthCell, 'each route row must render its measured health line');
+  assert.match(String(healthCell?.props?.children ?? ''), /8 .*7 .*2100ms|8 attempts .*7 answered .*2100ms/, 'health must show measured counts');
+  assert.match(String(healthCell?.props?.children ?? ''), /QUOTA/, 'the newest failure code must be shown');
+});
+
+test('the review button runs both scripted cases and shows their verdicts', async () => {
+  const env = await setupComponent({
+    savedSettings: { ...SAVED_ROUTE },
+    catalogGroups: ROUTE_CATALOG,
+    testResponse: {
+      ok: true,
+      value: testResult({
+        status: 'warning',
+        code: 'REVIEW_MISMATCH',
+        cases: [
+          { case: 'allow', expected: 'allow', actual: 'allow', risk: 'low', ok: true, failureCode: '', latencyMs: 1200, detail: '' },
+          { case: 'deny', expected: 'deny', actual: 'allow', risk: 'low', ok: false, failureCode: '', latencyMs: 1300, detail: '' },
+        ],
+      }),
+    },
+  });
+  env.render();
+  let nodes = flattenNodes(await env.flush());
+  findByAction(nodes, 'route-0-review')?.props.onClick();
+  nodes = flattenNodes(await env.flush());
+
+  assert.equal(env.endpoint.calls.length, 1, 'the review action must be one Remote call');
+  assert.equal(env.endpoint.inputs[0]?.mode, 'review', 'the review action must ask for the review mode');
+  assert.equal(env.endpoint.inputs[0]?.provider, 'provider-a');
+  const badges = nodes.filter((node) => node.props?.className?.includes('dsh_arm_reviewBadge'));
+  assert.equal(badges.length, 2, 'both scripted cases must be shown');
+  assert.ok(badges.some((node) => String(node.props?.className).includes('dsh_arm_reviewPass')));
+  assert.ok(badges.some((node) => String(node.props?.className).includes('dsh_arm_reviewFail')));
+  assert.ok(
+    nodes.some((node) => node.props?.className?.includes('dsh_arm_routeTestStatus') && node.props?.className?.includes('dsh_arm_testWarn')),
+    'a mismatch must render as a warning',
   );
 });
 

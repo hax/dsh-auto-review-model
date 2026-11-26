@@ -1,3 +1,57 @@
+/**
+ * Host entry for `@aghost-prj/dsh-auto-review-model`.
+ *
+ * The plugin installs one globally prepended `llm/stream` waterfall listener.
+ * When the experimental auto-review package asks the LLM service to classify a
+ * pending tool call, the listener rewrites only that request from the fixed
+ * reviewer route to the provider/model (and optional reasoning effort) chosen
+ * in this plugin's settings. Every other request passes through untouched.
+ *
+ * Rewriting is performed on a fresh object because auto-review freezes its
+ * `GenerateOptions` with `deepFreeze`. The rewritten object is then streamed
+ * through `ctx.llm.stream`, which re-enters the same waterfall; a `WeakSet`
+ * marks that object so the listener forwards it immediately instead of
+ * rewriting it again. Each reviewer request is therefore rewritten exactly
+ * once, with no recursion.
+ *
+ * A configured reasoning effort is verified against the reviewer route's live
+ * capabilities before the first review. If that lookup fails or exceeds its
+ * five-minute deadline, the review either moves on to the next configured
+ * fallback route or rejects immediately with an actionable error that names the
+ * exact route and repair steps; the failed lookup is not cached and the review
+ * never silently degrades to the provider's default effort.
+ *
+ * Optional ordered multi-route review: row 1 is the legacy primary route
+ * (`provider`/`model`/`reasoningEffort`), followed by the ordered `fallbacks`
+ * array of explicit routes. The intercepted review request's own
+ * provider/model is ALWAYS the implicit final fallback (reasoning effort `''`),
+ * so it is never configurable, never stored as a settings row, and never
+ * duplicated when an explicit attempt already uses the same provider+model.
+ * With no usable explicit route the listener does not rewrite at all and the
+ * native session model serves the review. Legacy `{ mode: 'session' }` entries
+ * are ignored because that fallback is implicit now. Only route-level failures
+ * — capability lookup failure, a thrown provider stream, or a terminal `finish`
+ * whose official failure code is a quota / auth / credential / rate-limit /
+ * server / timeout / transport / adapter failure — advance to the next route.
+ * A caller abort is propagated untouched, and content/protocol failures are
+ * surfaced instead of retried. Chunks are forwarded to the caller immediately:
+ * a route may only be replaced before its first chunk is emitted. Once output
+ * has crossed that commit point, a later failure is surfaced as an actionable
+ * error instead of retrying, so the caller's single-decision stream never sees
+ * chunks from two different routes. When every route fails before any output,
+ * one aggregate error lists each attempted route with its code and raw provider message.
+ *
+ * The same plugin instance publishes one small Typert Remote endpoint,
+ * `autoReviewModel/testReviewRoute`, so the settings page can probe the SAVED
+ * reviewer route with one fixed harmless prompt. The endpoint reads the live
+ * settings itself, accepts no browser-provided route or credential, sends no
+ * session id, purpose, tools, or conversation history, returns a classified
+ * outcome instead of model output, and throttles probes Host-wide. Its
+ * manifest and Client contribution are hand-written generated-style artifacts
+ * in `./typert.host.js` / `./typert.remote-client.js`.
+ *
+ * @module @aghost-prj/dsh-auto-review-model
+ */
 import z from '@deepseek-ai/schemastery';
 import { adaptEffortToAdvertised, effortCacheKey, effortRank, isAutoReviewRequest, normalizeEffort, readReviewerSettings, shouldOverrideRoute } from './policy.js';
 import type { ReviewerConfig } from './policy.js';
@@ -162,10 +216,7 @@ export declare class ReviewerCapabilityError extends Error {
  * review from one that fell back. The file is small (one line per route attempt)
  * and writing it can never fail a review.
  */
-/** Directory holding the captured review ledger. */
-export declare const REVIEW_LEDGER_DIR: string;
-/** Absolute ledger path for one moment, rotated by ISO week. */
-export declare function reviewLedgerPath(now?: Date): string;
+export { REVIEW_LEDGER_DIR, reviewLedgerPath, isoWeekOf, type ReviewLedgerRecord, } from './ledger.js';
 /**
  * Install the reviewer-model override.
  *
@@ -222,7 +273,7 @@ export declare const __testing: {
         ROUTE_TEST_CLOSE_GRACE_MS: number;
         ROUTE_TEST_SYSTEM_PROMPT: string;
         ROUTE_TEST_USER_PROMPT: string;
-        ROUTE_TEST_DETAILS: Readonly<Record<"OK" | "ROUTE_DISABLED" | "ROUTE_INCOMPLETE" | "BUSY" | "RATE_LIMITED" | "CANCELLED" | "TIMEOUT" | "NO_ADAPTER" | "UNKNOWN_MODEL" | "MODEL_UNSUPPORTED" | "MISSING_CREDENTIAL" | "INVALID_CREDENTIAL" | "NO_CREDENTIAL_STORE" | "AUTH" | "ACCOUNT_SIGN_IN_REQUIRED" | "ACCOUNT_AUTH_FAILED" | "ACCOUNT_CONNECTION" | "CONNECTION" | "RATE_LIMIT" | "QUOTA" | "CONTEXT_WINDOW_EXCEEDED" | "UNSUPPORTED_REASONING_EFFORT" | "EMPTY_RESPONSE" | "UNKNOWN", string>>;
+        ROUTE_TEST_DETAILS: Readonly<Record<"OK" | "ROUTE_DISABLED" | "ROUTE_INCOMPLETE" | "BUSY" | "RATE_LIMITED" | "CANCELLED" | "TIMEOUT" | "NO_ADAPTER" | "UNKNOWN_MODEL" | "MODEL_UNSUPPORTED" | "MISSING_CREDENTIAL" | "INVALID_CREDENTIAL" | "NO_CREDENTIAL_STORE" | "AUTH" | "ACCOUNT_SIGN_IN_REQUIRED" | "ACCOUNT_AUTH_FAILED" | "ACCOUNT_CONNECTION" | "CONNECTION" | "RATE_LIMIT" | "QUOTA" | "CONTEXT_WINDOW_EXCEEDED" | "UNSUPPORTED_REASONING_EFFORT" | "EMPTY_RESPONSE" | "NO_REVIEW_PROMPT" | "REVIEW_MISMATCH" | "UNKNOWN", string>>;
         REMOTE_SERVICE_KEY: string;
         REMOTE_NAMESPACE: string;
         createRouteTestState: typeof import("./route-test.js").createRouteTestState;

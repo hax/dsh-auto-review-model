@@ -303,6 +303,16 @@ test('the optional input codec accepts only the documented route ids', () => {
     { provider: 'p', model: 'm', reasoningEffort: 'inherit' },
   );
   assert.deepEqual(schema.parse({}), {});
+  assert.deepEqual(
+    schema.parse({ mode: 'review', provider: 'p', model: 'm' }),
+    { mode: 'review', provider: 'p', model: 'm' },
+    'the review mode is an accepted wire value',
+  );
+  assert.deepEqual(
+    schema.parse({ mode: 'health' }),
+    { mode: 'health' },
+    'the health mode needs no route',
+  );
   for (const [label, value] of [
     ['a non-object input', 'route'],
     ['an array input', []],
@@ -310,13 +320,14 @@ test('the optional input codec accepts only the documented route ids', () => {
     ['a non-string provider', { provider: 42 }],
     ['a non-string model', { model: {} }],
     ['a non-string effort', { reasoningEffort: false }],
+    ['an unknown mode', { mode: 'prompt' }],
   ] as const) {
     assert.throws(() => schema.parse(value), TypeError, `the input codec must reject ${label}`);
   }
   assert.ok(inputCodec.jsonSchema, 'the input codec must publish a JSON Schema projection');
   assert.deepEqual(
     Object.keys((inputCodec.jsonSchema as { properties: Record<string, unknown> }).properties).sort(),
-    ['model', 'provider', 'reasoningEffort'],
+    ['mode', 'model', 'provider', 'reasoningEffort'],
   );
 });
 

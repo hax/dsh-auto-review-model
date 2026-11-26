@@ -39,7 +39,7 @@
  * @module @aghost-prj/dsh-auto-review-model/typert-contract
  */
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.RESULT_JSON_SCHEMA = exports.INPUT_JSON_SCHEMA = exports.INPUT_TYPE_SYMBOL = exports.INPUT_SCHEMA_NAME = exports.REVIEW_ROUTE_TEST_CODES = exports.REMOTE_INVOCATION_ID = exports.RESULT_TYPE_SYMBOL = exports.RESULT_SCHEMA_NAME = exports.REMOTE_CONTRIBUTION_SPECIFIER = exports.REMOTE_CHUNK_FILE = exports.REMOTE_ENDPOINT = exports.REMOTE_METHOD = exports.REMOTE_NAMESPACE = exports.REMOTE_SERVICE_KEY = exports.PACKAGE_NAME = void 0;
+exports.RESULT_JSON_SCHEMA = exports.INPUT_JSON_SCHEMA = exports.INPUT_TYPE_SYMBOL = exports.INPUT_SCHEMA_NAME = exports.REVIEW_ROUTE_TEST_MODES = exports.REVIEW_ROUTE_TEST_CODES = exports.REMOTE_INVOCATION_ID = exports.RESULT_TYPE_SYMBOL = exports.RESULT_SCHEMA_NAME = exports.REMOTE_CONTRIBUTION_SPECIFIER = exports.REMOTE_CHUNK_FILE = exports.REMOTE_ENDPOINT = exports.REMOTE_METHOD = exports.REMOTE_NAMESPACE = exports.REMOTE_SERVICE_KEY = exports.PACKAGE_NAME = void 0;
 exports.createInputSchema = createInputSchema;
 exports.createResultSchema = createResultSchema;
 exports.createInvocationDescriptor = createInvocationDescriptor;
@@ -95,14 +95,18 @@ exports.REVIEW_ROUTE_TEST_CODES = [
     'CONTEXT_WINDOW_EXCEEDED',
     'UNSUPPORTED_REASONING_EFFORT',
     'EMPTY_RESPONSE',
+    'NO_REVIEW_PROMPT',
+    'REVIEW_MISMATCH',
     'UNKNOWN',
 ];
+/** Every mode the endpoint accepts. */
+exports.REVIEW_ROUTE_TEST_MODES = ['probe', 'review', 'health'];
 /** Type name of the optional input codec's stable type symbol. */
 exports.INPUT_SCHEMA_NAME = 'ReviewRouteTestInput';
 /** Stable type symbol of the optional input codec. */
 exports.INPUT_TYPE_SYMBOL = `${exports.PACKAGE_NAME}#${exports.INPUT_SCHEMA_NAME}`;
 /** Ordered optional field list of {@link ReviewRouteTestInput}. */
-const INPUT_KEYS = ['provider', 'model', 'reasoningEffort'];
+const INPUT_KEYS = ['mode', 'provider', 'model', 'reasoningEffort'];
 /**
  * Strict parser for the optional explicit-route input.
  *
@@ -133,7 +137,14 @@ function createInputSchema() {
                     continue;
                 if (typeof field !== 'string')
                     throw new TypeError(`ReviewRouteTestInput.${key} must be a string`);
-                input[key] = field;
+                if (key === 'mode')
+                    input.mode = field;
+                else
+                    input[key] = field;
+            }
+            const mode = input.mode;
+            if (mode !== undefined && !exports.REVIEW_ROUTE_TEST_MODES.includes(mode)) {
+                throw new TypeError(`ReviewRouteTestInput.mode is not a known mode: ${mode}`);
             }
             return input;
         },
@@ -144,13 +155,14 @@ exports.INPUT_JSON_SCHEMA = {
     type: 'object',
     additionalProperties: false,
     properties: {
+        mode: { type: 'string', enum: [...exports.REVIEW_ROUTE_TEST_MODES] },
         provider: { type: 'string' },
         model: { type: 'string' },
         reasoningEffort: { type: 'string' },
     },
 };
-/** Ordered field list of {@link ReviewRouteTestResult}; the strict parser rejects anything else. */
-const RESULT_KEYS = [
+/** Ordered required field list of {@link ReviewRouteTestResult}; the strict parser rejects anything else. */
+const RESULT_REQUIRED_KEYS = [
     'status',
     'code',
     'route',
@@ -165,6 +177,29 @@ const RESULT_KEYS = [
     'failureCode',
     'detail',
 ];
+/** Optional result fields, present only for the mode that produces them. */
+const RESULT_OPTIONAL_KEYS = ['cases', 'health'];
+/** Every result field the strict parser accepts. */
+const RESULT_KEYS = [...RESULT_REQUIRED_KEYS, ...RESULT_OPTIONAL_KEYS];
+/** Ordered field list of one scripted case. */
+const CASE_KEYS = ['case', 'expected', 'actual', 'risk', 'ok', 'failureCode', 'latencyMs', 'detail'];
+/** Ordered field list of the health snapshot. */
+const HEALTH_KEYS = ['ledger', 'week', 'records', 'routes'];
+/** Ordered field list of one health row. */
+const HEALTH_ENTRY_KEYS = [
+    'provider',
+    'model',
+    'attempts',
+    'answered',
+    'failed',
+    'avgMs',
+    'lastAt',
+    'lastFailureCode',
+];
+/** Decision values a scripted case may carry. */
+const CASE_DECISIONS = ['allow', 'deny'];
+/** Risk values a scripted case may carry. */
+const CASE_RISKS = ['low', 'medium', 'high'];
 const RESULT_STATUSES = ['ok', 'warning', 'error', 'blocked'];
 const RESULT_AUTH_KINDS = ['account', 'api-key', 'unknown'];
 const RESULT_ROUTE_KEYS = ['provider', 'model', 'reasoningEffort'];
@@ -208,15 +243,93 @@ function recordField(record, key) {
  * Reject unknown keys so a Host-side result cannot carry model prose, a
  * conversation log, or any other field the Client did not opt into.
  */
-function rejectUnknownKeys(record, keys, subject) {
+function rejectUnknownKeys(record, keys, subject, required = keys) {
     for (const key of Object.keys(record)) {
         if (!keys.includes(key))
             throw new TypeError(`${subject} has undeclared field ${JSON.stringify(key)}`);
     }
-    for (const key of keys) {
+    for (const key of required) {
         if (!Object.hasOwn(record, key))
             throw new TypeError(`${subject} is missing field ${JSON.stringify(key)}`);
     }
+}
+/**
+ * Parse one scripted review case.
+ *
+ * @param value - untrusted wire value.
+ * @returns the detached case.
+ */
+function parseReviewCase(value) {
+    if (!isRecord(value))
+        throw new TypeError('ReviewRouteTestResult.cases[] must be an object');
+    rejectUnknownKeys(value, CASE_KEYS, 'ReviewRouteTestResult.cases[]');
+    const scripted = stringField(value, 'case');
+    if (!CASE_DECISIONS.includes(scripted)) {
+        throw new TypeError(`ReviewRouteTestResult.cases[].case is not a known case: ${scripted}`);
+    }
+    const expected = stringField(value, 'expected');
+    if (!CASE_DECISIONS.includes(expected)) {
+        throw new TypeError(`ReviewRouteTestResult.cases[].expected is not a known decision: ${expected}`);
+    }
+    const actual = stringField(value, 'actual');
+    if (actual !== '' && !CASE_DECISIONS.includes(actual)) {
+        throw new TypeError(`ReviewRouteTestResult.cases[].actual is not a known decision: ${actual}`);
+    }
+    const risk = stringField(value, 'risk');
+    if (risk !== '' && !CASE_RISKS.includes(risk)) {
+        throw new TypeError(`ReviewRouteTestResult.cases[].risk is not a known risk: ${risk}`);
+    }
+    return {
+        case: scripted,
+        expected: expected,
+        actual: actual,
+        risk: risk,
+        ok: booleanField(value, 'ok'),
+        failureCode: stringField(value, 'failureCode'),
+        latencyMs: numberField(value, 'latencyMs'),
+        detail: stringField(value, 'detail'),
+    };
+}
+/**
+ * Parse one route's measured health row.
+ *
+ * @param value - untrusted wire value.
+ * @returns the detached health row.
+ */
+function parseHealthEntry(value) {
+    if (!isRecord(value))
+        throw new TypeError('ReviewRouteTestResult.health.routes[] must be an object');
+    rejectUnknownKeys(value, HEALTH_ENTRY_KEYS, 'ReviewRouteTestResult.health.routes[]');
+    return {
+        provider: stringField(value, 'provider'),
+        model: stringField(value, 'model'),
+        attempts: numberField(value, 'attempts'),
+        answered: numberField(value, 'answered'),
+        failed: numberField(value, 'failed'),
+        avgMs: numberField(value, 'avgMs'),
+        lastAt: numberField(value, 'lastAt'),
+        lastFailureCode: stringField(value, 'lastFailureCode'),
+    };
+}
+/**
+ * Parse the measured ledger health snapshot.
+ *
+ * @param value - untrusted wire value.
+ * @returns the detached snapshot.
+ */
+function parseHealth(value) {
+    if (!isRecord(value))
+        throw new TypeError('ReviewRouteTestResult.health must be an object');
+    rejectUnknownKeys(value, HEALTH_KEYS, 'ReviewRouteTestResult.health');
+    const routes = value.routes;
+    if (!Array.isArray(routes))
+        throw new TypeError('ReviewRouteTestResult.health.routes must be an array');
+    return {
+        ledger: stringField(value, 'ledger'),
+        week: stringField(value, 'week'),
+        records: numberField(value, 'records'),
+        routes: routes.map(parseHealthEntry),
+    };
 }
 /**
  * Build the strict result parser.
@@ -233,7 +346,7 @@ function createResultSchema() {
         parse(value) {
             if (!isRecord(value))
                 throw new TypeError('ReviewRouteTestResult must be an object');
-            rejectUnknownKeys(value, RESULT_KEYS, 'ReviewRouteTestResult');
+            rejectUnknownKeys(value, RESULT_KEYS, 'ReviewRouteTestResult', RESULT_REQUIRED_KEYS);
             const route = recordField(value, 'route');
             rejectUnknownKeys(route, RESULT_ROUTE_KEYS, 'ReviewRouteTestResult.route');
             const status = stringField(value, 'status');
@@ -251,6 +364,14 @@ function createResultSchema() {
             const credentialEnv = value.credentialEnv;
             if (!Array.isArray(credentialEnv) || credentialEnv.some((entry) => typeof entry !== 'string')) {
                 throw new TypeError('ReviewRouteTestResult.credentialEnv must be an array of strings');
+            }
+            const casesValue = value.cases;
+            if (casesValue !== undefined && !Array.isArray(casesValue)) {
+                throw new TypeError('ReviewRouteTestResult.cases must be an array');
+            }
+            const healthValue = value.health;
+            if (healthValue !== undefined && !isRecord(healthValue)) {
+                throw new TypeError('ReviewRouteTestResult.health must be an object');
             }
             return {
                 status: status,
@@ -270,6 +391,8 @@ function createResultSchema() {
                 retryAfterMs: numberField(value, 'retryAfterMs'),
                 failureCode: stringField(value, 'failureCode'),
                 detail: stringField(value, 'detail'),
+                ...casesValue === undefined ? {} : { cases: casesValue.map(parseReviewCase) },
+                ...healthValue === undefined ? {} : { health: parseHealth(healthValue) },
             };
         },
     };
@@ -284,7 +407,7 @@ function createResultSchema() {
 exports.RESULT_JSON_SCHEMA = {
     type: 'object',
     additionalProperties: false,
-    required: [...RESULT_KEYS],
+    required: [...RESULT_REQUIRED_KEYS],
     properties: {
         status: { type: 'string', enum: [...RESULT_STATUSES] },
         code: { type: 'string', enum: [...exports.REVIEW_ROUTE_TEST_CODES] },
@@ -308,6 +431,52 @@ exports.RESULT_JSON_SCHEMA = {
         retryAfterMs: { type: 'number', minimum: 0 },
         failureCode: { type: 'string' },
         detail: { type: 'string' },
+        cases: {
+            type: 'array',
+            items: {
+                type: 'object',
+                additionalProperties: false,
+                required: [...CASE_KEYS],
+                properties: {
+                    case: { type: 'string', enum: [...CASE_DECISIONS] },
+                    expected: { type: 'string', enum: [...CASE_DECISIONS] },
+                    actual: { type: 'string', enum: ['', ...CASE_DECISIONS] },
+                    risk: { type: 'string', enum: ['', ...CASE_RISKS] },
+                    ok: { type: 'boolean' },
+                    failureCode: { type: 'string' },
+                    latencyMs: { type: 'number', minimum: 0 },
+                    detail: { type: 'string' },
+                },
+            },
+        },
+        health: {
+            type: 'object',
+            additionalProperties: false,
+            required: [...HEALTH_KEYS],
+            properties: {
+                ledger: { type: 'string' },
+                week: { type: 'string' },
+                records: { type: 'number', minimum: 0 },
+                routes: {
+                    type: 'array',
+                    items: {
+                        type: 'object',
+                        additionalProperties: false,
+                        required: [...HEALTH_ENTRY_KEYS],
+                        properties: {
+                            provider: { type: 'string' },
+                            model: { type: 'string' },
+                            attempts: { type: 'number', minimum: 0 },
+                            answered: { type: 'number', minimum: 0 },
+                            failed: { type: 'number', minimum: 0 },
+                            avgMs: { type: 'number', minimum: 0 },
+                            lastAt: { type: 'number', minimum: 0 },
+                            lastFailureCode: { type: 'string' },
+                        },
+                    },
+                },
+            },
+        },
     },
 };
 /**
@@ -568,6 +737,16 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
             // outcomes plus a short technical detail.
             test: '测试',
             testing: '测试中…',
+            reviewTest: '审查',
+            reviewing: '审查中…',
+            reviewCaseAllow: '放行用例',
+            reviewCaseDeny: '拒绝用例',
+            reviewPassed: '符合',
+            reviewFailed: '不符',
+            reviewNoAnswer: '无有效回答',
+            routeHealthLine: '本周 {attempts} 次 · 成功 {answered} · 均 {avg}ms',
+            routeHealthEmpty: '本周尚无真实审查记录',
+            routeHealthFailed: '最近失败 {code}',
             testUnavailableHint: '路由测试当前不可用：Remote 端点未能挂载。请刷新页面或重启 DSH 后重试。',
             testResultPrefix: '测试结果',
             testTransportFailed: '测试未能运行',
@@ -599,6 +778,8 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
             testQuotaMessage: '提供商账号的配额或余额已用尽。',
             testContextWindowMessage: '测试请求超出了模型上下文窗口。',
             testUnsupportedEffortMessage: '该模型不支持已保存的推理等级。',
+            testNoReviewPromptMessage: '还没有可供测试的真实审查提示词。',
+            testReviewMismatchMessage: '路由给出了决定，但与用例期望不符。',
             testEmptyResponseMessage: '路由有响应，但返回了空内容。',
             testUnknownMessage: '路由测试因未知原因失败。',
             testOkHint: '',
@@ -622,6 +803,8 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
             testQuotaHint: '为 {provider} 充值账户余额，或改选其他路由。',
             testContextWindowHint: '固定最小提示不应触发此问题；请更换模型，若仍出现请报告。',
             testUnsupportedEffortHint: '为 {provider} / {model} 选择其他推理等级（或默认值）并保存，然后重新测试。',
+            testNoReviewPromptHint: '先让一次工具调用触发真实审查（本进程内），再运行审查测试。',
+            testReviewMismatchHint: '对照两个用例：放行用例被拒绝是误杀，拒绝用例被放行是绕过，都需要换模型或检查策略路由。',
             testEmptyResponseHint: '连接可用，但模型返回了空补全；可重新测试或更换模型/推理等级。',
             testUnknownHint: '查看详情并核对提供商设置后重试；若持续出现，请更换提供商或模型。',
         };
@@ -675,6 +858,16 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
             // detail are rendered; the provider's response text never reaches the page.
             test: 'Test',
             testing: 'Testing…',
+            reviewTest: 'Review',
+            reviewing: 'Reviewing…',
+            reviewCaseAllow: 'Allow case',
+            reviewCaseDeny: 'Deny case',
+            reviewPassed: 'passed',
+            reviewFailed: 'failed',
+            reviewNoAnswer: 'no usable answer',
+            routeHealthLine: '{attempts} attempts this week · {answered} answered · {avg}ms avg',
+            routeHealthEmpty: 'No real reviews this week yet',
+            routeHealthFailed: 'last failure {code}',
             testUnavailableHint: 'Route testing is unavailable because its Remote endpoint did not mount. Refresh the page or restart DSH and try again.',
             testResultPrefix: 'Test result',
             testTransportFailed: 'The test could not run',
@@ -706,6 +899,10 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
             testQuotaMessage: 'The provider account has no remaining quota or balance.',
             testContextWindowMessage: 'The test request exceeded the model context window.',
             testUnsupportedEffortMessage: 'The saved reasoning effort is not supported by this model.',
+            testNoReviewPromptMessage: 'No real reviewer prompt is available yet',
+            testNoReviewPromptHint: 'Trigger one reviewed tool call in this Host process, then run the review test again.',
+            testReviewMismatchMessage: 'The route decided, but not what the scripted case expects',
+            testReviewMismatchHint: 'Read both case results: rejecting the allow case is a false block, allowing the deny case is a bypass; either way pick another model or check how the policy reaches this route.',
             testEmptyResponseMessage: 'The route answered but returned no content.',
             testUnknownMessage: 'The route test failed for an unexpected reason.',
             testOkHint: '',
@@ -769,6 +966,11 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
 .dsh_arm_testError{color:var(--dsw-alias-state-error-primary)}
 .dsh_arm_testBlocked{color:var(--dsw-alias-label-tertiary)}
 .dsh_arm_testDetail{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;overflow-wrap:anywhere}
+.dsh_arm_routeHealthRow{background:transparent}
+.dsh_arm_routeHealthCell{padding-top:0!important;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.dsh_arm_reviewBadge{box-sizing:border-box;padding:1px 8px;border-radius:10px;border:1px solid var(--dsw-alias-border-l2);font-size:12px;line-height:18px;white-space:nowrap}
+.dsh_arm_reviewPass{color:var(--dsw-alias-label-secondary)}
+.dsh_arm_reviewFail{color:var(--dsw-alias-state-warn-label)}
 .dsh_arm_routes{display:flex;flex-direction:column;gap:8px;min-width:0;padding-top:10px;border-top:1px solid var(--dsw-alias-border-l2)}
 .dsh_arm_routeHeader{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;min-width:0}
 .dsh_arm_tableWrap{width:100%;min-width:0;overflow:visible;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-1)}
@@ -781,7 +983,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
 .dsh_arm_colModel{width:34%}
 .dsh_arm_colEffort{width:14%}
 .dsh_arm_colWeight{width:64px}
-.dsh_arm_colActions{width:176px}
+.dsh_arm_colActions{width:236px}
 .dsh_arm_cellEnable{text-align:center}
 .dsh_arm_tableCheckbox{width:16px;height:16px;margin:0;vertical-align:middle;accent-color:var(--dsw-alias-brand-primary);cursor:pointer}
 .dsh_arm_tableCheckbox[data-arm-unavailable="true"]{accent-color:var(--dsw-alias-label-tertiary);opacity:.5}
@@ -1484,6 +1686,8 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
             CONTEXT_WINDOW_EXCEEDED: 'testContextWindowMessage',
             UNSUPPORTED_REASONING_EFFORT: 'testUnsupportedEffortMessage',
             EMPTY_RESPONSE: 'testEmptyResponseMessage',
+            NO_REVIEW_PROMPT: 'testNoReviewPromptMessage',
+            REVIEW_MISMATCH: 'testReviewMismatchMessage',
             UNKNOWN: 'testUnknownMessage',
         };
         /** Outcome code → locale key for the actionable repair hint. */
@@ -1511,6 +1715,8 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
             CONTEXT_WINDOW_EXCEEDED: 'testContextWindowHint',
             UNSUPPORTED_REASONING_EFFORT: 'testUnsupportedEffortHint',
             EMPTY_RESPONSE: 'testEmptyResponseHint',
+            NO_REVIEW_PROMPT: 'testNoReviewPromptHint',
+            REVIEW_MISMATCH: 'testReviewMismatchHint',
             UNKNOWN: 'testUnknownHint',
         };
         /**
@@ -1720,6 +1926,32 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
             // has its own in-flight flag and result line, so a test never reuses the
             // save `busy` state or overwrites another row's result.
             const [rowTests, setRowTests] = React.useState({});
+            // Measured per-route health for the current ledger week. It is read once per
+            // page and never causes a provider request, so it cannot spend review quota.
+            const [health, setHealth] = React.useState(null);
+            React.useEffect(() => {
+                if (testRoute === undefined)
+                    return;
+                let cancelled = false;
+                testRoute.testReviewRoute({ mode: 'health' }).then((response) => {
+                    if (cancelled)
+                        return;
+                    const value = response !== null && response !== undefined && response.ok === true
+                        ? response.value
+                        : undefined;
+                    const snapshot = value !== null && value !== undefined && typeof value === 'object'
+                        ? value.health
+                        : undefined;
+                    if (snapshot !== null && snapshot !== undefined && Array.isArray(snapshot.routes)) {
+                        setHealth(snapshot);
+                    }
+                }).catch(() => {
+                    // Health is decorative: a failed read leaves the rows without a summary.
+                });
+                return () => {
+                    cancelled = true;
+                };
+            }, [testRoute]);
             const aliveRef = React.useRef(true);
             // Every started probe gets a sequence number per row; editing the list, or
             // starting another probe for the same row, advances it so a late response
@@ -1878,7 +2110,14 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
              *
              * @param index - row position in the current explicit list.
              */
-            const runRowTest = async (index) => {
+            /**
+             * Run one row's test, either the liveness probe or the two scripted reviews.
+             *
+             * Every row owns an independent sequence number, so an edit or a second test
+             * retires the previous result instead of letting it appear beside different
+             * route values.
+             */
+            const runRowTest = async (index, mode = 'probe') => {
                 const row = rows[index];
                 if (row === undefined)
                     return;
@@ -1886,7 +2125,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
                     return;
                 if (rowTests[index]?.busy === true)
                     return;
-                // Defensive: a stale controller for this row belongs to a retired probe.
+                // Defensive: a stale controller for this row belongs to a retired test.
                 probesRef.current.get(index)?.controller.abort();
                 const sequence = probeSeqRef.current + 1;
                 probeSeqRef.current = sequence;
@@ -1894,11 +2133,16 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
                 probesRef.current.set(index, { seq: sequence, controller });
                 setRowTests((previous) => ({
                     ...previous,
-                    [index]: { busy: true, outcome: previous[index]?.outcome ?? null },
+                    [index]: {
+                        busy: true,
+                        outcome: previous[index]?.outcome ?? null,
+                        cases: previous[index]?.cases ?? null,
+                    },
                 }));
                 const current = () => (aliveRef.current && probesRef.current.get(index)?.seq === sequence);
                 try {
                     const response = await testRoute.testReviewRoute({
+                        ...(mode === 'review' ? { mode } : {}),
                         provider: row.provider,
                         model: row.model,
                         reasoningEffort: row.reasoningEffort,
@@ -1906,23 +2150,28 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
                     if (!current())
                         return;
                     let outcome;
+                    let cases = null;
                     if (response === null || response === undefined || response.ok !== true) {
                         outcome = mapTestTransportFailure(response === null || response === undefined ? undefined : response.error, t);
                     }
                     else {
                         const value = response.value;
-                        outcome = value === null || value === undefined
-                            || typeof value !== 'object' || typeof value.code !== 'string'
-                            ? mapTestUnknownResult(t)
-                            : mapTestResult(value, t);
+                        if (value === null || value === undefined
+                            || typeof value !== 'object' || typeof value.code !== 'string') {
+                            outcome = mapTestUnknownResult(t);
+                        }
+                        else {
+                            outcome = mapTestResult(value, t);
+                            cases = Array.isArray(value.cases) ? value.cases : null;
+                        }
                     }
-                    setRowTests((previous) => ({ ...previous, [index]: { busy: false, outcome } }));
+                    setRowTests((previous) => ({ ...previous, [index]: { busy: false, outcome, cases } }));
                 }
                 catch (error) {
                     if (current()) {
                         setRowTests((previous) => ({
                             ...previous,
-                            [index]: { busy: false, outcome: mapTestTransportFailure(error, t) },
+                            [index]: { busy: false, outcome: mapTestTransportFailure(error, t), cases: null },
                         }));
                     }
                 }
@@ -1932,7 +2181,11 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
                         if (aliveRef.current) {
                             setRowTests((previous) => ({
                                 ...previous,
-                                [index]: { busy: false, outcome: previous[index]?.outcome ?? null },
+                                [index]: {
+                                    busy: false,
+                                    outcome: previous[index]?.outcome ?? null,
+                                    cases: previous[index]?.cases ?? null,
+                                },
                             }));
                         }
                     }
@@ -2134,12 +2387,44 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
                     onClick: () => {
                         void runRowTest(index);
                     },
-                }, testBusy ? t('testing') : t('test')), iconButton(t('routeMoveUp'), '↑', rowDisabled || index === 0, 'route-' + String(index) + '-up', () => {
+                }, testBusy ? t('testing') : t('test')), React.createElement('button', {
+                    type: 'button',
+                    className: 'dsh_arm_button dsh_arm_buttonSecondary dsh_arm_testButton',
+                    'data-arm-action': 'route-' + String(index) + '-review',
+                    disabled: rowDisabled || testRoute === undefined || testBusy,
+                    'aria-label': t('reviewTest') + ' ' + rowLabel,
+                    onClick: () => {
+                        void runRowTest(index, 'review');
+                    },
+                }, testBusy ? t('reviewing') : t('reviewTest')), iconButton(t('routeMoveUp'), '↑', rowDisabled || index === 0, 'route-' + String(index) + '-up', () => {
                     updateRoutes((list) => moveRoute(list, index, -1));
                 }), iconButton(t('routeMoveDown'), '↓', rowDisabled || index >= rows.length - 1, 'route-' + String(index) + '-down', () => updateRoutes((list) => moveRoute(list, index, 1))), iconButton(t('routeRemove'), '✕', rowDisabled, 'route-' + String(index) + '-remove', () => {
                     updateRoutes((list) => removeRoute(list, index));
                 })));
                 const children = [mainRow];
+                // Measured health is a full-width row under its route row: attempts,
+                // successes and mean latency for this week, or an explicit "no reviews
+                // yet" instead of a fake 0%.
+                if (health !== null) {
+                    const measured = health.routes.find((entry) => (entry.provider === route.provider && entry.model === route.model));
+                    const healthText = measured === undefined
+                        ? t('routeHealthEmpty')
+                        : formatText(t('routeHealthLine'), {
+                            attempts: String(measured.attempts),
+                            answered: String(measured.answered),
+                            avg: String(measured.avgMs),
+                        }) + (measured.failed > 0 && measured.lastFailureCode !== ''
+                            ? ' · ' + formatText(t('routeHealthFailed'), { code: measured.lastFailureCode })
+                            : '');
+                    children.push(React.createElement('tr', {
+                        className: 'dsh_arm_routeHealthRow',
+                        key: 'route-health:' + String(index),
+                        'data-route-health': index,
+                    }, React.createElement('td', {
+                        className: 'dsh_arm_routeHealthCell',
+                        colSpan: 6,
+                    }, healthText)));
+                }
                 // The result is a full-width row directly under its route row, so a long
                 // status/hint never widens or shifts the columns above.
                 if (outcome !== null) {
@@ -2158,6 +2443,15 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
                     }
                     if (outcome.detail !== '') {
                         feedback.push(React.createElement('span', { className: 'dsh_arm_testDetail', key: 'detail' }, outcome.detail));
+                    }
+                    for (const entry of rowTest?.cases ?? []) {
+                        const label = entry.case === 'allow' ? t('reviewCaseAllow') : t('reviewCaseDeny');
+                        const verdict = entry.ok ? t('reviewPassed') : t('reviewFailed');
+                        const actual = entry.actual === '' ? t('reviewNoAnswer') : entry.actual;
+                        feedback.push(React.createElement('span', {
+                            className: 'dsh_arm_reviewBadge ' + (entry.ok ? 'dsh_arm_reviewPass' : 'dsh_arm_reviewFail'),
+                            key: 'case:' + entry.case,
+                        }, label + ': ' + verdict + ' · ' + actual));
                     }
                     children.push(React.createElement('tr', {
                         className: 'dsh_arm_routeResultRow',

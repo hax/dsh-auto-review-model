@@ -1540,3 +1540,99 @@ test('pure request/throttle helpers keep the fixed safety contract', () => {
   assert.equal(classifyRouteTestFailure('SECRET_TOKEN_12345', 'account'), 'UNKNOWN');
   assert.deepEqual(readThrownFailure({ code: 'SECRET_TOKEN_12345' }), { code: '' });
 });
+
+test('health mode reads the measured ledger without contacting a provider', async () => {
+  const health = {
+    ledger: 'auto-review-ledger-2026-W48.jsonl',
+    week: '2026-W48',
+    records: 3,
+    routes: [
+      {
+        provider: 'deepseek-account',
+        model: 'deepseek-flash',
+        attempts: 6,
+        answered: 5,
+        failed: 1,
+        avgMs: 900,
+        lastAt: 1_000,
+        lastFailureCode: 'QUOTA',
+      },
+    ],
+  };
+  const harness = createHarness({ endpointOptions: { health: () => health } });
+  const result = await harness.invoke({ input: { mode: 'health' } });
+  assert.equal(result.status, 'ok');
+  assert.equal(result.code, 'OK');
+  assert.deepEqual(result.health, health);
+  assert.equal(harness.streamCalls.length, 0, 'a health read must never contact a provider');
+  assert.equal(harness.resolveCalls.length, 0, 'a health read must not resolve a model');
+});
+
+test('review mode replays the real prompt and judges both scripted cases', async () => {
+  const prompt = {
+    system: 'REVIEW_POLICY\nreal policy',
+    environment: 'ENVIRONMENT\n{"cwd":"/tmp"}',
+    capturedAt: 1_700_000_000_000,
+  };
+  // The allow case must be allowed, the deny case denied: answer by the command
+  // the scripted pending call carries, exactly as a correct reviewer would.
+  const stream: StreamFactory = (generate) => {
+    const pending = String(generate?.messages?.at(-1)?.content?.[0]?.text ?? '');
+    const answer = pending.includes('credentials.yaml')
+      ? '{"risk":"high","decision":"deny"}'
+      : '{"risk":"low","decision":"allow"}';
+    return streamOf([
+      { type: 'block-start', index: 0, blockType: 'text' },
+      { type: 'text-delta', index: 0, text: answer },
+      { type: 'block-end', index: 0, block: { type: 'text', text: answer } },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ]);
+  };
+  const harness = createHarness({
+    stream,
+    endpointOptions: { reviewPrompt: () => prompt },
+  });
+  const result = await harness.invoke({ input: { mode: 'review', provider: 'deepseek-account', model: 'deepseek-flash' } });
+
+  assert.equal(result.status, 'ok');
+  assert.equal(result.code, 'OK');
+  assert.equal(result.cases?.length, 2, 'both scripted cases must run');
+  assert.deepEqual(result.cases?.map((entry) => entry.actual), ['allow', 'deny']);
+  assert.deepEqual(result.cases?.map((entry) => entry.ok), [true, true]);
+  assert.equal(harness.streamCalls.length, 2, 'one provider request per case');
+
+  const first = harness.streamCalls[0]!;
+  assert.equal(first.system, prompt.system, 'the real review policy must be sent verbatim');
+  assert.equal(first.messages?.length, 2, 'the request carries the environment plus one pending call');
+  assert.equal(first.messages?.[0]?.content?.[0]?.text, prompt.environment);
+  const pending = JSON.parse(String(first.messages?.[1]?.content?.[0]?.text ?? '{}')) as Record<string, unknown>;
+  assert.equal(pending['kind'], 'tool-call');
+  assert.equal(pending['name'], 'bash');
+  assert.equal(pending['role'], 'fact');
+  assert.equal(JSON.parse(String(pending['arguments']))['command'], 'echo hello');
+  const denyPending = JSON.parse(String(harness.streamCalls[1]?.messages?.[1]?.content?.[0]?.text ?? '{}'));
+  assert.match(String(JSON.parse(String(denyPending['arguments']))['command']), /credentials\.yaml/);
+});
+
+test('review mode reports a mismatch without hiding the decisions', async () => {
+  const prompt = { system: 'REVIEW_POLICY', environment: 'ENVIRONMENT\n{}', capturedAt: 1 };
+  // A blanket-allow reviewer lets the deny case through; the test must say so.
+  const harness = createHarness({
+    stream: okStream('{"risk":"low","decision":"allow"}'),
+    endpointOptions: { reviewPrompt: () => prompt },
+  });
+  const result = await harness.invoke({ input: { mode: 'review', provider: 'deepseek-account', model: 'deepseek-flash' } });
+  assert.equal(result.status, 'warning');
+  assert.equal(result.code, 'REVIEW_MISMATCH');
+  assert.deepEqual(result.cases?.map((entry) => entry.ok), [true, false]);
+  assert.equal(result.cases?.[1]?.actual, 'allow');
+  assert.equal(result.cases?.[1]?.expected, 'deny');
+});
+
+test('review mode refuses without a captured prompt', async () => {
+  const harness = createHarness();
+  const result = await harness.invoke({ input: { mode: 'review', provider: 'deepseek-account', model: 'deepseek-flash' } });
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.code, 'NO_REVIEW_PROMPT');
+  assert.equal(harness.streamCalls.length, 0);
+});

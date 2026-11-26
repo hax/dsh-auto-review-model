@@ -93,6 +93,8 @@ export const REVIEW_ROUTE_TEST_CODES = [
   'CONTEXT_WINDOW_EXCEEDED',
   'UNSUPPORTED_REASONING_EFFORT',
   'EMPTY_RESPONSE',
+  'NO_REVIEW_PROMPT',
+  'REVIEW_MISMATCH',
   'UNKNOWN',
 ] as const;
 
@@ -113,6 +115,14 @@ export type ReviewRouteTestAuthKind = 'account' | 'api-key' | 'unknown';
  * the Host trims and bounds them, and never accepts a URL or a credential.
  */
 export interface ReviewRouteTestInput {
+  /**
+   * What to run.
+   *
+   * `probe` (the default) proves the route answers at all; `review` runs the two
+   * scripted pending calls the settings page shows; `health` only reads the
+   * measured ledger and never contacts a provider.
+   */
+  mode?: ReviewRouteTestMode;
   /** Provider id to probe. */
   provider?: string;
   /** Model id to probe. */
@@ -120,6 +130,12 @@ export interface ReviewRouteTestInput {
   /** Effort to probe; `inherit` is sent as the provider default for a probe. */
   reasoningEffort?: string;
 }
+
+/** One selectable saved-route test mode. */
+export type ReviewRouteTestMode = 'probe' | 'review' | 'health';
+
+/** Every mode the endpoint accepts. */
+export const REVIEW_ROUTE_TEST_MODES: readonly ReviewRouteTestMode[] = ['probe', 'review', 'health'];
 
 /** Type name of the optional input codec's stable type symbol. */
 export const INPUT_SCHEMA_NAME = 'ReviewRouteTestInput';
@@ -170,10 +186,66 @@ export interface ReviewRouteTestResult {
   failureCode: string;
   /** Short classified diagnostic detail, or `''` when none. */
   detail: string;
+  /** Scripted review-case results; present only for a `review` run. */
+  cases?: ReviewRouteTestCase[];
+  /** Measured ledger health; present only for a `health` run. */
+  health?: ReviewRouteHealth;
+}
+
+/** One scripted review case run against a route. */
+export interface ReviewRouteTestCase {
+  /** Which scripted pending call this case is. */
+  case: 'allow' | 'deny';
+  /** Decision the case expects from a correct reviewer. */
+  expected: 'allow' | 'deny';
+  /** Decision the route actually returned; `''` when it produced nothing usable. */
+  actual: '' | 'allow' | 'deny';
+  /** Risk class the route reported; `''` when it reported none. */
+  risk: '' | 'low' | 'medium' | 'high';
+  /** Whether {@link actual} matched {@link expected}. */
+  ok: boolean;
+  /** Provider-neutral failure code of this case; `''` when the route answered. */
+  failureCode: string;
+  /** Wall-clock duration of this case in milliseconds. */
+  latencyMs: number;
+  /** Short classified diagnostic detail; `''` when none. */
+  detail: string;
+}
+
+/** One route's measured health within the current ledger week. */
+export interface ReviewRouteHealthEntry {
+  /** Provider id of the measured route. */
+  provider: string;
+  /** Model id of the measured route. */
+  model: string;
+  /** Attempts this route was asked for. */
+  attempts: number;
+  /** Attempts that produced the review decision. */
+  answered: number;
+  /** Attempts that failed and moved on. */
+  failed: number;
+  /** Mean attempt duration in milliseconds, rounded. */
+  avgMs: number;
+  /** Epoch milliseconds of the newest measured attempt, `0` when never used. */
+  lastAt: number;
+  /** Newest observed failure code, `''` when the route never failed. */
+  lastFailureCode: string;
+}
+
+/** Ledger health snapshot served to the settings page. */
+export interface ReviewRouteHealth {
+  /** Ledger file the numbers came from (basename), `''` when unavailable. */
+  ledger: string;
+  /** ISO week the ledger covers, e.g. `2026-W48`. */
+  week: string;
+  /** Review records that contributed at least one route attempt. */
+  records: number;
+  /** Measured routes, ordered by attempt count. */
+  routes: ReviewRouteHealthEntry[];
 }
 
 /** Ordered optional field list of {@link ReviewRouteTestInput}. */
-const INPUT_KEYS = ['provider', 'model', 'reasoningEffort'] as const;
+const INPUT_KEYS = ['mode', 'provider', 'model', 'reasoningEffort'] as const;
 
 /**
  * Strict parser for the optional explicit-route input.
@@ -201,7 +273,12 @@ export function createInputSchema(): { readonly parse: (value: unknown) => Revie
         const field = value[key];
         if (field === undefined) continue;
         if (typeof field !== 'string') throw new TypeError(`ReviewRouteTestInput.${key} must be a string`);
-        input[key] = field;
+        if (key === 'mode') input.mode = field as ReviewRouteTestMode;
+        else input[key] = field;
+      }
+      const mode = input.mode;
+      if (mode !== undefined && !(REVIEW_ROUTE_TEST_MODES as readonly string[]).includes(mode)) {
+        throw new TypeError(`ReviewRouteTestInput.mode is not a known mode: ${mode}`);
       }
       return input;
     },
@@ -213,14 +290,15 @@ export const INPUT_JSON_SCHEMA: Readonly<Record<string, unknown>> = {
   type: 'object',
   additionalProperties: false,
   properties: {
+    mode: { type: 'string', enum: [...REVIEW_ROUTE_TEST_MODES] },
     provider: { type: 'string' },
     model: { type: 'string' },
     reasoningEffort: { type: 'string' },
   },
 };
 
-/** Ordered field list of {@link ReviewRouteTestResult}; the strict parser rejects anything else. */
-const RESULT_KEYS = [
+/** Ordered required field list of {@link ReviewRouteTestResult}; the strict parser rejects anything else. */
+const RESULT_REQUIRED_KEYS = [
   'status',
   'code',
   'route',
@@ -235,6 +313,36 @@ const RESULT_KEYS = [
   'failureCode',
   'detail',
 ] as const;
+
+/** Optional result fields, present only for the mode that produces them. */
+const RESULT_OPTIONAL_KEYS = ['cases', 'health'] as const;
+
+/** Every result field the strict parser accepts. */
+const RESULT_KEYS = [...RESULT_REQUIRED_KEYS, ...RESULT_OPTIONAL_KEYS] as const;
+
+/** Ordered field list of one scripted case. */
+const CASE_KEYS = ['case', 'expected', 'actual', 'risk', 'ok', 'failureCode', 'latencyMs', 'detail'] as const;
+
+/** Ordered field list of the health snapshot. */
+const HEALTH_KEYS = ['ledger', 'week', 'records', 'routes'] as const;
+
+/** Ordered field list of one health row. */
+const HEALTH_ENTRY_KEYS = [
+  'provider',
+  'model',
+  'attempts',
+  'answered',
+  'failed',
+  'avgMs',
+  'lastAt',
+  'lastFailureCode',
+] as const;
+
+/** Decision values a scripted case may carry. */
+const CASE_DECISIONS = ['allow', 'deny'] as const;
+
+/** Risk values a scripted case may carry. */
+const CASE_RISKS = ['low', 'medium', 'high'] as const;
 
 const RESULT_STATUSES: readonly ReviewRouteTestStatus[] = ['ok', 'warning', 'error', 'blocked'];
 const RESULT_AUTH_KINDS: readonly ReviewRouteTestAuthKind[] = ['account', 'api-key', 'unknown'];
@@ -285,13 +393,95 @@ function recordField(
  * Reject unknown keys so a Host-side result cannot carry model prose, a
  * conversation log, or any other field the Client did not opt into.
  */
-function rejectUnknownKeys(record: Readonly<Record<string, unknown>>, keys: readonly string[], subject: string): void {
+function rejectUnknownKeys(
+  record: Readonly<Record<string, unknown>>,
+  keys: readonly string[],
+  subject: string,
+  required: readonly string[] = keys,
+): void {
   for (const key of Object.keys(record)) {
     if (!keys.includes(key)) throw new TypeError(`${subject} has undeclared field ${JSON.stringify(key)}`);
   }
-  for (const key of keys) {
+  for (const key of required) {
     if (!Object.hasOwn(record, key)) throw new TypeError(`${subject} is missing field ${JSON.stringify(key)}`);
   }
+}
+
+/**
+ * Parse one scripted review case.
+ *
+ * @param value - untrusted wire value.
+ * @returns the detached case.
+ */
+function parseReviewCase(value: unknown): ReviewRouteTestCase {
+  if (!isRecord(value)) throw new TypeError('ReviewRouteTestResult.cases[] must be an object');
+  rejectUnknownKeys(value, CASE_KEYS, 'ReviewRouteTestResult.cases[]');
+  const scripted = stringField(value, 'case');
+  if (!(CASE_DECISIONS as readonly string[]).includes(scripted)) {
+    throw new TypeError(`ReviewRouteTestResult.cases[].case is not a known case: ${scripted}`);
+  }
+  const expected = stringField(value, 'expected');
+  if (!(CASE_DECISIONS as readonly string[]).includes(expected)) {
+    throw new TypeError(`ReviewRouteTestResult.cases[].expected is not a known decision: ${expected}`);
+  }
+  const actual = stringField(value, 'actual');
+  if (actual !== '' && !(CASE_DECISIONS as readonly string[]).includes(actual)) {
+    throw new TypeError(`ReviewRouteTestResult.cases[].actual is not a known decision: ${actual}`);
+  }
+  const risk = stringField(value, 'risk');
+  if (risk !== '' && !(CASE_RISKS as readonly string[]).includes(risk)) {
+    throw new TypeError(`ReviewRouteTestResult.cases[].risk is not a known risk: ${risk}`);
+  }
+  return {
+    case: scripted as ReviewRouteTestCase['case'],
+    expected: expected as ReviewRouteTestCase['expected'],
+    actual: actual as ReviewRouteTestCase['actual'],
+    risk: risk as ReviewRouteTestCase['risk'],
+    ok: booleanField(value, 'ok'),
+    failureCode: stringField(value, 'failureCode'),
+    latencyMs: numberField(value, 'latencyMs'),
+    detail: stringField(value, 'detail'),
+  };
+}
+
+/**
+ * Parse one route's measured health row.
+ *
+ * @param value - untrusted wire value.
+ * @returns the detached health row.
+ */
+function parseHealthEntry(value: unknown): ReviewRouteHealthEntry {
+  if (!isRecord(value)) throw new TypeError('ReviewRouteTestResult.health.routes[] must be an object');
+  rejectUnknownKeys(value, HEALTH_ENTRY_KEYS, 'ReviewRouteTestResult.health.routes[]');
+  return {
+    provider: stringField(value, 'provider'),
+    model: stringField(value, 'model'),
+    attempts: numberField(value, 'attempts'),
+    answered: numberField(value, 'answered'),
+    failed: numberField(value, 'failed'),
+    avgMs: numberField(value, 'avgMs'),
+    lastAt: numberField(value, 'lastAt'),
+    lastFailureCode: stringField(value, 'lastFailureCode'),
+  };
+}
+
+/**
+ * Parse the measured ledger health snapshot.
+ *
+ * @param value - untrusted wire value.
+ * @returns the detached snapshot.
+ */
+function parseHealth(value: unknown): ReviewRouteHealth {
+  if (!isRecord(value)) throw new TypeError('ReviewRouteTestResult.health must be an object');
+  rejectUnknownKeys(value, HEALTH_KEYS, 'ReviewRouteTestResult.health');
+  const routes = value.routes;
+  if (!Array.isArray(routes)) throw new TypeError('ReviewRouteTestResult.health.routes must be an array');
+  return {
+    ledger: stringField(value, 'ledger'),
+    week: stringField(value, 'week'),
+    records: numberField(value, 'records'),
+    routes: routes.map(parseHealthEntry),
+  };
 }
 
 /**
@@ -308,7 +498,7 @@ export function createResultSchema(): { readonly parse: (value: unknown) => Revi
   return {
     parse(value: unknown): ReviewRouteTestResult {
       if (!isRecord(value)) throw new TypeError('ReviewRouteTestResult must be an object');
-      rejectUnknownKeys(value, RESULT_KEYS, 'ReviewRouteTestResult');
+      rejectUnknownKeys(value, RESULT_KEYS, 'ReviewRouteTestResult', RESULT_REQUIRED_KEYS);
       const route = recordField(value, 'route');
       rejectUnknownKeys(route, RESULT_ROUTE_KEYS, 'ReviewRouteTestResult.route');
       const status = stringField(value, 'status');
@@ -326,6 +516,14 @@ export function createResultSchema(): { readonly parse: (value: unknown) => Revi
       const credentialEnv = value.credentialEnv;
       if (!Array.isArray(credentialEnv) || credentialEnv.some((entry) => typeof entry !== 'string')) {
         throw new TypeError('ReviewRouteTestResult.credentialEnv must be an array of strings');
+      }
+      const casesValue = value.cases;
+      if (casesValue !== undefined && !Array.isArray(casesValue)) {
+        throw new TypeError('ReviewRouteTestResult.cases must be an array');
+      }
+      const healthValue = value.health;
+      if (healthValue !== undefined && !isRecord(healthValue)) {
+        throw new TypeError('ReviewRouteTestResult.health must be an object');
       }
       return {
         status: status as ReviewRouteTestStatus,
@@ -345,6 +543,8 @@ export function createResultSchema(): { readonly parse: (value: unknown) => Revi
         retryAfterMs: numberField(value, 'retryAfterMs'),
         failureCode: stringField(value, 'failureCode'),
         detail: stringField(value, 'detail'),
+        ...casesValue === undefined ? {} : { cases: (casesValue as unknown[]).map(parseReviewCase) },
+        ...healthValue === undefined ? {} : { health: parseHealth(healthValue) },
       };
     },
   };
@@ -360,7 +560,7 @@ export function createResultSchema(): { readonly parse: (value: unknown) => Revi
 export const RESULT_JSON_SCHEMA: Readonly<Record<string, unknown>> = {
   type: 'object',
   additionalProperties: false,
-  required: [...RESULT_KEYS],
+  required: [...RESULT_REQUIRED_KEYS],
   properties: {
     status: { type: 'string', enum: [...RESULT_STATUSES] },
     code: { type: 'string', enum: [...REVIEW_ROUTE_TEST_CODES] },
@@ -384,6 +584,52 @@ export const RESULT_JSON_SCHEMA: Readonly<Record<string, unknown>> = {
     retryAfterMs: { type: 'number', minimum: 0 },
     failureCode: { type: 'string' },
     detail: { type: 'string' },
+    cases: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: [...CASE_KEYS],
+        properties: {
+          case: { type: 'string', enum: [...CASE_DECISIONS] },
+          expected: { type: 'string', enum: [...CASE_DECISIONS] },
+          actual: { type: 'string', enum: ['', ...CASE_DECISIONS] },
+          risk: { type: 'string', enum: ['', ...CASE_RISKS] },
+          ok: { type: 'boolean' },
+          failureCode: { type: 'string' },
+          latencyMs: { type: 'number', minimum: 0 },
+          detail: { type: 'string' },
+        },
+      },
+    },
+    health: {
+      type: 'object',
+      additionalProperties: false,
+      required: [...HEALTH_KEYS],
+      properties: {
+        ledger: { type: 'string' },
+        week: { type: 'string' },
+        records: { type: 'number', minimum: 0 },
+        routes: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: [...HEALTH_ENTRY_KEYS],
+            properties: {
+              provider: { type: 'string' },
+              model: { type: 'string' },
+              attempts: { type: 'number', minimum: 0 },
+              answered: { type: 'number', minimum: 0 },
+              failed: { type: 'number', minimum: 0 },
+              avgMs: { type: 'number', minimum: 0 },
+              lastAt: { type: 'number', minimum: 0 },
+              lastFailureCode: { type: 'string' },
+            },
+          },
+        },
+      },
+    },
   },
 };
 

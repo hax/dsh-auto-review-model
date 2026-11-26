@@ -58,7 +58,7 @@ export declare const REMOTE_INVOCATION_ID = "@aghost-prj/dsh-auto-review-model#a
  * The list is the `enum` of the wire `code` field, so the Host, the Client
  * locale table, and tests all validate against this one declaration.
  */
-export declare const REVIEW_ROUTE_TEST_CODES: readonly ["OK", "ROUTE_DISABLED", "ROUTE_INCOMPLETE", "BUSY", "RATE_LIMITED", "CANCELLED", "TIMEOUT", "NO_ADAPTER", "UNKNOWN_MODEL", "MODEL_UNSUPPORTED", "MISSING_CREDENTIAL", "INVALID_CREDENTIAL", "NO_CREDENTIAL_STORE", "AUTH", "ACCOUNT_SIGN_IN_REQUIRED", "ACCOUNT_AUTH_FAILED", "ACCOUNT_CONNECTION", "CONNECTION", "RATE_LIMIT", "QUOTA", "CONTEXT_WINDOW_EXCEEDED", "UNSUPPORTED_REASONING_EFFORT", "EMPTY_RESPONSE", "UNKNOWN"];
+export declare const REVIEW_ROUTE_TEST_CODES: readonly ["OK", "ROUTE_DISABLED", "ROUTE_INCOMPLETE", "BUSY", "RATE_LIMITED", "CANCELLED", "TIMEOUT", "NO_ADAPTER", "UNKNOWN_MODEL", "MODEL_UNSUPPORTED", "MISSING_CREDENTIAL", "INVALID_CREDENTIAL", "NO_CREDENTIAL_STORE", "AUTH", "ACCOUNT_SIGN_IN_REQUIRED", "ACCOUNT_AUTH_FAILED", "ACCOUNT_CONNECTION", "CONNECTION", "RATE_LIMIT", "QUOTA", "CONTEXT_WINDOW_EXCEEDED", "UNSUPPORTED_REASONING_EFFORT", "EMPTY_RESPONSE", "NO_REVIEW_PROMPT", "REVIEW_MISMATCH", "UNKNOWN"];
 /** One saved-route test outcome code. */
 export type ReviewRouteTestCode = (typeof REVIEW_ROUTE_TEST_CODES)[number];
 /** Presentation tone of one outcome: success, reachable-with-issue, failure, or local refusal. */
@@ -73,6 +73,14 @@ export type ReviewRouteTestAuthKind = 'account' | 'api-key' | 'unknown';
  * the Host trims and bounds them, and never accepts a URL or a credential.
  */
 export interface ReviewRouteTestInput {
+    /**
+     * What to run.
+     *
+     * `probe` (the default) proves the route answers at all; `review` runs the two
+     * scripted pending calls the settings page shows; `health` only reads the
+     * measured ledger and never contacts a provider.
+     */
+    mode?: ReviewRouteTestMode;
     /** Provider id to probe. */
     provider?: string;
     /** Model id to probe. */
@@ -80,6 +88,10 @@ export interface ReviewRouteTestInput {
     /** Effort to probe; `inherit` is sent as the provider default for a probe. */
     reasoningEffort?: string;
 }
+/** One selectable saved-route test mode. */
+export type ReviewRouteTestMode = 'probe' | 'review' | 'health';
+/** Every mode the endpoint accepts. */
+export declare const REVIEW_ROUTE_TEST_MODES: readonly ReviewRouteTestMode[];
 /** Type name of the optional input codec's stable type symbol. */
 export declare const INPUT_SCHEMA_NAME = "ReviewRouteTestInput";
 /** Stable type symbol of the optional input codec. */
@@ -126,6 +138,59 @@ export interface ReviewRouteTestResult {
     failureCode: string;
     /** Short classified diagnostic detail, or `''` when none. */
     detail: string;
+    /** Scripted review-case results; present only for a `review` run. */
+    cases?: ReviewRouteTestCase[];
+    /** Measured ledger health; present only for a `health` run. */
+    health?: ReviewRouteHealth;
+}
+/** One scripted review case run against a route. */
+export interface ReviewRouteTestCase {
+    /** Which scripted pending call this case is. */
+    case: 'allow' | 'deny';
+    /** Decision the case expects from a correct reviewer. */
+    expected: 'allow' | 'deny';
+    /** Decision the route actually returned; `''` when it produced nothing usable. */
+    actual: '' | 'allow' | 'deny';
+    /** Risk class the route reported; `''` when it reported none. */
+    risk: '' | 'low' | 'medium' | 'high';
+    /** Whether {@link actual} matched {@link expected}. */
+    ok: boolean;
+    /** Provider-neutral failure code of this case; `''` when the route answered. */
+    failureCode: string;
+    /** Wall-clock duration of this case in milliseconds. */
+    latencyMs: number;
+    /** Short classified diagnostic detail; `''` when none. */
+    detail: string;
+}
+/** One route's measured health within the current ledger week. */
+export interface ReviewRouteHealthEntry {
+    /** Provider id of the measured route. */
+    provider: string;
+    /** Model id of the measured route. */
+    model: string;
+    /** Attempts this route was asked for. */
+    attempts: number;
+    /** Attempts that produced the review decision. */
+    answered: number;
+    /** Attempts that failed and moved on. */
+    failed: number;
+    /** Mean attempt duration in milliseconds, rounded. */
+    avgMs: number;
+    /** Epoch milliseconds of the newest measured attempt, `0` when never used. */
+    lastAt: number;
+    /** Newest observed failure code, `''` when the route never failed. */
+    lastFailureCode: string;
+}
+/** Ledger health snapshot served to the settings page. */
+export interface ReviewRouteHealth {
+    /** Ledger file the numbers came from (basename), `''` when unavailable. */
+    ledger: string;
+    /** ISO week the ledger covers, e.g. `2026-W48`. */
+    week: string;
+    /** Review records that contributed at least one route attempt. */
+    records: number;
+    /** Measured routes, ordered by attempt count. */
+    routes: ReviewRouteHealthEntry[];
 }
 /**
  * Strict parser for the optional explicit-route input.

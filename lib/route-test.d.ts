@@ -1,4 +1,4 @@
-import type { ReviewRouteTestAuthKind, ReviewRouteTestCode, ReviewRouteTestRoute, ReviewRouteTestStatus } from './typert.contract.js';
+import type { ReviewRouteTestAuthKind, ReviewRouteHealth, ReviewRouteTestCode, ReviewRouteTestMode, ReviewRouteTestRoute, ReviewRouteTestStatus } from './typert.contract.js';
 import type { ReviewerConfig } from './policy.js';
 import { normalizeFailureCode, readFinishFailure, readThrownFailure } from './failure.js';
 export { normalizeFailureCode, readFinishFailure, readThrownFailure } from './failure.js';
@@ -25,6 +25,26 @@ export declare const ROUTE_TEST_MAX_OUTPUT_CHUNKS = 32;
  * degraded adapter from holding the endpoint open forever during cleanup.
  */
 export declare const ROUTE_TEST_CLOSE_GRACE_MS = 250;
+/** Output-token budget of one scripted review case. */
+export declare const REVIEW_CASE_MAX_TOKENS = 512;
+/** One scripted pending call the review test replays through a route. */
+interface ReviewCaseSpec {
+    /** Stable case id carried on the wire. */
+    case: 'allow' | 'deny';
+    /** Decision a correct reviewer must return. */
+    expected: 'allow' | 'deny';
+    /** Shell command described to the reviewer; never executed. */
+    command: string;
+}
+/**
+ * The two scripted cases every review test runs, in order.
+ *
+ * They are fixed by design: the allow case proves the route does not blanket-deny
+ * ordinary work, and the deny case proves it does not blanket-allow an
+ * irreversible credential exfiltration. Both are plain `bash` calls, so the
+ * reviewer sees exactly the tool it reviews in production.
+ */
+export declare const REVIEW_CASES: readonly ReviewCaseSpec[];
 /** Fixed system prompt of the harmless probe; carries no review policy and no session data. */
 export declare const ROUTE_TEST_SYSTEM_PROMPT = "You are a connectivity probe for a model settings page. Follow the user instruction exactly and keep the reply minimal.";
 /** Fixed user prompt of the harmless probe. */
@@ -121,6 +141,26 @@ export interface RouteTestOptions {
     maxPerWindow?: number;
     /** Requested output-token budget; capped at {@link ROUTE_TEST_MAX_TOKENS}. */
     maxTokens?: number;
+    /**
+     * Last real reviewer prompt observed by the Host, or `undefined` when this
+     * process has not reviewed anything yet.
+     *
+     * The review test never invents a policy: it replays the prompt the auto
+     * review actually sends, so a route is judged by the same instructions it
+     * would face in production.
+     */
+    reviewPrompt?: () => RouteTestReviewPrompt | undefined;
+    /** Ledger health reader; defaults to the measured weekly ledger. */
+    health?: () => ReviewRouteHealth;
+}
+/** One cached real reviewer prompt, reduced to what a test needs. */
+export interface RouteTestReviewPrompt {
+    /** The real review system prompt. */
+    system: string;
+    /** The real first user message (`ENVIRONMENT`), with the session path only. */
+    environment: string;
+    /** Epoch milliseconds when the Host captured it. */
+    capturedAt: number;
 }
 /** Auth style and directory metadata of the probed provider. */
 export interface RouteTestProviderClassification {
@@ -298,6 +338,45 @@ export declare function normalizeRouteTestInput(input: unknown): ReviewRouteTest
  * @param config - live reviewer config (volatile refs or plain values).
  * @param options - test-only tuning overrides; production omits them.
  */
+/** Read the requested mode from an untrusted wire input. */
+export declare function readRouteTestMode(input: unknown): ReviewRouteTestMode;
+/**
+ * Build the exact options of one scripted review case.
+ *
+ * The request replays the real reviewer prompt captured from production traffic:
+ * the same system policy, the same `ENVIRONMENT` message, and one synthetic
+ * `tool-call` history entry describing the case. The session's own history is
+ * deliberately absent, so nothing from the conversation is retained in memory or
+ * resent, and the pending call is the only action the reviewer can authorize.
+ *
+ * @param route - route under test.
+ * @param effortUsed - advertised effort to send, or `''` for the provider default.
+ * @param prompt - cached real reviewer prompt.
+ * @param spec - scripted case to describe.
+ * @param signal - combined caller/deadline cancellation signal.
+ * @returns the exact `GenerateOptions` handed to `ctx.llm.stream`.
+ */
+export declare function buildReviewCaseRequest(route: ReviewRouteTestRoute, effortUsed: string, prompt: RouteTestReviewPrompt, spec: ReviewCaseSpec, signal: AbortSignal): RouteTestGenerateOptions;
+/** One parsed reviewer answer. */
+interface ParsedReviewAnswer {
+    /** Decision the route returned, `''` when it returned no usable decision. */
+    decision: '' | 'allow' | 'deny';
+    /** Risk class the route returned, `''` when absent. */
+    risk: '' | 'low' | 'medium' | 'high';
+    /** Whether the text was a usable risk/decision object at all. */
+    parsed: boolean;
+}
+/**
+ * Read one reviewer answer.
+ *
+ * Only the outer protocol is enforced here: a JSON object carrying a known risk
+ * and decision. The test compares the decision with the scripted expectation; it
+ * never tries to second-guess the reviewer's risk class.
+ *
+ * @param text - assembled answer text.
+ * @returns the parsed decision, or an unparsed placeholder.
+ */
+export declare function parseReviewAnswer(text: string): ParsedReviewAnswer;
 export declare function installRouteTestEndpoint(ctx: RouteTestContext, config: ReviewerConfig, options?: RouteTestOptions): void;
 /**
  * Stable helpers exposed for regression tests and Host integration checks.
@@ -316,7 +395,7 @@ export declare const __testing: {
     ROUTE_TEST_CLOSE_GRACE_MS: number;
     ROUTE_TEST_SYSTEM_PROMPT: string;
     ROUTE_TEST_USER_PROMPT: string;
-    ROUTE_TEST_DETAILS: Readonly<Record<"OK" | "ROUTE_DISABLED" | "ROUTE_INCOMPLETE" | "BUSY" | "RATE_LIMITED" | "CANCELLED" | "TIMEOUT" | "NO_ADAPTER" | "UNKNOWN_MODEL" | "MODEL_UNSUPPORTED" | "MISSING_CREDENTIAL" | "INVALID_CREDENTIAL" | "NO_CREDENTIAL_STORE" | "AUTH" | "ACCOUNT_SIGN_IN_REQUIRED" | "ACCOUNT_AUTH_FAILED" | "ACCOUNT_CONNECTION" | "CONNECTION" | "RATE_LIMIT" | "QUOTA" | "CONTEXT_WINDOW_EXCEEDED" | "UNSUPPORTED_REASONING_EFFORT" | "EMPTY_RESPONSE" | "UNKNOWN", string>>;
+    ROUTE_TEST_DETAILS: Readonly<Record<"OK" | "ROUTE_DISABLED" | "ROUTE_INCOMPLETE" | "BUSY" | "RATE_LIMITED" | "CANCELLED" | "TIMEOUT" | "NO_ADAPTER" | "UNKNOWN_MODEL" | "MODEL_UNSUPPORTED" | "MISSING_CREDENTIAL" | "INVALID_CREDENTIAL" | "NO_CREDENTIAL_STORE" | "AUTH" | "ACCOUNT_SIGN_IN_REQUIRED" | "ACCOUNT_AUTH_FAILED" | "ACCOUNT_CONNECTION" | "CONNECTION" | "RATE_LIMIT" | "QUOTA" | "CONTEXT_WINDOW_EXCEEDED" | "UNSUPPORTED_REASONING_EFFORT" | "EMPTY_RESPONSE" | "NO_REVIEW_PROMPT" | "REVIEW_MISMATCH" | "UNKNOWN", string>>;
     REMOTE_SERVICE_KEY: string;
     REMOTE_NAMESPACE: string;
     createRouteTestState: typeof createRouteTestState;
