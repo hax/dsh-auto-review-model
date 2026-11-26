@@ -52,7 +52,7 @@ The command adds the package as a dependency and bundle layer for the `web` prof
 
 After installing or rebuilding the client, reload the Web profile in the usual DSH way and refresh the page for the configuration panel to appear. Saving settings takes effect on the next review without requiring a session restart.
 
-Because the Host face is discovered by the Typert Loader from the package's `./typert` export, install or upgrade the package before starting DSH, or restart DSH after the package files change, so the new export is registered. The browser half then mounts the `./remote` contribution automatically when the settings page loads.
+The Host face is discovered by the Typert Loader from the package's `./typert` export. A linked package (`link:` dependency) is read from disk, so after its files change you only need to **reload the plugin entry** (Plugin Manager, or any profile recomposition): the HMR recomposition re-imports the changed files, re-registers the Typert face and re-reads the browser bundle. A full DSH restart is the fallback for when the entry itself cannot be reloaded (for example it fails to import) or HMR is disabled — it is never required just because a file changed. The browser half then mounts the `./remote` contribution automatically when the settings page loads.
 
 ## Configuration
 
@@ -202,7 +202,7 @@ As of 2026-11-27, the unified weighted route list, the per-session sticky route,
 **Validation boundaries**:
 - **The automated suite uses in-memory fake adapters**: unit tests execute no real LLM API or network call. The live behavior was verified separately after restarting the DSH web host (see below).
 - **Browser behavior was reviewed manually, not automated**: the table layout, per-row test buttons, inline results and light/dark appearance were inspected on the running settings page; automated tests use a deterministic hook driver rather than a real browser, and visual regression coverage is not part of `npm test`.
-- **Live Gateway dispatch was verified after a host restart**: the earlier `gateway/arguments-invalid` failures came from a DSH web host process started before the optional `input` parameter existed. After restarting that host, the rebuilt client's per-row **Test** button returned real classified results through the installed Typert Loader + Gateway RPC path, and the saved row-1 path still works. Install/upgrade the package (or restart DSH) after changing the `./typert` contract.
+- **Live Gateway dispatch was verified after a host restart**: the earlier `gateway/arguments-invalid` failures came from a DSH web host process started before the optional `input` parameter existed. After restarting that host, the rebuilt client's per-row **Test** button returned real classified results through the installed Typert Loader + Gateway RPC path, and the saved row-1 path still works. After changing the `./typert` contract, reload the plugin entry; restart DSH only if the entry cannot be reloaded.
 
 ## Development
 
