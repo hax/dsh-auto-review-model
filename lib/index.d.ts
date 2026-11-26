@@ -58,7 +58,7 @@ import type { ReviewerConfig } from './policy.js';
 import { installRouteTestEndpoint } from './route-test.js';
 import { readThrownFailure } from './failure.js';
 export { ReviewerRouteError, ReviewerRoutesError } from './fallback.js';
-import { ReviewerRouteError, ReviewerRoutesError, buildReviewPlan, failureFromFinish, failureFromThrown, isAsyncIterable, isFallbackEligibleFailure, readFallbackEntries } from './fallback.js';
+import { ReviewerRouteError, ReviewerRoutesError, buildReviewPlan, failureFromFinish, failureFromThrown, isAsyncIterable, isFallbackEligibleFailure, readRoutes } from './fallback.js';
 /** One adapter-owned reasoning effort advertised for an exact route. */
 interface LlmEffortInfo {
     id?: string;
@@ -210,7 +210,8 @@ export declare const __testing: {
         PROTOCOL_FAILURE_CODE: string;
         normalizeFallbackEntry: typeof import("./fallback.js").normalizeFallbackEntry;
         isLegacySessionEntry: typeof import("./fallback.js").isLegacySessionEntry;
-        readFallbackEntries: typeof readFallbackEntries;
+        readFallbackEntries: typeof import("./fallback.js").readFallbackEntries;
+        readRoutes: typeof readRoutes;
         buildReviewPlan: typeof buildReviewPlan;
         isFallbackEligibleFailure: typeof isFallbackEligibleFailure;
         failureFromThrown: typeof failureFromThrown;

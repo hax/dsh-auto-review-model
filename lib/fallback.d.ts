@@ -1,5 +1,5 @@
 import type { FailureFacts } from './failure.js';
-import type { ReviewerConfig, ReviewerSettings } from './policy.js';
+import type { ReviewerConfig } from './policy.js';
 /** Largest number of configurable fallback entries a Host will schedule. */
 export declare const MAX_FALLBACK_ENTRIES = 10;
 /** Stable `name` of the aggregate all-routes-failed error. */
@@ -27,12 +27,8 @@ export interface FallbackEntry {
 }
 /** One concrete route the Host will try, in order. */
 export interface ReviewRouteAttempt {
-    /** Where the route came from. */
-    source: 'primary' | 'fallback';
-    /** How the route was resolved. */
+    /** How the route was resolved: an explicit entry or the implicit session route. */
     mode: RouteMode;
-    /** Index in the fallback array, or `-1` for the primary and implicit session routes. */
-    index: number;
     /** Provider id to send. */
     provider: string;
     /** Model id to send. */
@@ -93,32 +89,38 @@ export declare function normalizeFallbackEntry(raw: unknown): FallbackEntry;
  * @returns normalized explicit entries in configured order.
  */
 export declare function readFallbackEntries(config: ReviewerConfig | undefined): FallbackEntry[];
+/**
+ * Read the ordered reviewer routes from one live config snapshot.
+ *
+ * The unified `routes` list is authoritative. A config written before that list
+ * existed is migrated in place on read: its row 1 becomes the first route and its
+ * `fallbacks` follow, so an old settings document keeps behaving exactly as it
+ * did and rewrites into the new shape on the next save.
+ *
+ * @param config - live volatile settings.
+ * @returns every configured route in order, including disabled ones.
+ */
+export declare function readRoutes(config: ReviewerConfig | undefined): FallbackEntry[];
 /** Build the short diagnostic label of one attempt. */
 export declare function routeAttemptLabel(provider: string, model: string, mode: RouteMode): string;
 /**
  * Build the deterministic attempt order for one intercepted review request.
  *
- * The complete primary route comes first (row 1 of the settings list), then
- * every enabled explicit fallback entry in array order. A disabled row
- * (`primaryEnabled: false` or `enabled: false`) is skipped exactly like an
- * incomplete one. The intercepted request's own provider/model is then appended
- * as the implicit final fallback — the route the pending review was issued for,
- * never the plugin's idea of "the current session model" — and it never
- * overrides the reasoning effort. It is omitted when the request has no usable
- * route and when an explicit attempt already uses the same provider/model, so
- * the same route is never tried twice in a row.
+ * Every enabled, complete route is included in configured order, and the
+ * intercepted request's own provider/model is appended as the implicit final
+ * route — the route the pending review was issued for, never the plugin's idea of
+ * "the current session model" — with no explicit reasoning effort. It is omitted
+ * when the request has no usable route, and when an explicit route already uses
+ * the same provider/model, so the same route is never tried twice.
  *
  * An empty result means "do not take the review over at all": with no usable
  * enabled route the native session model already is the review route.
  *
- * @param settings - live primary settings (settings-list row 1).
- * @param fallbacks - normalized explicit fallback entries in order.
+ * @param routes - configured routes in order.
  * @param request - provider/model of the intercepted review request.
  * @returns the ordered attempts; empty when nothing may be routed.
  */
-export declare function buildReviewPlan(settings: Pick<ReviewerSettings, 'provider' | 'model' | 'reasoningEffort'> & {
-    primaryEnabled?: boolean;
-}, fallbacks: readonly FallbackEntry[], request: {
+export declare function buildReviewPlan(routes: readonly FallbackEntry[], request: {
     provider: string;
     model: string;
 }): ReviewRouteAttempt[];
@@ -212,6 +214,7 @@ export declare const __testing: {
     normalizeFallbackEntry: typeof normalizeFallbackEntry;
     isLegacySessionEntry: typeof isLegacySessionEntry;
     readFallbackEntries: typeof readFallbackEntries;
+    readRoutes: typeof readRoutes;
     buildReviewPlan: typeof buildReviewPlan;
     isFallbackEligibleFailure: typeof isFallbackEligibleFailure;
     failureFromThrown: typeof failureFromThrown;

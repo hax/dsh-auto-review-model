@@ -80,12 +80,8 @@ export interface FallbackEntry {
 
 /** One concrete route the Host will try, in order. */
 export interface ReviewRouteAttempt {
-  /** Where the route came from. */
-  source: 'primary' | 'fallback';
-  /** How the route was resolved. */
+  /** How the route was resolved: an explicit entry or the implicit session route. */
   mode: RouteMode;
-  /** Index in the fallback array, or `-1` for the primary and implicit session routes. */
-  index: number;
   /** Provider id to send. */
   provider: string;
   /** Model id to send. */
@@ -230,6 +226,49 @@ export function readFallbackEntries(config: ReviewerConfig | undefined): Fallbac
     .map(entry => normalizeFallbackEntry(entry));
 }
 
+/**
+ * Read the ordered reviewer routes from one live config snapshot.
+ *
+ * The unified `routes` list is authoritative. A config written before that list
+ * existed is migrated in place on read: its row 1 becomes the first route and its
+ * `fallbacks` follow, so an old settings document keeps behaving exactly as it
+ * did and rewrites into the new shape on the next save.
+ *
+ * @param config - live volatile settings.
+ * @returns every configured route in order, including disabled ones.
+ */
+export function readRoutes(config: ReviewerConfig | undefined): FallbackEntry[] {
+  const source = config ?? {};
+  const raw = readConfigValue(source.routes);
+  // The schema fills a missing volatile list with `[]`, so an empty array cannot
+  // be distinguished from "this config predates `routes`". Migrating in that case
+  // is safe both ways: a legacy config yields its old rows, and a config the
+  // settings page already rewrote carries empty legacy fields, so it stays empty.
+  if (Array.isArray(raw)) {
+    return raw
+      .filter(entry => !isLegacySessionEntry(entry))
+      .slice(0, MAX_FALLBACK_ENTRIES)
+      .map(entry => normalizeFallbackEntry(entry));
+  }
+  // Migration: the pre-`routes` document had a top-level route plus fallbacks.
+  const legacy: FallbackEntry[] = [];
+  const primaryEnabled = readConfigValue(source.primaryEnabled) !== false;
+  const provider = readConfigValue(source.provider);
+  const model = readConfigValue(source.model);
+  const trimmedProvider = provider === undefined || provider === null ? '' : String(provider).trim();
+  const trimmedModel = model === undefined || model === null ? '' : String(model).trim();
+  if (primaryEnabled && trimmedProvider !== '' && trimmedModel !== '') {
+    legacy.push({
+      enabled: true,
+      provider: trimmedProvider,
+      model: trimmedModel,
+      reasoningEffort: normalizeEffort(readConfigValue(source.reasoningEffort)),
+    });
+  }
+  for (const entry of readFallbackEntries(source)) legacy.push(entry);
+  return legacy;
+}
+
 /** Build the short diagnostic label of one attempt. */
 export function routeAttemptLabel(provider: string, model: string, mode: RouteMode): string {
   const route = `${provider}/${model}`;
@@ -239,56 +278,36 @@ export function routeAttemptLabel(provider: string, model: string, mode: RouteMo
 /**
  * Build the deterministic attempt order for one intercepted review request.
  *
- * The complete primary route comes first (row 1 of the settings list), then
- * every enabled explicit fallback entry in array order. A disabled row
- * (`primaryEnabled: false` or `enabled: false`) is skipped exactly like an
- * incomplete one. The intercepted request's own provider/model is then appended
- * as the implicit final fallback — the route the pending review was issued for,
- * never the plugin's idea of "the current session model" — and it never
- * overrides the reasoning effort. It is omitted when the request has no usable
- * route and when an explicit attempt already uses the same provider/model, so
- * the same route is never tried twice in a row.
+ * Every enabled, complete route is included in configured order, and the
+ * intercepted request's own provider/model is appended as the implicit final
+ * route — the route the pending review was issued for, never the plugin's idea of
+ * "the current session model" — with no explicit reasoning effort. It is omitted
+ * when the request has no usable route, and when an explicit route already uses
+ * the same provider/model, so the same route is never tried twice.
  *
  * An empty result means "do not take the review over at all": with no usable
  * enabled route the native session model already is the review route.
  *
- * @param settings - live primary settings (settings-list row 1).
- * @param fallbacks - normalized explicit fallback entries in order.
+ * @param routes - configured routes in order.
  * @param request - provider/model of the intercepted review request.
  * @returns the ordered attempts; empty when nothing may be routed.
  */
 export function buildReviewPlan(
-  settings: Pick<ReviewerSettings, 'provider' | 'model' | 'reasoningEffort'> & {
-    primaryEnabled?: boolean;
-  },
-  fallbacks: readonly FallbackEntry[],
+  routes: readonly FallbackEntry[],
   request: { provider: string; model: string },
 ): ReviewRouteAttempt[] {
   const plan: ReviewRouteAttempt[] = [];
-  if (settings.primaryEnabled !== false && settings.provider !== '' && settings.model !== '') {
+  for (const entry of routes) {
+    if (entry.enabled === false) continue;
+    if (entry.provider === '' || entry.model === '') continue;
     plan.push({
-      source: 'primary',
       mode: 'route',
-      index: -1,
-      provider: settings.provider,
-      model: settings.model,
-      reasoningEffort: settings.reasoningEffort,
-      label: routeAttemptLabel(settings.provider, settings.model, 'route'),
-    });
-  }
-  fallbacks.forEach((entry, index) => {
-    if (entry.enabled === false) return;
-    if (entry.provider === '' || entry.model === '') return;
-    plan.push({
-      source: 'fallback',
-      mode: 'route',
-      index,
       provider: entry.provider,
       model: entry.model,
       reasoningEffort: entry.reasoningEffort,
       label: routeAttemptLabel(entry.provider, entry.model, 'route'),
     });
-  });
+  }
   if (
     plan.length > 0
     && request.provider !== ''
@@ -296,9 +315,7 @@ export function buildReviewPlan(
     && !plan.some(attempt => attempt.provider === request.provider && attempt.model === request.model)
   ) {
     plan.push({
-      source: 'fallback',
       mode: 'session',
-      index: -1,
       provider: request.provider,
       model: request.model,
       reasoningEffort: '',
@@ -517,6 +534,7 @@ export const __testing = {
   normalizeFallbackEntry,
   isLegacySessionEntry,
   readFallbackEntries,
+  readRoutes,
   buildReviewPlan,
   isFallbackEligibleFailure,
   failureFromThrown,

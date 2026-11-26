@@ -76,7 +76,7 @@ import {
   failureFromThrown,
   isAsyncIterable,
   isFallbackEligibleFailure,
-  readFallbackEntries,
+  readRoutes,
   __testing as fallbackTesting,
 } from './fallback.js';
 import type {
@@ -897,12 +897,11 @@ export function apply(ctx: HostContext, config: ReviewerConfig): void {
         return next();
       }
       // The deprecated `enabled` knob is ignored: this plugin is always active.
-      const settings = readReviewerSettings(config);
       const requestRoute = {
         provider: typeof options.provider === 'string' ? options.provider.trim() : '',
         model: typeof options.model === 'string' ? options.model.trim() : '',
       };
-      const plan = buildReviewPlan(settings, readFallbackEntries(config), requestRoute);
+      const plan = buildReviewPlan(readRoutes(config), requestRoute);
       // No usable explicit route: reviews already use the native session model,
       // so there is nothing to rewrite (the session route is implicit).
       if (plan.length === 0) return next();

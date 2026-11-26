@@ -71,11 +71,20 @@ export type ConfigValue<T> = T | ConfigRef<T> | undefined;
 export interface ReviewerConfig {
   /** @deprecated Ignored; the plugin is always active. Kept for old configs. */
   enabled?: ConfigValue<boolean>;
-  /** Whether settings-list row 1 (the top-level route) is eligible. */
+  /**
+   * Ordered reviewer routes. Every entry has the same shape and is tried in
+   * order until one answers, so there is no separate "primary" route.
+   */
+  routes?: ConfigValue<unknown>;
+  /** @deprecated Read only to migrate old configs into {@link routes}. */
   primaryEnabled?: ConfigValue<boolean>;
+  /** @deprecated Read only to migrate old configs into {@link routes}. */
   provider?: ConfigValue<string>;
+  /** @deprecated Read only to migrate old configs into {@link routes}. */
   model?: ConfigValue<string>;
+  /** @deprecated Read only to migrate old configs into {@link routes}. */
   reasoningEffort?: ConfigValue<string>;
+  /** @deprecated Read only to migrate old configs into {@link routes}. */
   fallbacks?: ConfigValue<unknown>;
 }
 

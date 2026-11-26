@@ -63,8 +63,9 @@ import type {
   ReviewRouteTestRoute,
   ReviewRouteTestStatus,
 } from './typert.contract.js';
-import { INHERIT_EFFORT, normalizeEffort, readReviewerSettings } from './policy.js';
+import { INHERIT_EFFORT, normalizeEffort } from './policy.js';
 import type { ReviewerConfig } from './policy.js';
+import { readRoutes } from './fallback.js';
 import {
   httpStatusOf,
   isRecord,
@@ -1463,12 +1464,12 @@ export function installRouteTestEndpoint(
       signal?: AbortSignal,
     ): Promise<ReviewRouteTestResult> {
       const startedAt = now();
-      const settings = readReviewerSettings(config);
+      const firstRoute = readRoutes(config)[0];
       const explicitRoute = normalizeRouteTestInput(input);
-      const savedEffort = normalizeEffort(settings.reasoningEffort);
+      const savedEffort = normalizeEffort(firstRoute?.reasoningEffort);
       const route: ReviewRouteTestRoute = explicitRoute ?? {
-        provider: settings.provider,
-        model: settings.model,
+        provider: firstRoute?.provider ?? '',
+        model: firstRoute?.model ?? '',
         // A probe cannot resolve the main session's effort, so an `inherit`
         // saved row is probed with the provider default.
         reasoningEffort: savedEffort === INHERIT_EFFORT ? '' : savedEffort,
