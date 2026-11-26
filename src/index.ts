@@ -641,69 +641,196 @@ async function* rewriteSingleRoute(
     effortCache,
   );
   patchedRequests.add(patched);
-  yield* ctx.llm.stream(patched);
+  const iterable = ctx.llm.stream(patched);
+  if (!isAsyncIterable(iterable)) {
+    throw new ReviewerRouteError(attempt.label, PROTOCOL_FAILURE_CODE, 'the provider returned no chunk stream');
+  }
+  const outcome = await collectAnswer(iterable[Symbol.asyncIterator](), options.signal);
+  if ('failure' in outcome) {
+    throw new ReviewerRouteError(attempt.label, outcome.failure.code === '' ? PROTOCOL_FAILURE_CODE : outcome.failure.code, outcome.failure.detail);
+  }
+  for (const chunk of outcome.answer.chunks) yield chunk;
+  yield outcome.answer.finish;
 }
 
 /**
- * Turn one thrown provider failure into a retryable route failure, or throw a
- * non-retryable {@link ReviewerRouteError}.
+ * One reviewer answer buffered far enough to decide whether to keep it.
  *
- * An unclassified throw during streaming is treated as a transport-level route
- * failure: the route produced no decision, so trying the next configured route
- * is the whole point of the fallback list. A throw that *does* carry an official
- * provider-neutral code (or a valid HTTP status) is judged by the same
- * classification table as a terminal `finish`: only route / credential / quota /
- * rate-limit / transport failures move on, while content and protocol failures
- * are surfaced instead of being hidden behind another route.
- *
- * @param {ReviewRouteAttempt} attempt - the route that threw.
- * @param {unknown} error - the caught rejection.
- * @returns {ReviewerRouteFailure} a retryable failure record.
- * @throws {ReviewerRouteError} for a classified non-retryable failure.
+ * A reviewer answer is one short JSON object by contract, so buffering it costs
+ * nothing measurable. Doing so is what lets this plugin treat "the model answered
+ * something that is not a risk/decision object" as a route failure: the caller's
+ * parser never has to see the bad answer, so the next configured route still gets
+ * a chance and the failing route only fails once.
  */
-function routeFailureFromThrown(attempt: ReviewRouteAttempt, error: unknown): ReviewerRouteFailure {
-  const facts = readThrownFailure(error);
-  const failure = failureFromThrown(attempt, error);
-  if (facts.code === '' && facts.status === undefined) {
-    // Unclassified thrown stream error: treat it as a route failure.
-    return failure;
+interface BufferedAnswer {
+  /** Every chunk before the terminal `finish`, in arrival order. */
+  chunks: unknown[];
+  /** Concatenated `text-delta` content of the answer. */
+  text: string;
+  /** The terminal `finish` chunk. */
+  finish: unknown;
+}
+
+/** A buffered answer could not be produced; the route failed. */
+interface AnswerFailure {
+  code: string;
+  detail: string;
+}
+
+/** Reviewer answers are one JSON object; refuse to buffer an unbounded stream. */
+const ANSWER_BUFFER_LIMIT = 1 << 20;
+
+/**
+ * Whether a reviewer answer is a usable risk/decision object.
+ *
+ * Only the outer shape is checked here: one JSON object carrying a known `risk`
+ * and `decision`. DSH applies the stricter combination rules itself; this check
+ * exists only to keep a route that answered something else (prose, tool-call
+ * markup, an empty block) from being committed as the reviewer's decision.
+ */
+function isUsableReviewAnswer(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed === '') return false;
+  let value: unknown;
+  try {
+    value = JSON.parse(trimmed);
+  } catch {
+    return false;
   }
-  if (isFallbackEligibleFailure(facts)) return failure;
-  throw new ReviewerRouteError(
-    attempt.label,
-    failure.code === '' ? PROTOCOL_FAILURE_CODE : failure.code,
-    failure.detail,
-    error,
+  if (!isRecord(value)) return false;
+  const record = value as Record<string, unknown>;
+  const risk = record['risk'];
+  const decision = record['decision'];
+  return (
+    (risk === 'low' || risk === 'medium' || risk === 'high') &&
+    (decision === 'allow' || decision === 'deny')
   );
 }
 
 /**
- * Try each planned route in order and forward the winning route's chunks as
- * they arrive.
+ * Drain one reviewer stream into a {@link BufferedAnswer} without forwarding it.
  *
- * The failover contract is a commit point: a route may only be replaced while
- * NO chunk has reached the caller. Every chunk is yielded immediately (no
- * capture), so a reasoning-heavy reviewer can stream as long as the provider
- * allows. Once a chunk has been
- * emitted, a later failure is surfaced as a {@link ReviewerRouteError} because
- * the caller's single-decision stream is already contaminated and switching
- * routes would duplicate or mix output. Failures before the first emitted chunk
- * — a failed capability lookup, a thrown stream, a retryable terminal finish,
- * or a premature end with no output — advance to the next route, and all of them
- * still produce one aggregate error when no route can answer.
- *
- * Caller aborts keep the same semantics (propagated, never retried), and every
- * abandoned provider stream gets a best-effort close.
- *
- * @param {HostContext} ctx - plugin context exposing `llm` and `sessions`.
- * @param {GenerateOptions} options - frozen original reviewer `GenerateOptions`.
- * @param {readonly ReviewRouteAttempt[]} plan - ordered attempts.
- * @param {WeakSet<object>} patchedRequests - objects already rewritten.
- * @param {CapabilityCache} effortCache - capability cache.
- * @returns {AsyncGenerator<unknown>} the winning route's live chunk stream.
- * @throws {ReviewerRouteError} when a failure happens after output was emitted.
- * @throws {ReviewerRoutesError} when every route fails before any output.
+ * Both transport-level and content-level failures are reported the same way:
+ * the caller decides which route to try next. A stream that ends without a
+ * terminal `finish` fails as `STREAM_CLOSED`; a `finish` whose reason is an
+ * error or an abort fails with that reason; a clean stop whose text is not a
+ * risk/decision object fails as `UNUSABLE_ANSWER`.
  */
+async function collectAnswer(
+  iterator: AsyncIterator<unknown>,
+  signal: AbortSignal | undefined,
+): Promise<{ answer: BufferedAnswer } | { failure: AnswerFailure }> {
+  const chunks: unknown[] = [];
+  let text = '';
+  try {
+    for (;;) {
+      signal?.throwIfAborted();
+      let step: IteratorResult<unknown>;
+      try {
+        step = await iterator.next();
+      } catch (error) {
+        signal?.throwIfAborted();
+        const facts = readThrownFailure(error);
+        return {
+          failure: {
+            code: facts.code,
+            detail: error instanceof Error && error.message !== '' ? error.message : String(error),
+          },
+        };
+      }
+      signal?.throwIfAborted();
+      if (step.done === true) {
+        return { failure: { code: 'STREAM_CLOSED', detail: 'the reviewer stream ended before its terminal finish' } };
+      }
+      const chunk = step.value;
+      if (!isRecord(chunk) || chunk.type !== 'finish') {
+        chunks.push(chunk);
+        if (isRecord(chunk) && chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+          text += chunk.text;
+          if (text.length > ANSWER_BUFFER_LIMIT) {
+            return {
+              failure: { code: 'ANSWER_TOO_LARGE', detail: `reviewer answer exceeded ${ANSWER_BUFFER_LIMIT} characters` },
+            };
+          }
+        }
+        continue;
+      }
+      const reason = chunk.reason;
+      const kind = isRecord(reason) && typeof reason.kind === 'string' ? reason.kind : '';
+      if (kind === 'error') {
+        signal?.throwIfAborted();
+        const facts = isRecord(reason) && isRecord(reason.failure) ? reason.failure : undefined;
+        const code = facts !== undefined && typeof facts.code === 'string' ? facts.code : '';
+        const detail = facts !== undefined && typeof facts.message === 'string' ? facts.message : 'the reviewer stream failed';
+        return { failure: { code, detail } };
+      }
+      if (kind === 'aborted') {
+        return { failure: { code: 'ABORTED', detail: 'the provider aborted the reviewer stream' } };
+      }
+      if (!isUsableReviewAnswer(text)) {
+        return {
+          failure: {
+            code: 'UNUSABLE_ANSWER',
+            detail: `the reviewer answered ${JSON.stringify(text.slice(0, 120))}, which is not a risk/decision object`,
+          },
+        };
+      }
+      return {
+        answer: {
+          chunks,
+          text,
+          finish: chunk,
+        },
+      };
+    }
+  } finally {
+    try {
+      await iterator.return?.();
+    } catch {
+      // Cleanup must never mask the failure that abandoned the stream.
+    }
+  }
+}
+
+/** Convert an observed thrown failure to one attempt record. */
+function routeFailureFromThrown(attempt: ReviewRouteAttempt, error: unknown): ReviewerRouteFailure {
+  return failureFromThrown(attempt, error);
+}
+
+/** Try one route without forwarding until the complete answer is validated. */
+async function tryReviewRoute(
+  ctx: HostContext,
+  options: GenerateOptions,
+  attempt: ReviewRouteAttempt,
+  patchedRequests: WeakSet<object>,
+  effortCache: CapabilityCache,
+): Promise<{ ok: true; chunks: unknown[]; finish: unknown } | { ok: false; failure: ReviewerRouteFailure }> {
+  let patched: GenerateOptions;
+  try {
+    patched = await buildRoutedRequest(ctx, options, attempt.provider, attempt.model, attempt.reasoningEffort, effortCache);
+  } catch (error) {
+    options.signal?.throwIfAborted();
+    if (!(error instanceof ReviewerCapabilityError)) throw error;
+    return { ok: false, failure: failureFromThrown(attempt, error) };
+  }
+  patchedRequests.add(patched);
+  let iterable: AsyncIterable<unknown>;
+  try { iterable = ctx.llm.stream(patched); }
+  catch (error) { options.signal?.throwIfAborted(); return { ok: false, failure: routeFailureFromThrown(attempt, error) }; }
+  if (!isAsyncIterable(iterable)) {
+    return { ok: false, failure: { attempt, code: PROTOCOL_FAILURE_CODE, detail: 'the provider returned no chunk stream' } };
+  }
+  let iterator: AsyncIterator<unknown>;
+  try { iterator = iterable[Symbol.asyncIterator](); }
+  catch (error) { options.signal?.throwIfAborted(); return { ok: false, failure: routeFailureFromThrown(attempt, error) }; }
+  const outcome = await collectAnswer(iterator, options.signal);
+  if ('failure' in outcome) {
+    options.signal?.throwIfAborted();
+    return { ok: false, failure: { attempt, code: outcome.failure.code, detail: outcome.failure.detail } };
+  }
+  return { ok: true, chunks: outcome.answer.chunks, finish: outcome.answer.finish };
+}
+
 async function* streamReviewWithFallback(
   ctx: HostContext,
   options: GenerateOptions,
@@ -713,147 +840,11 @@ async function* streamReviewWithFallback(
 ): AsyncGenerator<unknown> {
   const failures: ReviewerRouteFailure[] = [];
   for (const attempt of plan) {
-    options.signal?.throwIfAborted();
-    let patched: GenerateOptions;
-    try {
-      patched = await buildRoutedRequest(
-        ctx,
-        options,
-        attempt.provider,
-        attempt.model,
-        attempt.reasoningEffort,
-        effortCache,
-      );
-    } catch (error) {
-      options.signal?.throwIfAborted();
-      if (!(error instanceof ReviewerCapabilityError)) throw error;
-      failures.push(failureFromThrown(attempt, error));
-      continue;
-    }
-    patchedRequests.add(patched);
-
-    let iterable: AsyncIterable<unknown>;
-    try {
-      iterable = ctx.llm.stream(patched);
-    } catch (error) {
-      options.signal?.throwIfAborted();
-      failures.push(routeFailureFromThrown(attempt, error));
-      continue;
-    }
-    if (!isAsyncIterable(iterable)) {
-      throw new ReviewerRouteError(
-        attempt.label,
-        PROTOCOL_FAILURE_CODE,
-        'the provider returned no chunk stream',
-      );
-    }
-
-    let iterator: AsyncIterator<unknown>;
-    try {
-      iterator = iterable[Symbol.asyncIterator]();
-    } catch (error) {
-      options.signal?.throwIfAborted();
-      failures.push(routeFailureFromThrown(attempt, error));
-      continue;
-    }
-
-    /** Whether any chunk from THIS attempt has already reached the caller. */
-    let emitted = false;
-    try {
-      for (;;) {
-        options.signal?.throwIfAborted();
-        let step: IteratorResult<unknown>;
-        try {
-          step = await iterator.next();
-        } catch (error) {
-          options.signal?.throwIfAborted();
-          if (emitted) {
-            const failure = failureFromThrown(attempt, error);
-            throw new ReviewerRouteError(
-              attempt.label,
-              failure.code === '' ? PROTOCOL_FAILURE_CODE : failure.code,
-              failure.detail,
-              error,
-            );
-          }
-          failures.push(routeFailureFromThrown(attempt, error));
-          break;
-        }
-        options.signal?.throwIfAborted();
-
-        if (step.done === true) {
-          if (emitted) {
-            throw new ReviewerRouteError(
-              attempt.label,
-              'STREAM_CLOSED',
-              'the reviewer stream ended after chunks were forwarded before its terminal finish',
-            );
-          }
-          failures.push({
-            attempt,
-            code: 'STREAM_CLOSED',
-            detail: 'the reviewer stream ended before its terminal finish',
-          });
-          break;
-        }
-
-        const chunk = step.value;
-        if (!isRecord(chunk) || chunk.type !== 'finish') {
-          emitted = true;
-          yield chunk;
-          continue;
-        }
-
-        const reason = chunk.reason;
-        const kind = isRecord(reason) && typeof reason.kind === 'string' ? reason.kind : '';
-        if (kind === 'error') {
-          options.signal?.throwIfAborted();
-          const failure = failureFromFinish(attempt, reason);
-          if (emitted) {
-            // Output already crossed the boundary: never mix another route in.
-            throw new ReviewerRouteError(
-              attempt.label,
-              failure.code === '' ? PROTOCOL_FAILURE_CODE : failure.code,
-              failure.detail,
-            );
-          }
-          if (
-            isFallbackEligibleFailure(
-              failure.status === undefined
-                ? { code: failure.code }
-                : { code: failure.code, status: failure.status },
-            )
-          ) {
-            failures.push(failure);
-            break;
-          }
-          throw new ReviewerRouteError(
-            attempt.label,
-            failure.code === '' ? PROTOCOL_FAILURE_CODE : failure.code,
-            failure.detail,
-          );
-        }
-        if (kind === 'aborted') {
-          throw new ReviewerRouteError(
-            attempt.label,
-            'ABORTED',
-            'the provider aborted the reviewer stream',
-          );
-        }
-        // A normal terminal stop: forward the finish and stop as the winner.
-        yield chunk;
-        return;
-      }
-    } finally {
-      // Best-effort cleanup: the caller's abort signal remains the primary
-      // cancellation path, and a stream that ignores `return()` must not hold
-      // the review open.
-      try {
-        await iterator.return?.();
-      } catch {
-        // Cleanup must never mask the failure that abandoned the stream.
-      }
-    }
+    const outcome = await tryReviewRoute(ctx, options, attempt, patchedRequests, effortCache);
+    if (!outcome.ok) { failures.push(outcome.failure); continue; }
+    for (const chunk of outcome.chunks) yield chunk;
+    yield outcome.finish;
+    return;
   }
   throw new ReviewerRoutesError(failures);
 }
