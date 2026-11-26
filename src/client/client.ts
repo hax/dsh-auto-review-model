@@ -575,20 +575,20 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
 .dsh_arm_testDetail{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;overflow-wrap:anywhere}
 .dsh_arm_routes{display:flex;flex-direction:column;gap:8px;min-width:0;padding-top:10px;border-top:1px solid var(--dsw-alias-border-l2)}
 .dsh_arm_routeHeader{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;min-width:0}
-.dsh_arm_tableWrap{width:100%;min-width:0;overflow-x:auto;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-1)}
-.dsh_arm_table{box-sizing:border-box;width:100%;min-width:680px;border-collapse:collapse;table-layout:fixed}
+.dsh_arm_tableWrap{width:100%;min-width:0;overflow:visible;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-1)}
+.dsh_arm_table{box-sizing:border-box;width:100%;border-collapse:collapse;table-layout:fixed}
 .dsh_arm_table th{box-sizing:border-box;padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;font-weight:600;text-align:left;white-space:nowrap}
 .dsh_arm_table td{box-sizing:border-box;min-width:0;padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-l2);vertical-align:middle;text-align:left}
 .dsh_arm_table tbody tr:last-child td{border-bottom:none}
-.dsh_arm_colEnable{width:52px}
-.dsh_arm_colProvider{width:22%}
-.dsh_arm_colModel{width:27%}
-.dsh_arm_colEffort{width:16%}
+.dsh_arm_colEnable{width:44px}
+.dsh_arm_colProvider{width:20%}
+.dsh_arm_colModel{width:34%}
+.dsh_arm_colEffort{width:14%}
 .dsh_arm_colWeight{width:64px}
-.dsh_arm_colTest{width:84px}
-.dsh_arm_colActions{width:124px}
+.dsh_arm_colActions{width:176px}
 .dsh_arm_cellEnable{text-align:center}
 .dsh_arm_tableCheckbox{width:16px;height:16px;margin:0;vertical-align:middle;accent-color:var(--dsw-alias-brand-primary);cursor:pointer}
+.dsh_arm_tableCheckbox[data-arm-unavailable="true"]{accent-color:var(--dsw-alias-label-tertiary);opacity:.5}
 .dsh_arm_tableCheckbox:disabled{cursor:default}
 .dsh_arm_cellSelect .dsh_arm_select{width:100%;min-width:0}
 .dsh_arm_cellTest{white-space:nowrap}
@@ -1878,7 +1878,8 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
       const entryProviderOptions: SelectOption[] = [
         { value: '', label: t('routeProviderPlaceholder') },
       ];
-      if (route.provider !== '' && !groups.some((group) => group.id === route.provider)) {
+      const entryProviderUnavailable = route.provider !== '' && !groups.some((group) => group.id === route.provider);
+      if (entryProviderUnavailable) {
         entryProviderOptions.push({ value: route.provider, label: route.provider + ' ' + t('unavailable') });
       }
       for (const group of groups) entryProviderOptions.push({ value: group.id, label: group.name || group.id });
@@ -1927,6 +1928,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
           React.createElement('input', {
             type: 'checkbox',
             className: 'dsh_arm_tableCheckbox',
+            'data-arm-unavailable': entryProviderUnavailable ? 'true' : 'false',
             checked: route.enabled,
             disabled: rowDisabled,
             'aria-label': t('routeEnabled') + ' ' + rowLabel,
@@ -1989,7 +1991,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
             },
           }),
         ),
-        React.createElement('td', { className: 'dsh_arm_cellTest' },
+        React.createElement('td', { className: 'dsh_arm_cellActions' },
           React.createElement('button', {
             type: 'button',
             className: 'dsh_arm_button dsh_arm_buttonSecondary dsh_arm_testButton',
@@ -2000,8 +2002,6 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
               void runRowTest(index);
             },
           }, testBusy ? t('testing') : t('test')),
-        ),
-        React.createElement('td', { className: 'dsh_arm_cellActions' },
           iconButton(t('routeMoveUp'), '↑', rowDisabled || index === 0, 'route-' + String(index) + '-up', () => {
             updateRoutes((list) => moveRoute(list, index, -1));
           }),
@@ -2072,13 +2072,6 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     },
       React.createElement('div', { className: 'dsh_arm_routeHeader' },
         React.createElement('span', { className: 'dsh_arm_label' }, t('reviewRoutesTitle')),
-        React.createElement('button', {
-          type: 'button',
-          className: 'dsh_arm_button dsh_arm_buttonSecondary',
-          'data-arm-action': 'route-add',
-          disabled: controlsDisabled || rows.length >= MAX_ROUTES,
-          onClick: () => updateRoutes((list) => addRoute(list)),
-        }, t('routeAdd')),
       ),
       React.createElement('p', { className: 'dsh_arm_hint' }, t('reviewRoutesHint')),
       testRoute === undefined
@@ -2096,7 +2089,6 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
             React.createElement('col', { className: 'dsh_arm_colModel', key: 'model' }),
             React.createElement('col', { className: 'dsh_arm_colEffort', key: 'effort' }),
             React.createElement('col', { className: 'dsh_arm_colWeight', key: 'weight' }),
-            React.createElement('col', { className: 'dsh_arm_colTest', key: 'test' }),
             React.createElement('col', { className: 'dsh_arm_colActions', key: 'actions' }),
           ),
           React.createElement('thead', null,
@@ -2106,7 +2098,6 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
               React.createElement('th', { scope: 'col' }, t('routeModel')),
               React.createElement('th', { scope: 'col' }, t('routeEffort')),
               React.createElement('th', { scope: 'col', className: 'dsh_arm_thWeight' }, t('routeWeight')),
-              React.createElement('th', { scope: 'col' }, t('test')),
               React.createElement('th', { scope: 'col' }, t('routeActions')),
             ),
           ),
@@ -2119,6 +2110,15 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
             rows.flatMap((route, index) => renderRoute(route, index)),
           ),
         ),
+      ),
+      React.createElement('div', { className: 'dsh_arm_actions' },
+        React.createElement('button', {
+          type: 'button',
+          className: 'dsh_arm_button dsh_arm_buttonSecondary',
+          'data-arm-action': 'route-add',
+          disabled: controlsDisabled || rows.length >= MAX_ROUTES,
+          onClick: () => updateRoutes((list) => addRoute(list)),
+        }, t('routeAdd')),
       ),
       rows.length >= MAX_ROUTES
         ? React.createElement('p', { className: 'dsh_arm_hint' }, t('routeCapHint'))
