@@ -225,6 +225,14 @@ export const Config: z = z.object({
     model: z.string().default(''),
     reasoningEffort: z.string().default(''),
   })).default([]).volatile(),
+  /** Unified ordered reviewer routes; absent/empty means legacy migration. */
+  routes: z.array(z.object({
+    enabled: z.boolean().default(true),
+    weight: z.number().default(0),
+    provider: z.string().default(''),
+    model: z.string().default(''),
+    reasoningEffort: z.string().default(''),
+  })).volatile(),
 });
 
 /**
