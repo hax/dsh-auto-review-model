@@ -313,6 +313,11 @@ test('the optional input codec accepts only the documented route ids', () => {
     { mode: 'health' },
     'the health mode needs no route',
   );
+  assert.deepEqual(
+    schema.parse({ mode: 'full', provider: 'p', model: 'm' }),
+    { mode: 'full', provider: 'p', model: 'm' },
+    'the full mode is an accepted wire value',
+  );
   for (const [label, value] of [
     ['a non-object input', 'route'],
     ['an array input', []],

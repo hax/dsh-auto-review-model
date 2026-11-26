@@ -224,6 +224,8 @@ const ROUTE_TEST_DETAILS: Readonly<Record<ReviewRouteTestCode, string>> = {
     'No real review has run in this Host process yet, so there is no reviewer prompt to test against. Trigger one reviewed tool call, then run the review test again.',
   REVIEW_MISMATCH:
     'The route answered both scripted reviews but at least one decision did not match what a correct reviewer must decide. Check the route or choose another model.',
+  REVIEW_SKIPPED:
+    'The route answered the liveness probe, but this Host process has not reviewed anything yet, so there is no real reviewer prompt to check decisions against. Trigger one reviewed tool call, then test again.',
   UNKNOWN:
     'The saved route failed the test for an unclassified reason. Check the provider settings and credentials, then test the route again.',
 };
@@ -686,7 +688,7 @@ export function classifyRouteTestFailure(
  */
 export function routeTestStatusOf(code: ReviewRouteTestCode): ReviewRouteTestStatus {
   if (code === 'OK') return 'ok';
-  if (code === 'EMPTY_RESPONSE' || code === 'REVIEW_MISMATCH') return 'warning';
+  if (code === 'EMPTY_RESPONSE' || code === 'REVIEW_MISMATCH' || code === 'REVIEW_SKIPPED') return 'warning';
   if (
     code === 'ROUTE_DISABLED'
     || code === 'ROUTE_INCOMPLETE'
@@ -1462,7 +1464,7 @@ function buildRouteTestFailure(
 export function readRouteTestMode(input: unknown): ReviewRouteTestMode {
   if (input === null || typeof input !== 'object' || Array.isArray(input)) return 'probe';
   const mode = (input as Record<string, unknown>).mode;
-  return mode === 'review' || mode === 'health' ? mode : 'probe';
+  return mode === 'review' || mode === 'full' || mode === 'health' ? mode : 'probe';
 }
 
 /**
@@ -1744,10 +1746,21 @@ export function installRouteTestEndpoint(
           }
         }
 
-        if (mode === 'review') {
+        /**
+         * Run the two scripted review cases against this route.
+         *
+         * Shared by `review` (cases only) and `full` (liveness probe first). A
+         * transport failure abandons the run and forwards its classified result;
+         * an unparseable or runaway answer only fails that case, so the other one
+         * still tells the page something useful.
+         */
+        const runReviewCases = async (): Promise<
+          | { readonly ok: true; readonly cases: ReviewRouteTestCase[] }
+          | { readonly ok: false; readonly result: ReviewRouteTestResult }
+        > => {
           const prompt = options.reviewPrompt?.();
           if (prompt === undefined || prompt.system === '' || prompt.environment === '') {
-            return refuse('NO_REVIEW_PROMPT');
+            return { ok: false, result: refuse('NO_REVIEW_PROMPT') };
           }
           const cases: ReviewRouteTestCase[] = [];
           for (const spec of REVIEW_CASES) {
@@ -1761,11 +1774,9 @@ export function installRouteTestEndpoint(
               REVIEW_CASE_MAX_CHARS,
               REVIEW_CASE_MAX_CHUNKS,
             );
-            if (outcome.kind === 'cancelled') return refuse('CANCELLED');
-            if (outcome.kind === 'timeout') return refuse('TIMEOUT');
+            if (outcome.kind === 'cancelled') return { ok: false, result: refuse('CANCELLED') };
+            if (outcome.kind === 'timeout') return { ok: false, result: refuse('TIMEOUT') };
             if (outcome.kind === 'oversize') {
-              // A reviewer that never stops is a failed case, not a failed run:
-              // the other case still tells the page something useful.
               cases.push({
                 case: spec.case,
                 expected: spec.expected,
@@ -1780,16 +1791,16 @@ export function installRouteTestEndpoint(
             }
             if (outcome.kind === 'failure') {
               const aborted = abortOutcome(deadline);
-              if (aborted === 'CANCELLED') return refuse('CANCELLED');
-              if (aborted === 'TIMEOUT') return refuse('TIMEOUT');
-              return buildRouteTestFailure(stats, outcome.failure, { startedAt, now });
+              if (aborted === 'CANCELLED') return { ok: false, result: refuse('CANCELLED') };
+              if (aborted === 'TIMEOUT') return { ok: false, result: refuse('TIMEOUT') };
+              return { ok: false, result: buildRouteTestFailure(stats, outcome.failure, { startedAt, now }) };
             }
             const finishFailure = readFinishFailure(outcome.reason);
             if (finishFailure !== undefined) {
               const aborted = abortOutcome(deadline);
-              if (aborted === 'CANCELLED') return refuse('CANCELLED');
-              if (aborted === 'TIMEOUT') return refuse('TIMEOUT');
-              return buildRouteTestFailure(stats, finishFailure, { startedAt, now });
+              if (aborted === 'CANCELLED') return { ok: false, result: refuse('CANCELLED') };
+              if (aborted === 'TIMEOUT') return { ok: false, result: refuse('TIMEOUT') };
+              return { ok: false, result: buildRouteTestFailure(stats, finishFailure, { startedAt, now }) };
             }
             const parsed = parseReviewAnswer(outcome.text);
             cases.push({
@@ -1805,13 +1816,19 @@ export function installRouteTestEndpoint(
                 : 'The route answered something that is not a risk/decision object.',
             });
           }
-          const mismatch = cases.some(entry => !entry.ok);
+          return { ok: true, cases };
+        };
+
+        if (mode === 'review') {
+          const ran = await runReviewCases();
+          if (!ran.ok) return ran.result;
+          const mismatch = ran.cases.some(entry => !entry.ok);
           return buildRouteTestResult({
             code: mismatch ? 'REVIEW_MISMATCH' : 'OK',
             stats,
             startedAt,
             now,
-            cases,
+            cases: ran.cases,
           });
         }
 
@@ -1859,6 +1876,24 @@ export function installRouteTestEndpoint(
                 stats,
                 startedAt,
                 now,
+              });
+            }
+            // `full` (the settings page's single button) adds the two scripted
+            // review cases once the liveness probe proved the route answers.
+            if (mode === 'full') {
+              const prompt = options.reviewPrompt?.();
+              if (prompt === undefined || prompt.system === '' || prompt.environment === '') {
+                return buildRouteTestResult({ code: 'REVIEW_SKIPPED', stats, startedAt, now });
+              }
+              const ran = await runReviewCases();
+              if (!ran.ok) return ran.result;
+              const mismatch = ran.cases.some(entry => !entry.ok);
+              return buildRouteTestResult({
+                code: mismatch ? 'REVIEW_MISMATCH' : 'OK',
+                stats,
+                startedAt,
+                now,
+                cases: ran.cases,
               });
             }
             return buildRouteTestResult({

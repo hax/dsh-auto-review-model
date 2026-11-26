@@ -95,6 +95,7 @@ export const REVIEW_ROUTE_TEST_CODES = [
   'EMPTY_RESPONSE',
   'NO_REVIEW_PROMPT',
   'REVIEW_MISMATCH',
+  'REVIEW_SKIPPED',
   'UNKNOWN',
 ] as const;
 
@@ -119,8 +120,9 @@ export interface ReviewRouteTestInput {
    * What to run.
    *
    * `probe` (the default) proves the route answers at all; `review` runs the two
-   * scripted pending calls the settings page shows; `health` only reads the
-   * measured ledger and never contacts a provider.
+   * scripted pending calls the settings page shows; `full` runs the probe first
+   * and then both scripted calls (the settings page's single button); `health`
+   * only reads the measured ledger and never contacts a provider.
    */
   mode?: ReviewRouteTestMode;
   /** Provider id to probe. */
@@ -132,10 +134,10 @@ export interface ReviewRouteTestInput {
 }
 
 /** One selectable saved-route test mode. */
-export type ReviewRouteTestMode = 'probe' | 'review' | 'health';
+export type ReviewRouteTestMode = 'probe' | 'review' | 'full' | 'health';
 
 /** Every mode the endpoint accepts. */
-export const REVIEW_ROUTE_TEST_MODES: readonly ReviewRouteTestMode[] = ['probe', 'review', 'health'];
+export const REVIEW_ROUTE_TEST_MODES: readonly ReviewRouteTestMode[] = ['probe', 'review', 'full', 'health'];
 
 /** Type name of the optional input codec's stable type symbol. */
 export const INPUT_SCHEMA_NAME = 'ReviewRouteTestInput';

@@ -58,7 +58,7 @@ export declare const REMOTE_INVOCATION_ID = "@aghost-prj/dsh-auto-review-model#a
  * The list is the `enum` of the wire `code` field, so the Host, the Client
  * locale table, and tests all validate against this one declaration.
  */
-export declare const REVIEW_ROUTE_TEST_CODES: readonly ["OK", "ROUTE_DISABLED", "ROUTE_INCOMPLETE", "BUSY", "RATE_LIMITED", "CANCELLED", "TIMEOUT", "NO_ADAPTER", "UNKNOWN_MODEL", "MODEL_UNSUPPORTED", "MISSING_CREDENTIAL", "INVALID_CREDENTIAL", "NO_CREDENTIAL_STORE", "AUTH", "ACCOUNT_SIGN_IN_REQUIRED", "ACCOUNT_AUTH_FAILED", "ACCOUNT_CONNECTION", "CONNECTION", "RATE_LIMIT", "QUOTA", "CONTEXT_WINDOW_EXCEEDED", "UNSUPPORTED_REASONING_EFFORT", "EMPTY_RESPONSE", "NO_REVIEW_PROMPT", "REVIEW_MISMATCH", "UNKNOWN"];
+export declare const REVIEW_ROUTE_TEST_CODES: readonly ["OK", "ROUTE_DISABLED", "ROUTE_INCOMPLETE", "BUSY", "RATE_LIMITED", "CANCELLED", "TIMEOUT", "NO_ADAPTER", "UNKNOWN_MODEL", "MODEL_UNSUPPORTED", "MISSING_CREDENTIAL", "INVALID_CREDENTIAL", "NO_CREDENTIAL_STORE", "AUTH", "ACCOUNT_SIGN_IN_REQUIRED", "ACCOUNT_AUTH_FAILED", "ACCOUNT_CONNECTION", "CONNECTION", "RATE_LIMIT", "QUOTA", "CONTEXT_WINDOW_EXCEEDED", "UNSUPPORTED_REASONING_EFFORT", "EMPTY_RESPONSE", "NO_REVIEW_PROMPT", "REVIEW_MISMATCH", "REVIEW_SKIPPED", "UNKNOWN"];
 /** One saved-route test outcome code. */
 export type ReviewRouteTestCode = (typeof REVIEW_ROUTE_TEST_CODES)[number];
 /** Presentation tone of one outcome: success, reachable-with-issue, failure, or local refusal. */
@@ -77,8 +77,9 @@ export interface ReviewRouteTestInput {
      * What to run.
      *
      * `probe` (the default) proves the route answers at all; `review` runs the two
-     * scripted pending calls the settings page shows; `health` only reads the
-     * measured ledger and never contacts a provider.
+     * scripted pending calls the settings page shows; `full` runs the probe first
+     * and then both scripted calls (the settings page's single button); `health`
+     * only reads the measured ledger and never contacts a provider.
      */
     mode?: ReviewRouteTestMode;
     /** Provider id to probe. */
@@ -89,7 +90,7 @@ export interface ReviewRouteTestInput {
     reasoningEffort?: string;
 }
 /** One selectable saved-route test mode. */
-export type ReviewRouteTestMode = 'probe' | 'review' | 'health';
+export type ReviewRouteTestMode = 'probe' | 'review' | 'full' | 'health';
 /** Every mode the endpoint accepts. */
 export declare const REVIEW_ROUTE_TEST_MODES: readonly ReviewRouteTestMode[];
 /** Type name of the optional input codec's stable type symbol. */

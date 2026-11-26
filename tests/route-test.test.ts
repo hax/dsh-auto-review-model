@@ -1675,3 +1675,58 @@ test('review mode accepts a realistic reasoning-heavy answer instead of failing 
   assert.equal(probed.detail, '');
   assert.equal(probed.status, 'ok');
 });
+
+test('full mode probes the route first and then runs both scripted cases', async () => {
+  const prompt = { system: 'REVIEW_POLICY\nreal policy', environment: 'ENVIRONMENT\n{}', capturedAt: 1 };
+  const stream: StreamFactory = (generate) => {
+    const system = String(generate?.system ?? '');
+    // The liveness probe sends its own fixed instruction; the two scripted cases
+    // replay the captured review policy.
+    if (!system.startsWith('REVIEW_POLICY')) {
+      return okStream()(generate);
+    }
+    const pending = String(generate?.messages?.at(-1)?.content?.[0]?.text ?? '');
+    const answer = pending.includes('credentials.yaml')
+      ? '{"risk":"high","decision":"deny"}'
+      : '{"risk":"low","decision":"allow"}';
+    return streamOf([
+      { type: 'block-start', index: 0, blockType: 'text' },
+      { type: 'text-delta', index: 0, text: answer },
+      { type: 'block-end', index: 0, block: { type: 'text', text: answer } },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ]);
+  };
+  const harness = createHarness({ stream, endpointOptions: { reviewPrompt: () => prompt } });
+  const result = await harness.invoke({ input: { mode: 'full', provider: 'deepseek-account', model: 'deepseek-flash' } });
+
+  assert.equal(result.code, 'OK');
+  assert.equal(result.status, 'ok');
+  assert.equal(harness.streamCalls.length, 3, 'one liveness probe plus two scripted cases');
+  assert.equal(result.cases?.length, 2);
+  assert.deepEqual(result.cases?.map((entry) => entry.ok), [true, true]);
+  // The probe really ran first and asked for the fixed liveness prompt.
+  assert.ok(!String(harness.streamCalls[0]?.system ?? '').startsWith('REVIEW_POLICY'));
+  assert.equal(harness.streamCalls[0]?.maxTokens, 16);
+  assert.equal(harness.streamCalls[1]?.system, prompt.system);
+});
+
+test('full mode reports a probe-clean route with no reviewer prompt yet as skipped', async () => {
+  const harness = createHarness({ stream: okStream() });
+  const result = await harness.invoke({ input: { mode: 'full', provider: 'deepseek-account', model: 'deepseek-flash' } });
+  assert.equal(result.code, 'REVIEW_SKIPPED');
+  assert.equal(result.status, 'warning');
+  assert.equal(result.cases, undefined, 'no cases may be invented without a real prompt');
+  assert.equal(harness.streamCalls.length, 1, 'only the liveness probe ran');
+});
+
+test('full mode stops after a failed probe and never spends the review cases', async () => {
+  const prompt = { system: 'REVIEW_POLICY', environment: 'ENVIRONMENT\n{}', capturedAt: 1 };
+  const harness = createHarness({
+    stream: finishErrorStream('QUOTA'),
+    endpointOptions: { reviewPrompt: () => prompt },
+  });
+  const result = await harness.invoke({ input: { mode: 'full', provider: 'deepseek-account', model: 'deepseek-flash' } });
+  assert.equal(result.code, 'QUOTA');
+  assert.equal(result.status, 'error');
+  assert.equal(harness.streamCalls.length, 1, 'a route that cannot answer is not asked to review');
+});

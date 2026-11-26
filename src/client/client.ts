@@ -106,8 +106,8 @@ interface ReviewerSettings {
 
 /** Optional explicit route input of one per-row test. */
 interface ReviewRouteTestInput {
-  /** `probe` (default), `review` for the two scripted cases, or `health`. */
-  mode?: 'probe' | 'review' | 'health';
+  /** `probe` (default), `review` (cases only), `full` (probe then cases) or `health`. */
+  mode?: 'probe' | 'review' | 'full' | 'health';
   provider?: string;
   model?: string;
   reasoningEffort?: string;
@@ -415,8 +415,6 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     // outcomes plus a short technical detail.
     test: '测试',
     testing: '测试中…',
-    reviewTest: '审查',
-    reviewing: '审查中…',
     reviewCaseAllow: '放行用例',
     reviewCaseDeny: '拒绝用例',
     reviewPassed: '符合',
@@ -458,6 +456,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     testUnsupportedEffortMessage: '该模型不支持已保存的推理等级。',
     testNoReviewPromptMessage: '还没有可供测试的真实审查提示词。',
     testReviewMismatchMessage: '路由给出了决定，但与用例期望不符。',
+    testReviewSkippedMessage: '连接正常，但本进程还没有真实审查提示词，判定用例未运行。',
     testEmptyResponseMessage: '路由有响应，但返回了空内容。',
     testUnknownMessage: '路由测试因未知原因失败。',
     testOkHint: '',
@@ -483,6 +482,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     testUnsupportedEffortHint: '为 {provider} / {model} 选择其他推理等级（或默认值）并保存，然后重新测试。',
     testNoReviewPromptHint: '先让一次工具调用触发真实审查（本进程内），再运行审查测试。',
     testReviewMismatchHint: '对照两个用例：放行用例被拒绝是误杀，拒绝用例被放行是绕过，都需要换模型或检查策略路由。',
+    testReviewSkippedHint: '先让一次工具调用触发真实审查（本进程内），再测试一次。',
     testEmptyResponseHint: '连接可用，但模型返回了空补全；可重新测试或更换模型/推理等级。',
     testUnknownHint: '查看详情并核对提供商设置后重试；若持续出现，请更换提供商或模型。',
   };
@@ -537,8 +537,6 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     // detail are rendered; the provider's response text never reaches the page.
     test: 'Test',
     testing: 'Testing…',
-    reviewTest: 'Review',
-    reviewing: 'Reviewing…',
     reviewCaseAllow: 'Allow case',
     reviewCaseDeny: 'Deny case',
     reviewPassed: 'passed',
@@ -581,7 +579,9 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     testNoReviewPromptMessage: 'No real reviewer prompt is available yet',
     testNoReviewPromptHint: 'Trigger one reviewed tool call in this Host process, then run the review test again.',
     testReviewMismatchMessage: 'The route decided, but not what the scripted case expects',
+    testReviewSkippedMessage: 'The route answered, but this Host has no real reviewer prompt yet, so the scripted cases did not run.',
     testReviewMismatchHint: 'Read both case results: rejecting the allow case is a false block, allowing the deny case is a bypass; either way pick another model or check how the policy reaches this route.',
+    testReviewSkippedHint: 'Trigger one reviewed tool call in this Host process, then test again.',
     testEmptyResponseMessage: 'The route answered but returned no content.',
     testUnknownMessage: 'The route test failed for an unexpected reason.',
     testOkHint: '',
@@ -663,7 +663,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
 .dsh_arm_colModel{width:34%}
 .dsh_arm_colEffort{width:14%}
 .dsh_arm_colWeight{width:64px}
-.dsh_arm_colActions{width:236px}
+.dsh_arm_colActions{width:176px}
 .dsh_arm_cellEnable{text-align:center}
 .dsh_arm_tableCheckbox{width:16px;height:16px;margin:0;vertical-align:middle;accent-color:var(--dsw-alias-brand-primary);cursor:pointer}
 .dsh_arm_tableCheckbox[data-arm-unavailable="true"]{accent-color:var(--dsw-alias-label-tertiary);opacity:.5}
@@ -1393,6 +1393,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     EMPTY_RESPONSE: 'testEmptyResponseMessage',
     NO_REVIEW_PROMPT: 'testNoReviewPromptMessage',
     REVIEW_MISMATCH: 'testReviewMismatchMessage',
+    REVIEW_SKIPPED: 'testReviewSkippedMessage',
     UNKNOWN: 'testUnknownMessage',
   };
 
@@ -1423,6 +1424,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     EMPTY_RESPONSE: 'testEmptyResponseHint',
     NO_REVIEW_PROMPT: 'testNoReviewPromptHint',
     REVIEW_MISMATCH: 'testReviewMismatchHint',
+    REVIEW_SKIPPED: 'testReviewSkippedHint',
     UNKNOWN: 'testUnknownHint',
   };
 
@@ -1651,13 +1653,13 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     // save `busy` state or overwrites another row's result.
     const [rowTests, setRowTests] = React.useState<Record<number, RowTestState>>({});
     // Measured per-route health for the current ledger week. It is read once per
-    // page and never causes a provider request, so it cannot spend review quota.
+    // page and again after every test (both are local ledger reads), so it can
+    // never spend review quota or contact a provider.
     const [health, setHealth] = React.useState<ReviewHealth | null>(null);
-    React.useEffect(() => {
+    const refreshHealth = React.useCallback(async (): Promise<void> => {
       if (testRoute === undefined) return;
-      let cancelled = false;
-      testRoute.testReviewRoute({ mode: 'health' }).then((response) => {
-        if (cancelled) return;
+      try {
+        const response = await testRoute.testReviewRoute({ mode: 'health' });
         const value = response !== null && response !== undefined && response.ok === true
           ? response.value
           : undefined;
@@ -1667,13 +1669,13 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
         if (snapshot !== null && snapshot !== undefined && Array.isArray(snapshot.routes)) {
           setHealth(snapshot);
         }
-      }).catch(() => {
+      } catch {
         // Health is decorative: a failed read leaves the rows without a summary.
-      });
-      return () => {
-        cancelled = true;
-      };
+      }
     }, [testRoute]);
+    React.useEffect(() => {
+      void refreshHealth();
+    }, [refreshHealth]);
     const aliveRef = React.useRef(true);
     // Every started probe gets a sequence number per row; editing the list, or
     // starting another probe for the same row, advances it so a late response
@@ -1839,16 +1841,13 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
      * @param index - row position in the current explicit list.
      */
     /**
-     * Run one row's test, either the liveness probe or the two scripted reviews.
+     * Run one row's whole test: the liveness probe and the two scripted reviews.
      *
      * Every row owns an independent sequence number, so an edit or a second test
      * retires the previous result instead of letting it appear beside different
      * route values.
      */
-    const runRowTest = async (
-      index: number,
-      mode: 'probe' | 'review' = 'probe',
-    ): Promise<void> => {
+    const runRowTest = async (index: number): Promise<void> => {
       const row = rows[index];
       if (row === undefined) return;
       if (formBusy || !loaded || testRoute === undefined) return;
@@ -1872,7 +1871,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
       );
       try {
         const response = await testRoute.testReviewRoute({
-          ...(mode === 'review' ? { mode } : {}),
+          mode: 'full',
           provider: row.provider,
           model: row.model,
           reasoningEffort: row.reasoningEffort,
@@ -1896,6 +1895,9 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
           }
         }
         setRowTests((previous) => ({ ...previous, [index]: { busy: false, outcome, cases } }));
+        // The test itself is not a review, but re-reading the ledger keeps the
+        // measured line in step with whatever happened while the page was open.
+        void refreshHealth();
       } catch (error) {
         if (current()) {
           setRowTests((previous) => ({
@@ -2152,16 +2154,6 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
               void runRowTest(index);
             },
           }, testBusy ? t('testing') : t('test')),
-          React.createElement('button', {
-            type: 'button',
-            className: 'dsh_arm_button dsh_arm_buttonSecondary dsh_arm_testButton',
-            'data-arm-action': 'route-' + String(index) + '-review',
-            disabled: rowDisabled || testRoute === undefined || testBusy,
-            'aria-label': t('reviewTest') + ' ' + rowLabel,
-            onClick: () => {
-              void runRowTest(index, 'review');
-            },
-          }, testBusy ? t('reviewing') : t('reviewTest')),
           iconButton(t('routeMoveUp'), '↑', rowDisabled || index === 0, 'route-' + String(index) + '-up', () => {
             updateRoutes((list) => moveRoute(list, index, -1));
           }),

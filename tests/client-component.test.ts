@@ -1163,6 +1163,7 @@ test('each row has its own test button that probes that row\'s current values', 
 
   assert.equal(env.endpoint.calls.length, 1);
   assert.deepEqual(env.endpoint.inputs[0], {
+    mode: 'full',
     provider: 'provider-b',
     model: 'model-b1',
     reasoningEffort: 'inherit',
@@ -1303,7 +1304,7 @@ test('the page reads measured health once and shows it under its route', async (
   assert.match(String(healthCell?.props?.children ?? ''), /QUOTA/, 'the newest failure code must be shown');
 });
 
-test('the review button runs both scripted cases and shows their verdicts', async () => {
+test('the single test action runs the probe and both scripted cases in one call', async () => {
   const env = await setupComponent({
     savedSettings: { ...SAVED_ROUTE },
     catalogGroups: ROUTE_CATALOG,
@@ -1321,11 +1322,12 @@ test('the review button runs both scripted cases and shows their verdicts', asyn
   });
   env.render();
   let nodes = flattenNodes(await env.flush());
-  findByAction(nodes, 'route-0-review')?.props.onClick();
+  assert.equal(findByAction(nodes, 'route-0-review'), undefined, 'there is no second button anymore');
+  findByAction(nodes, 'route-0-test')?.props.onClick();
   nodes = flattenNodes(await env.flush());
 
-  assert.equal(env.endpoint.calls.length, 1, 'the review action must be one Remote call');
-  assert.equal(env.endpoint.inputs[0]?.mode, 'review', 'the review action must ask for the review mode');
+  assert.equal(env.endpoint.calls.length, 1, 'one button is one Remote call');
+  assert.equal(env.endpoint.inputs[0]?.mode, 'full', 'the single action asks for the full run');
   assert.equal(env.endpoint.inputs[0]?.provider, 'provider-a');
   const badges = nodes.filter((node) => node.props?.className?.includes('dsh_arm_reviewBadge'));
   assert.equal(badges.length, 2, 'both scripted cases must be shown');
@@ -1335,6 +1337,7 @@ test('the review button runs both scripted cases and shows their verdicts', asyn
     nodes.some((node) => node.props?.className?.includes('dsh_arm_routeTestStatus') && node.props?.className?.includes('dsh_arm_testWarn')),
     'a mismatch must render as a warning',
   );
+  assert.equal(env.endpoint.healthCalls, 2, 'the measured line is refreshed after a test');
 });
 
 test('the test action is unavailable without a mounted endpoint', async () => {
