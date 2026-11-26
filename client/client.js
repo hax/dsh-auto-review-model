@@ -849,6 +849,15 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
             const source = raw !== null && typeof raw === 'object'
                 ? raw
                 : {};
+            if (Array.isArray(source.routes)) {
+                return {
+                    primaryEnabled: true,
+                    provider: '',
+                    model: '',
+                    reasoningEffort: '',
+                    routes: normalizeRoutes(source.routes).map(storedFallback),
+                };
+            }
             const settings = {
                 primaryEnabled: source.primaryEnabled !== false,
                 provider: trimString(source.provider),
@@ -976,12 +985,20 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
          * @param raw - one row or saved entry, possibly malformed.
          * @returns a normalized explicit route.
          */
+        function normalizeRouteWeight(value) {
+            const numeric = Number(value);
+            if (!Number.isFinite(numeric))
+                return 0;
+            const clamped = Math.trunc(numeric);
+            return clamped >= 0 && clamped <= 9 ? clamped : 0;
+        }
         function normalizeRoute(raw) {
             const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw)
                 ? raw
                 : {};
             return {
                 enabled: source.enabled !== false,
+                weight: normalizeRouteWeight(source.weight),
                 provider: trimString(source.provider),
                 model: trimString(source.model),
                 reasoningEffort: trimString(source.reasoningEffort),
@@ -1009,6 +1026,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
             return {
                 mode: 'route',
                 enabled: route.enabled,
+                weight: route.weight,
                 provider: route.provider,
                 model: route.model,
                 reasoningEffort: route.reasoningEffort,
@@ -1026,6 +1044,8 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
          */
         function rowsFromSettings(raw) {
             const settings = normalizeSettings(raw);
+            if (settings.routes !== undefined)
+                return normalizeRoutes(settings.routes);
             const rows = [];
             if (settings.provider !== ''
                 || settings.model !== ''
@@ -1033,6 +1053,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
                 || !settings.primaryEnabled) {
                 rows.push({
                     enabled: settings.primaryEnabled,
+                    weight: 0,
                     provider: settings.provider,
                     model: settings.model,
                     reasoningEffort: settings.reasoningEffort,
@@ -1041,6 +1062,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
             for (const entry of settings.fallbacks ?? []) {
                 rows.push({
                     enabled: entry.enabled,
+                    weight: entry.weight,
                     provider: entry.provider,
                     model: entry.model,
                     reasoningEffort: entry.reasoningEffort,
@@ -1059,17 +1081,13 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
          * @returns the settings value to persist.
          */
         function settingsFromRows(rows) {
-            const list = normalizeRoutes(rows);
-            const [first, ...rest] = list;
-            const settings = {
-                primaryEnabled: first === undefined ? true : first.enabled,
-                provider: first === undefined ? '' : first.provider,
-                model: first === undefined ? '' : first.model,
-                reasoningEffort: first === undefined ? '' : first.reasoningEffort,
+            return {
+                primaryEnabled: true,
+                provider: '',
+                model: '',
+                reasoningEffort: '',
+                routes: normalizeRoutes(rows).map(storedFallback),
             };
-            if (rest.length > 0)
-                settings.fallbacks = rest.map(storedFallback);
-            return settings;
         }
         /** Structural equality for two ordered explicit lists, used for dirty detection. */
         function routesEqual(left, right) {
@@ -1078,6 +1096,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
             if (a.length !== b.length)
                 return false;
             return a.every((route, index) => (route.enabled === b[index].enabled
+                && route.weight === b[index].weight
                 && route.provider === b[index].provider
                 && route.model === b[index].model
                 && route.reasoningEffort === b[index].reasoningEffort));
@@ -1126,7 +1145,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
         }
         /** Build a fresh, enabled explicit-route row that inherits the session effort. */
         function emptyRoute() {
-            return { enabled: true, provider: '', model: '', reasoningEffort: INHERIT_EFFORT };
+            return { enabled: true, weight: 0, provider: '', model: '', reasoningEffort: INHERIT_EFFORT };
         }
         /**
          * Append one empty explicit-route row.
