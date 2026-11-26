@@ -54,8 +54,8 @@
  */
 import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
 import { zstdCompressSync } from 'node:zlib';
+import { join } from 'node:path';
 import z from '@deepseek-ai/schemastery';
 import {
   INHERIT_EFFORT,
@@ -230,7 +230,12 @@ export const Config: z = z.object({
     model: z.string().default(''),
     reasoningEffort: z.string().default(''),
   })).default([]).volatile(),
-  /** Unified ordered reviewer routes; absent/empty means legacy migration. */
+  /**
+   * Unified ordered routes. Deliberately has no default: an absent value means a
+   * config written before this list existed, which `readRoutes` migrates from the
+   * legacy row-1 fields. A defaulted empty array would make every legacy config
+   * look like "the user deleted all routes".
+   */
   routes: z.array(z.object({
     enabled: z.boolean().default(true),
     weight: z.number().default(0),
@@ -674,7 +679,9 @@ interface BufferedAnswer {
   text: string;
   /** The terminal `finish` chunk. */
   finish: unknown;
+  /** Provider-reported token usage, when the stream carried a `usage` chunk. */
   usage?: Record<string, unknown>;
+  /** Risk/decision parsed out of the answer, for the ledger. */
   decision?: { risk?: string; decision?: string };
 }
 
@@ -809,14 +816,83 @@ async function collectAnswer(
   }
 }
 
-/** Convert an observed thrown failure to one attempt record. */
+/**
+ * Turn one thrown provider failure into a retryable route failure, or throw a
+ * non-retryable {@link ReviewerRouteError}.
+ *
+ * An unclassified throw during streaming is treated as a transport-level route
+ * failure: the route produced no decision, so trying the next configured route
+ * is the whole point of the fallback list. A throw that *does* carry an official
+ * provider-neutral code (or a valid HTTP status) is judged by the same
+ * classification table as a terminal `finish`: only route / credential / quota /
+ * rate-limit / transport failures move on, while content and protocol failures
+ * are surfaced instead of being hidden behind another route.
+ *
+ * @param {ReviewRouteAttempt} attempt - the route that threw.
+ * @param {unknown} error - the caught rejection.
+ * @returns {ReviewerRouteFailure} a retryable failure record.
+ * @throws {ReviewerRouteError} for a classified non-retryable failure.
+ */
 function routeFailureFromThrown(attempt: ReviewRouteAttempt, error: unknown): ReviewerRouteFailure {
-  return failureFromThrown(attempt, error);
+  const facts = readThrownFailure(error);
+  const failure = failureFromThrown(attempt, error);
+  if (facts.code === '' && facts.status === undefined) {
+    // Unclassified thrown stream error: treat it as a route failure.
+    return failure;
+  }
+  if (isFallbackEligibleFailure(facts)) return failure;
+  throw new ReviewerRouteError(
+    attempt.label,
+    failure.code === '' ? PROTOCOL_FAILURE_CODE : failure.code,
+    failure.detail,
+    error,
+  );
 }
 
-/** Directory holding one append-only measured ledger per ISO week. */
+/**
+ * Try each planned route in order and forward the winning route's chunks as
+ * they arrive.
+ *
+ * The failover contract is a commit point: a route may only be replaced while
+ * NO chunk has reached the caller. Every chunk is yielded immediately (no
+ * capture), so a reasoning-heavy reviewer can stream as long as the provider
+ * allows. Once a chunk has been
+ * emitted, a later failure is surfaced as a {@link ReviewerRouteError} because
+ * the caller's single-decision stream is already contaminated and switching
+ * routes would duplicate or mix output. Failures before the first emitted chunk
+ * — a failed capability lookup, a thrown stream, a retryable terminal finish,
+ * or a premature end with no output — advance to the next route, and all of them
+ * still produce one aggregate error when no route can answer.
+ *
+ * Caller aborts keep the same semantics (propagated, never retried), and every
+ * abandoned provider stream gets a best-effort close.
+ *
+ * @param {HostContext} ctx - plugin context exposing `llm` and `sessions`.
+ * @param {GenerateOptions} options - frozen original reviewer `GenerateOptions`.
+ * @param {readonly ReviewRouteAttempt[]} plan - ordered attempts.
+ * @param {WeakSet<object>} patchedRequests - objects already rewritten.
+ * @param {CapabilityCache} effortCache - capability cache.
+ * @returns {AsyncGenerator<unknown>} the winning route's live chunk stream.
+ * @throws {ReviewerRouteError} when a failure happens after output was emitted.
+ * @throws {ReviewerRoutesError} when every route fails before any output.
+ */
+/**
+ * Append one review-route trace line.
+ *
+ * Review routing fails silently by design: a failing route is replaced before the
+ * caller sees anything, so without a trace there is no way to tell a healthy
+ * review from one that fell back. The file is small (one line per route attempt)
+ * and writing it can never fail a review.
+ */
+/** Directory holding the captured review ledger. */
 export const REVIEW_LEDGER_DIR = join(homedir(), '.dsh');
 
+/**
+ * ISO-8601 week of one date, used to rotate the ledger once per week.
+ *
+ * Weekly rotation keeps one file small enough to read and one week of reviews in
+ * a single place, which is the granularity the cost study compares at.
+ */
 function isoWeekOf(date: Date): { year: number; week: number } {
   const shifted = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
   const day = shifted.getUTCDay() || 7;
@@ -826,13 +902,18 @@ function isoWeekOf(date: Date): { year: number; week: number } {
   return { year: shifted.getUTCFullYear(), week };
 }
 
+/** Absolute ledger path for one moment, rotated by ISO week. */
 export function reviewLedgerPath(now: Date = new Date()): string {
   const { year, week } = isoWeekOf(now);
   return join(REVIEW_LEDGER_DIR, `auto-review-ledger-${year}-W${String(week).padStart(2, '0')}.jsonl`);
 }
 
-function ledgerEnabled(): boolean { return process.env['DSH_AUTO_REVIEW_LEDGER'] !== '0'; }
+/** Whether ledger capture is enabled (`DSH_AUTO_REVIEW_LEDGER=0` disables it). */
+function ledgerEnabled(): boolean {
+  return process.env['DSH_AUTO_REVIEW_LEDGER'] !== '0';
+}
 
+/** One ledger line; every numeric field is measured, never reconstructed. */
 interface ReviewLedgerRecord {
   v: 1;
   t: number;
@@ -845,7 +926,17 @@ interface ReviewLedgerRecord {
   winner?: string;
 }
 
+/** Week whose sealed predecessor has already been checked, to avoid restatting per write. */
 let sealedWeek: string | undefined;
+
+/**
+ * Compress the previous ISO week's ledger once it is no longer being appended to.
+ *
+ * The current week stays a plain append-only `.jsonl` so it can be tailed while a
+ * review is happening. Once a new week starts, the finished file is immutable, so
+ * a single whole-file Zstandard frame is both cheaper and denser than the
+ * concatenated frames the session backend needs for live appends.
+ */
 function sealPreviousWeek(now: Date): void {
   const current = isoWeekOf(now);
   const currentId = `${current.year}-W${String(current.week).padStart(2, '0')}`;
@@ -857,13 +948,15 @@ function sealPreviousWeek(now: Date): void {
     const { year, week } = isoWeekOf(previous);
     const plain = join(REVIEW_LEDGER_DIR, `auto-review-ledger-${year}-W${String(week).padStart(2, '0')}.jsonl`);
     if (!existsSync(plain)) return;
-    writeFileSync(`${plain}.zst`, zstdCompressSync(readFileSync(plain)));
+    const compressed = zstdCompressSync(readFileSync(plain));
+    writeFileSync(`${plain}.zst`, compressed);
     rmSync(plain);
   } catch {
-    // Housekeeping failures leave the plain ledger intact for a later retry.
+    // Sealing is housekeeping: a failure keeps the plain file for the next attempt.
   }
 }
 
+/** Append one review record to this week's ledger; failures are swallowed. */
 function writeLedger(record: ReviewLedgerRecord): void {
   if (!ledgerEnabled()) return;
   try {
@@ -871,17 +964,24 @@ function writeLedger(record: ReviewLedgerRecord): void {
     sealPreviousWeek(now);
     appendFileSync(reviewLedgerPath(now), `${JSON.stringify(record)}\n`);
   } catch {
-    // Ledger capture must never affect review delivery.
+    // Ledger capture must never affect a review.
   }
 }
 
-/** Session-scoped preferred route, learned only from a usable answer. */
+/**
+ * Session-scoped sticky route: once a route answers a review, later reviews from
+ * the same session go straight to it instead of retrying routes that already
+ * failed. Review latency is the whole point of this plugin, so a session pays for
+ * a failing route at most once.
+ */
 const stickyReviewRoutes = new Map<string, string>();
 
+/** Identity of one route inside the sticky table. */
 function reviewRouteKey(attempt: ReviewRouteAttempt): string {
   return `${attempt.provider}\u0000${attempt.model}\u0000${attempt.reasoningEffort}`;
 }
 
+/** Remember the route that answered, or forget it when that same route failed. */
 function noteReviewRoute(sessionId: string | undefined, attempt: ReviewRouteAttempt, answered: boolean): void {
   if (sessionId === undefined || sessionId === '') return;
   const key = reviewRouteKey(attempt);
@@ -889,49 +989,139 @@ function noteReviewRoute(sessionId: string | undefined, attempt: ReviewRouteAtte
   else if (stickyReviewRoutes.get(sessionId) === key) stickyReviewRoutes.delete(sessionId);
 }
 
-function preferStickyRoute(plan: readonly ReviewRouteAttempt[], sessionId: string | undefined): readonly ReviewRouteAttempt[] {
+/**
+ * Move the session's sticky route to the front of one plan.
+ *
+ * The route keeps its position when it is already first or absent, so a session
+ * without history still starts from the configured order.
+ */
+function preferStickyRoute(
+  plan: readonly ReviewRouteAttempt[],
+  sessionId: string | undefined,
+): readonly ReviewRouteAttempt[] {
   if (sessionId === undefined || sessionId === '') return plan;
   const sticky = stickyReviewRoutes.get(sessionId);
   if (sticky === undefined) return plan;
-  const index = plan.findIndex(attempt => reviewRouteKey(attempt) === sticky);
+  const index = plan.findIndex((attempt) => reviewRouteKey(attempt) === sticky);
   if (index <= 0) return plan;
   return [plan[index]!, ...plan.slice(0, index), ...plan.slice(index + 1)];
 }
 
-/** Try one route without forwarding until the complete answer is validated. */
+/**
+ * Try each configured route until one produces a usable risk/decision answer.
+ *
+ * Every failure advances to the next route, whatever its kind: a transport error,
+ * a capability lookup miss, a stream that closed early, and an answer whose text
+ * is not a risk/decision object all mean "this route could not review". The
+ * answer is buffered before it is forwarded, so the caller never sees chunks from
+ * a route that is about to be abandoned and never parses an unusable answer. The
+ * route that answers is remembered for the session, so a later review skips the
+ * routes that already failed.
+ *
+ * @param ctx - Cordis context with `llm`.
+ * @param options - the frozen original reviewer request.
+ * @param plan - ordered candidate routes.
+ * @param patchedRequests - objects already rewritten, to keep the waterfall idempotent.
+ * @param effortCache - capability cache.
+ */
+/** One route attempt's outcome, either a usable answer or a recorded failure. */
+type RouteOutcome =
+  | {
+      ok: true;
+      chunks: unknown[];
+      finish: unknown;
+      usage?: Record<string, unknown>;
+      decision?: { risk?: string; decision?: string };
+    }
+  | { ok: false; failure: ReviewerRouteFailure };
+
+/**
+ * Run one configured route far enough to know whether it can review.
+ *
+ * Nothing is forwarded here: the answer is buffered and validated, so a route
+ * that cannot produce a decision is reported as a failure instead of being
+ * committed to the caller.
+ */
 async function tryReviewRoute(
   ctx: HostContext,
   options: GenerateOptions,
   attempt: ReviewRouteAttempt,
   patchedRequests: WeakSet<object>,
   effortCache: CapabilityCache,
-): Promise<{ ok: true; chunks: unknown[]; finish: unknown; usage?: Record<string, unknown>; decision?: { risk?: string; decision?: string } } | { ok: false; failure: ReviewerRouteFailure }> {
+): Promise<RouteOutcome> {
   let patched: GenerateOptions;
   try {
-    patched = await buildRoutedRequest(ctx, options, attempt.provider, attempt.model, attempt.reasoningEffort, effortCache);
+    patched = await buildRoutedRequest(
+      ctx,
+      options,
+      attempt.provider,
+      attempt.model,
+      attempt.reasoningEffort,
+      effortCache,
+    );
   } catch (error) {
     options.signal?.throwIfAborted();
     if (!(error instanceof ReviewerCapabilityError)) throw error;
     return { ok: false, failure: failureFromThrown(attempt, error) };
   }
   patchedRequests.add(patched);
+
   let iterable: AsyncIterable<unknown>;
-  try { iterable = ctx.llm.stream(patched); }
-  catch (error) { options.signal?.throwIfAborted(); return { ok: false, failure: routeFailureFromThrown(attempt, error) }; }
-  if (!isAsyncIterable(iterable)) {
-    return { ok: false, failure: { attempt, code: PROTOCOL_FAILURE_CODE, detail: 'the provider returned no chunk stream' } };
+  try {
+    iterable = ctx.llm.stream(patched);
+  } catch (error) {
+    options.signal?.throwIfAborted();
+    return { ok: false, failure: routeFailureFromThrown(attempt, error) };
   }
+  if (!isAsyncIterable(iterable)) {
+    return {
+      ok: false,
+      failure: { attempt, code: PROTOCOL_FAILURE_CODE, detail: 'the provider returned no chunk stream' },
+    };
+  }
+
   let iterator: AsyncIterator<unknown>;
-  try { iterator = iterable[Symbol.asyncIterator](); }
-  catch (error) { options.signal?.throwIfAborted(); return { ok: false, failure: routeFailureFromThrown(attempt, error) }; }
+  try {
+    iterator = iterable[Symbol.asyncIterator]();
+  } catch (error) {
+    options.signal?.throwIfAborted();
+    return { ok: false, failure: routeFailureFromThrown(attempt, error) };
+  }
+
   const outcome = await collectAnswer(iterator, options.signal);
   if ('failure' in outcome) {
     options.signal?.throwIfAborted();
     return { ok: false, failure: { attempt, code: outcome.failure.code, detail: outcome.failure.detail } };
   }
-  return { ok: true, chunks: outcome.answer.chunks, finish: outcome.answer.finish, ...(outcome.answer.usage === undefined ? {} : { usage: outcome.answer.usage }), ...(outcome.answer.decision === undefined ? {} : { decision: outcome.answer.decision }) };
+  return {
+    ok: true,
+    chunks: outcome.answer.chunks,
+    finish: outcome.answer.finish,
+    ...(outcome.answer.usage === undefined ? {} : { usage: outcome.answer.usage }),
+    ...(outcome.answer.decision === undefined ? {} : { decision: outcome.answer.decision }),
+  };
 }
 
+/**
+ * Try configured routes until one produces a usable risk/decision answer.
+ *
+ * Every failure advances to the next route, whatever its kind: a transport error,
+ * a capability lookup miss, a stream that closed early, and an answer whose text
+ * is not a risk/decision object all mean "this route could not review". The answer
+ * is buffered before it is forwarded, so the caller never sees chunks from a route
+ * that is about to be abandoned and never parses an unusable answer.
+ *
+ * A session that already answered through one route starts there. If that sticky
+ * route fails, the whole configured order is retried from the top instead of
+ * continuing at whatever follows it: a sticky route is a latency optimization, not
+ * an ordering decision, so a broken one must not skip the routes before it.
+ *
+ * @param ctx - Cordis context with `llm`.
+ * @param options - the frozen original reviewer request.
+ * @param plan - ordered candidate routes.
+ * @param patchedRequests - objects already rewritten, to keep the waterfall idempotent.
+ * @param effortCache - capability cache.
+ */
 async function* streamReviewWithFallback(
   ctx: HostContext,
   options: GenerateOptions,
@@ -945,9 +1135,11 @@ async function* streamReviewWithFallback(
   const tried = new Set<string>();
   let candidates: readonly ReviewRouteAttempt[] = preferStickyRoute(plan, sessionId);
   let restartedFromTop = false;
+
   const startedAt = Date.now();
   const attempts: Array<Record<string, unknown>> = [];
-  const recordReview = (winner?: ReviewRouteAttempt): void => {
+  /** Emit the measured record for this review exactly once, however it ends. */
+  const recordReview = (winner?: ReviewRouteAttempt, decision?: { risk?: string; decision?: string }): void => {
     writeLedger({
       v: 1,
       t: startedAt,
@@ -956,30 +1148,54 @@ async function* streamReviewWithFallback(
       totalMs: Date.now() - startedAt,
       fallback: attempts.length > 1,
       ...(sticky === undefined ? {} : { stickyUsed: sticky }),
+      ...(decision === undefined ? {} : { decision }),
       attempts,
       ...(winner === undefined ? {} : { winner: `${winner.provider}/${winner.model}` }),
     });
   };
+
   for (;;) {
     let restart = false;
     for (const attempt of candidates) {
       const key = reviewRouteKey(attempt);
       if (tried.has(key)) continue;
       tried.add(key);
+
       const attemptStarted = Date.now();
       const outcome = await tryReviewRoute(ctx, options, attempt, patchedRequests, effortCache);
-      const base = { route: `${attempt.provider}/${attempt.model}`, effort: attempt.reasoningEffort, mode: attempt.mode, ms: Date.now() - attemptStarted };
+      const attemptMs = Date.now() - attemptStarted;
+      const base = {
+        route: `${attempt.provider}/${attempt.model}`,
+        effort: attempt.reasoningEffort,
+        mode: attempt.mode,
+        ms: attemptMs,
+      };
+
       if (outcome.ok) {
-        attempts.push({ ...base, ok: true, ...(outcome.usage === undefined ? {} : { usage: outcome.usage }), ...(outcome.decision === undefined ? {} : { decision: outcome.decision }) });
+        attempts.push({
+          ...base,
+          ok: true,
+          ...(outcome.usage === undefined ? {} : { usage: outcome.usage }),
+          ...(outcome.decision === undefined ? {} : { decision: outcome.decision }),
+        });
         noteReviewRoute(sessionId, attempt, true);
-        recordReview(attempt);
+        recordReview(attempt, outcome.decision);
         for (const chunk of outcome.chunks) yield chunk;
         yield outcome.finish;
         return;
       }
-      attempts.push({ ...base, ok: false, code: outcome.failure.code, detail: outcome.failure.detail.slice(0, 300) });
+
+      attempts.push({
+        ...base,
+        ok: false,
+        code: outcome.failure.code,
+        detail: outcome.failure.detail.slice(0, 300),
+      });
       noteReviewRoute(sessionId, attempt, false);
       failures.push(outcome.failure);
+
+      // The sticky route broke: drop it and retry the configured order from the
+      // top, so a route that sits before it is not skipped.
       if (!restartedFromTop && sticky !== undefined && key === sticky) {
         restartedFromTop = true;
         restart = true;
@@ -1049,7 +1265,9 @@ export function apply(ctx: HostContext, config: ReviewerConfig): void {
       const hasSticky = options.sessionId !== undefined
         && options.sessionId !== ''
         && stickyReviewRoutes.has(options.sessionId);
-      const plan = hasSticky ? preferStickyRoute(basePlan, options.sessionId) : pickWeightedStart(basePlan);
+      const plan = hasSticky
+        ? preferStickyRoute(basePlan, options.sessionId)
+        : pickWeightedStart(basePlan);
       // No usable explicit route: reviews already use the native session model,
       // so there is nothing to rewrite (the session route is implicit).
       if (plan.length === 0) return next();

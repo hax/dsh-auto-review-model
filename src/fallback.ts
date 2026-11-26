@@ -70,7 +70,13 @@ export type RouteMode = 'route' | 'session';
 export interface FallbackEntry {
   /** Whether this row is eligible; disabled rows are skipped, never deleted. */
   enabled: boolean;
-  /** Relative share for weighted new-session starts. */
+  /**
+   * Relative share of new sessions this route starts on, 0-9.
+   *
+   * A positive weight joins the weighted draw that picks a session's first route.
+   * Weight 0 never starts a session and is only reached after every positive
+   * route in the same session has failed, which makes it a last-resort row.
+   */
   weight: number;
   /** Configured provider id. */
   provider: string;
@@ -84,7 +90,7 @@ export interface FallbackEntry {
 export interface ReviewRouteAttempt {
   /** How the route was resolved: an explicit entry or the implicit session route. */
   mode: RouteMode;
-  /** Configured weight, zero for implicit session attempts. */
+  /** Declared weight; the implicit session route always uses 0. */
   weight: number;
   /** Provider id to send. */
   provider: string;
@@ -197,7 +203,13 @@ export function isLegacySessionEntry(raw: unknown): boolean {
  * @param raw - one array element from the volatile config.
  * @returns a normalized explicit entry.
  */
-/** Normalize a route weight to the supported 0-9 range. */
+/**
+ * Clamp one configured weight to the supported 0-9 range.
+ *
+ * An absent or malformed weight means an ordinary equal-share route. Weight 0 is
+ * a valid, meaningful value: a route that never starts a session and is only
+ * reached after every positive route has failed.
+ */
 function normalizeWeight(value: unknown): number {
   if (value === undefined || value === null) return 0;
   const numeric = Number(value);
@@ -307,7 +319,21 @@ export function routeAttemptLabel(provider: string, model: string, mode: RouteMo
  * @param request - provider/model of the intercepted review request.
  * @returns the ordered attempts; empty when nothing may be routed.
  */
-/** Draw a weighted start for one fresh session, leaving zero weights last. */
+/**
+ * Reorder one plan so a weighted draw decides where a fresh session starts.
+ *
+ * Only routes with a positive weight are candidates; the session's start is drawn
+ * in proportion to those weights. Weight-0 routes are last-resort rows: they are
+ * placed after every positive route, and the implicit session route stays last of
+ * all because it is the caller's own fallback, not a configured one.
+ *
+ * A plan with zero or one positive route keeps the configured order, so a single
+ * configured route behaves exactly as before.
+ *
+ * @param plan - attempts in configured order.
+ * @param random - injectable uniform source, `[0, 1)`, for deterministic tests.
+ * @returns attempts in the order this session should try them.
+ */
 export function pickWeightedStart(
   plan: readonly ReviewRouteAttempt[],
   random: () => number = Math.random,
@@ -317,12 +343,16 @@ export function pickWeightedStart(
   const rest = explicit.filter(attempt => attempt.weight === 0);
   const session = plan.filter(attempt => attempt.mode === 'session');
   if (positive.length <= 1) return [...positive, ...rest, ...session];
+
   const total = positive.reduce((sum, attempt) => sum + attempt.weight, 0);
   let roll = random() * total;
   let picked = positive[positive.length - 1]!;
   for (const attempt of positive) {
     roll -= attempt.weight;
-    if (roll <= 0) { picked = attempt; break; }
+    if (roll <= 0) {
+      picked = attempt;
+      break;
+    }
   }
   return [picked, ...positive.filter(attempt => attempt !== picked), ...rest, ...session];
 }
@@ -571,9 +601,7 @@ export const __testing = {
   normalizeFallbackEntry,
   isLegacySessionEntry,
   readFallbackEntries,
-  readRoutes,
   buildReviewPlan,
-  pickWeightedStart,
   isFallbackEligibleFailure,
   failureFromThrown,
   failureFromFinish,

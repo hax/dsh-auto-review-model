@@ -18,7 +18,13 @@ export type RouteMode = 'route' | 'session';
 export interface FallbackEntry {
     /** Whether this row is eligible; disabled rows are skipped, never deleted. */
     enabled: boolean;
-    /** Relative share for weighted new-session starts. */
+    /**
+     * Relative share of new sessions this route starts on, 0-9.
+     *
+     * A positive weight joins the weighted draw that picks a session's first route.
+     * Weight 0 never starts a session and is only reached after every positive
+     * route in the same session has failed, which makes it a last-resort row.
+     */
     weight: number;
     /** Configured provider id. */
     provider: string;
@@ -31,7 +37,7 @@ export interface FallbackEntry {
 export interface ReviewRouteAttempt {
     /** How the route was resolved: an explicit entry or the implicit session route. */
     mode: RouteMode;
-    /** Configured weight, zero for implicit session attempts. */
+    /** Declared weight; the implicit session route always uses 0. */
     weight: number;
     /** Provider id to send. */
     provider: string;
@@ -114,7 +120,21 @@ export declare function routeAttemptLabel(provider: string, model: string, mode:
  * @param request - provider/model of the intercepted review request.
  * @returns the ordered attempts; empty when nothing may be routed.
  */
-/** Draw a weighted start for one fresh session, leaving zero weights last. */
+/**
+ * Reorder one plan so a weighted draw decides where a fresh session starts.
+ *
+ * Only routes with a positive weight are candidates; the session's start is drawn
+ * in proportion to those weights. Weight-0 routes are last-resort rows: they are
+ * placed after every positive route, and the implicit session route stays last of
+ * all because it is the caller's own fallback, not a configured one.
+ *
+ * A plan with zero or one positive route keeps the configured order, so a single
+ * configured route behaves exactly as before.
+ *
+ * @param plan - attempts in configured order.
+ * @param random - injectable uniform source, `[0, 1)`, for deterministic tests.
+ * @returns attempts in the order this session should try them.
+ */
 export declare function pickWeightedStart(plan: readonly ReviewRouteAttempt[], random?: () => number): ReviewRouteAttempt[];
 export declare function buildReviewPlan(routes: readonly FallbackEntry[], request: {
     provider: string;
@@ -210,9 +230,7 @@ export declare const __testing: {
     normalizeFallbackEntry: typeof normalizeFallbackEntry;
     isLegacySessionEntry: typeof isLegacySessionEntry;
     readFallbackEntries: typeof readFallbackEntries;
-    readRoutes: typeof readRoutes;
     buildReviewPlan: typeof buildReviewPlan;
-    pickWeightedStart: typeof pickWeightedStart;
     isFallbackEligibleFailure: typeof isFallbackEligibleFailure;
     failureFromThrown: typeof failureFromThrown;
     failureFromFinish: typeof failureFromFinish;

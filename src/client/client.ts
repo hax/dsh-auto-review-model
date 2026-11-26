@@ -65,6 +65,7 @@ interface FallbackEntry {
   mode: 'route';
   /** Whether this row is eligible for review routing. */
   enabled: boolean;
+  /** Relative share of new sessions this route starts on, 0-9 (0 = in-order fallback only). */
   weight: number;
   provider: string;
   model: string;
@@ -75,6 +76,7 @@ interface FallbackEntry {
 interface ReviewRoute {
   /** Whether this row is eligible; a disabled row stays editable and testable. */
   enabled: boolean;
+  /** Relative share of new sessions this route starts on, 0-9. */
   weight: number;
   provider: string;
   model: string;
@@ -82,9 +84,12 @@ interface ReviewRoute {
 }
 
 interface ReviewerSettings {
-  /** Unified routes; when present legacy fields are ignored. */
+  /**
+   * Ordered reviewer routes in the current shape. When present the legacy row-1
+   * fields and `fallbacks` are ignored, and every route is an ordinary list row.
+   */
   routes?: FallbackEntry[];
-  /** Whether settings-list row 1 (the top-level route) is enabled. */
+  /** @deprecated Legacy row-1 flag, read only when `routes` is absent. */
   primaryEnabled: boolean;
   provider: string;
   model: string;
@@ -799,6 +804,14 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
    * @param raw - one row or saved entry, possibly malformed.
    * @returns a normalized explicit route.
    */
+  /**
+   * Clamp one weight input to 0-9.
+   *
+   * An unset or malformed weight is 0, which starts no session: the row is only
+   * reached after every positive-weight route has failed. That keeps an unchecked
+   * weight indistinguishable from a legacy row, so an upgraded page changes
+   * nothing until someone types a weight.
+   */
   function normalizeRouteWeight(value: unknown): number {
     const numeric = Number(value);
     if (!Number.isFinite(numeric)) return 0;
@@ -899,6 +912,8 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
    * @returns the settings value to persist.
    */
   function settingsFromRows(rows: unknown): ReviewerSettings {
+    // Every route is written as one entry of the unified list; the legacy row-1
+    // fields are written empty so an older reader sees no contradictory route.
     return {
       primaryEnabled: true,
       provider: '',

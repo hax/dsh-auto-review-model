@@ -990,6 +990,14 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
          * @param raw - one row or saved entry, possibly malformed.
          * @returns a normalized explicit route.
          */
+        /**
+         * Clamp one weight input to 0-9.
+         *
+         * An unset or malformed weight is 0, which starts no session: the row is only
+         * reached after every positive-weight route has failed. That keeps an unchecked
+         * weight indistinguishable from a legacy row, so an upgraded page changes
+         * nothing until someone types a weight.
+         */
         function normalizeRouteWeight(value) {
             const numeric = Number(value);
             if (!Number.isFinite(numeric))
@@ -1086,6 +1094,8 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
          * @returns the settings value to persist.
          */
         function settingsFromRows(rows) {
+            // Every route is written as one entry of the unified list; the legacy row-1
+            // fields are written empty so an older reader sees no contradictory route.
             return {
                 primaryEnabled: true,
                 provider: '',

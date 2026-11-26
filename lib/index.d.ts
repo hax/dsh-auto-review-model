@@ -4,7 +4,7 @@ import type { ReviewerConfig } from './policy.js';
 import { installRouteTestEndpoint } from './route-test.js';
 import { readThrownFailure } from './failure.js';
 export { ReviewerRouteError, ReviewerRoutesError } from './fallback.js';
-import { ReviewerRouteError, ReviewerRoutesError, buildReviewPlan, pickWeightedStart, failureFromFinish, failureFromThrown, isAsyncIterable, isFallbackEligibleFailure, readRoutes } from './fallback.js';
+import { ReviewerRouteError, ReviewerRoutesError, buildReviewPlan, failureFromFinish, failureFromThrown, isAsyncIterable, isFallbackEligibleFailure } from './fallback.js';
 /** One adapter-owned reasoning effort advertised for an exact route. */
 interface LlmEffortInfo {
     id?: string;
@@ -127,8 +127,44 @@ export declare class ReviewerCapabilityError extends Error {
      */
     constructor(provider: string, model: string, timedOut: boolean, cause?: unknown);
 }
-/** Directory holding one append-only measured ledger per ISO week. */
+/**
+ * Try each planned route in order and forward the winning route's chunks as
+ * they arrive.
+ *
+ * The failover contract is a commit point: a route may only be replaced while
+ * NO chunk has reached the caller. Every chunk is yielded immediately (no
+ * capture), so a reasoning-heavy reviewer can stream as long as the provider
+ * allows. Once a chunk has been
+ * emitted, a later failure is surfaced as a {@link ReviewerRouteError} because
+ * the caller's single-decision stream is already contaminated and switching
+ * routes would duplicate or mix output. Failures before the first emitted chunk
+ * — a failed capability lookup, a thrown stream, a retryable terminal finish,
+ * or a premature end with no output — advance to the next route, and all of them
+ * still produce one aggregate error when no route can answer.
+ *
+ * Caller aborts keep the same semantics (propagated, never retried), and every
+ * abandoned provider stream gets a best-effort close.
+ *
+ * @param {HostContext} ctx - plugin context exposing `llm` and `sessions`.
+ * @param {GenerateOptions} options - frozen original reviewer `GenerateOptions`.
+ * @param {readonly ReviewRouteAttempt[]} plan - ordered attempts.
+ * @param {WeakSet<object>} patchedRequests - objects already rewritten.
+ * @param {CapabilityCache} effortCache - capability cache.
+ * @returns {AsyncGenerator<unknown>} the winning route's live chunk stream.
+ * @throws {ReviewerRouteError} when a failure happens after output was emitted.
+ * @throws {ReviewerRoutesError} when every route fails before any output.
+ */
+/**
+ * Append one review-route trace line.
+ *
+ * Review routing fails silently by design: a failing route is replaced before the
+ * caller sees anything, so without a trace there is no way to tell a healthy
+ * review from one that fell back. The file is small (one line per route attempt)
+ * and writing it can never fail a review.
+ */
+/** Directory holding the captured review ledger. */
 export declare const REVIEW_LEDGER_DIR: string;
+/** Absolute ledger path for one moment, rotated by ISO week. */
 export declare function reviewLedgerPath(now?: Date): string;
 /**
  * Install the reviewer-model override.
@@ -160,9 +196,7 @@ export declare const __testing: {
         normalizeFallbackEntry: typeof import("./fallback.js").normalizeFallbackEntry;
         isLegacySessionEntry: typeof import("./fallback.js").isLegacySessionEntry;
         readFallbackEntries: typeof import("./fallback.js").readFallbackEntries;
-        readRoutes: typeof readRoutes;
         buildReviewPlan: typeof buildReviewPlan;
-        pickWeightedStart: typeof pickWeightedStart;
         isFallbackEligibleFailure: typeof isFallbackEligibleFailure;
         failureFromThrown: typeof failureFromThrown;
         failureFromFinish: typeof failureFromFinish;
