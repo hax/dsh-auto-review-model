@@ -75,6 +75,24 @@ export interface ReviewerRouteFailure {
  * @returns true when the entry was a legacy "follow session" row.
  */
 export declare function isLegacySessionEntry(raw: unknown): boolean;
+/**
+ * Normalize one configured fallback entry into an explicit route.
+ *
+ * Only provider/model/reasoningEffort matter: the removed `mode` field is not
+ * forwarded. Callers that read the config should use {@link readFallbackEntries}
+ * so legacy `session` entries are discarded before normalization.
+ *
+ * @param raw - one array element from the volatile config.
+ * @returns a normalized explicit entry.
+ */
+/**
+ * Clamp one configured weight to the supported 0-9 range.
+ *
+ * An absent or malformed weight means an ordinary equal-share route. Weight 0 is
+ * a valid, meaningful value: a route that never starts a session and is only
+ * reached after every positive route has failed.
+ */
+declare function normalizeWeight(value: unknown): number;
 export declare function normalizeFallbackEntry(raw: unknown): FallbackEntry;
 /**
  * Read the live ordered fallback list from the plugin config.
@@ -228,8 +246,11 @@ export declare const __testing: {
     ROUTE_ERROR_CODE: string;
     PROTOCOL_FAILURE_CODE: string;
     normalizeFallbackEntry: typeof normalizeFallbackEntry;
+    normalizeWeight: typeof normalizeWeight;
     isLegacySessionEntry: typeof isLegacySessionEntry;
     readFallbackEntries: typeof readFallbackEntries;
+    readRoutes: typeof readRoutes;
+    pickWeightedStart: typeof pickWeightedStart;
     buildReviewPlan: typeof buildReviewPlan;
     isFallbackEligibleFailure: typeof isFallbackEligibleFailure;
     failureFromThrown: typeof failureFromThrown;
@@ -238,3 +259,4 @@ export declare const __testing: {
     ReviewerRoutesError: typeof ReviewerRoutesError;
     ReviewerRouteError: typeof ReviewerRouteError;
 };
+export {};

@@ -657,7 +657,7 @@ test('a thrown provider stream falls back to the next explicit route', async () 
   assert.equal(harness.stats('backup-provider/backup-model').requests.length, 1);
 });
 
-test('a stream rejection after the first chunk is surfaced without retrying', async () => {
+test('a stream rejection after partial output falls back without leaking the partial answer', async () => {
   const harness = createHarness({
     routes: {
       'primary-provider/primary-model': {
@@ -670,18 +670,16 @@ test('a stream rejection after the first chunk is surfaced without retrying', as
     config: { fallbacks: [{ mode: 'route', provider: 'backup-provider', model: 'backup-model' }] },
   });
 
-  const stream = harness.ctx.llm.stream(reviewOptions());
-  const iterator = stream[Symbol.asyncIterator]();
-  const first = await iterator.next();
-  assert.equal((first.value as { text: string }).text, 'partial reasoning');
-  await assert.rejects(iterator.next(), (error: unknown) => {
-    assert.ok(error instanceof ReviewerRouteError, `expected ReviewerRouteError, got ${String(error)}`);
-    return true;
-  });
+  const chunks = await collect(harness.ctx.llm.stream(reviewOptions()));
+  assert.deepEqual(
+    chunks.map(chunk => (chunk as { type: string }).type),
+    ['text-delta', 'finish'],
+    'only the answer of the route that completed is forwarded',
+  );
   assert.equal(
     harness.stats('backup-provider/backup-model').requests.length,
-    0,
-    'output makes the route non-retryable',
+    1,
+    'a failure after partial output still moves to the next route',
   );
 });
 
@@ -701,7 +699,7 @@ test('a stream that ends with no output falls back', async () => {
   assert.equal(harness.stats('backup-provider/backup-model').requests.length, 1);
 });
 
-test('a classified content failure is surfaced instead of retried', async () => {
+test('a classified content failure also moves to the next route', async () => {
   const harness = createHarness({
     routes: {
       'primary-provider/primary-model': {
@@ -714,22 +712,13 @@ test('a classified content failure is surfaced instead of retried', async () => 
     config: { fallbacks: [{ mode: 'route', provider: 'backup-provider', model: 'backup-model' }] },
   });
 
-  await assert.rejects(
-    collect(harness.ctx.llm.stream(reviewOptions())),
-    (error: unknown) => {
-      assert.ok(error instanceof ReviewerRouteError, `expected ReviewerRouteError, got ${String(error)}`);
-      const failure = error as ReviewerRouteError;
-      assert.equal(failure.failureCode, 'INVALID_REQUEST');
-      assert.equal(failure.route, 'primary-provider/primary-model');
-      assert.match(failure.message, /malformed/);
-      return true;
-    },
-  );
-  assert.equal(harness.stats('backup-provider/backup-model').requests.length, 0, 'a protocol failure must not fall back');
+  const chunks = await collect(harness.ctx.llm.stream(reviewOptions()));
+  assert.deepEqual(chunks.map(chunk => (chunk as { type: string }).type), ['text-delta', 'finish']);
+  assert.equal(harness.stats('backup-provider/backup-model').requests.length, 1, 'one bad route must not block the review');
   assert.equal(harness.stats('session-provider/session-model').requests.length, 0);
 });
 
-test('a classified non-retryable thrown error is surfaced instead of retried', async () => {
+test('a classified thrown error also moves to the next route', async () => {
   const harness = createHarness({
     routes: {
       'primary-provider/primary-model': {
@@ -742,37 +731,31 @@ test('a classified non-retryable thrown error is surfaced instead of retried', a
     config: { fallbacks: [{ mode: 'route', provider: 'backup-provider', model: 'backup-model' }] },
   });
 
-  await assert.rejects(
-    collect(harness.ctx.llm.stream(reviewOptions())),
-    (error: unknown) => {
-      assert.ok(error instanceof ReviewerRouteError);
-      assert.equal((error as ReviewerRouteError).failureCode, 'MALFORMED_RESPONSE');
-      return true;
-    },
-  );
-  assert.equal(harness.stats('backup-provider/backup-model').requests.length, 0);
+  const chunks = await collect(harness.ctx.llm.stream(reviewOptions()));
+  assert.deepEqual(chunks.map(chunk => (chunk as { type: string }).type), ['text-delta', 'finish']);
+  assert.equal(harness.stats('backup-provider/backup-model').requests.length, 1);
 });
 
-test('an adapter-side aborted finish is surfaced instead of retried', async () => {
+test('an adapter-side aborted finish also moves to the next route', async () => {
   const harness = createHarness({
     routes: {
       'primary-provider/primary-model': {
         steps: [{ chunk: { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: '' } } } }],
       },
-      'backup-provider/backup-model': { steps: [{ chunk: STOP_FINISH }] },
+      'backup-provider/backup-model': {
+        steps: [{ chunk: text('{"risk":"low","decision":"allow"}') }, { chunk: STOP_FINISH }],
+      },
     },
     config: { fallbacks: [{ mode: 'route', provider: 'backup-provider', model: 'backup-model' }] },
   });
 
-  await assert.rejects(
-    collect(harness.ctx.llm.stream(reviewOptions())),
-    (error: unknown) => {
-      assert.ok(error instanceof ReviewerRouteError);
-      assert.equal((error as ReviewerRouteError).failureCode, 'ABORTED');
-      return true;
-    },
+  const chunks = await collect(harness.ctx.llm.stream(reviewOptions()));
+  assert.deepEqual(chunks.map(chunk => (chunk as { type: string }).type), ['text-delta', 'finish']);
+  assert.equal(
+    harness.stats('backup-provider/backup-model').requests.length,
+    1,
+    'a provider-side abort without a caller abort is just another failed attempt',
   );
-  assert.equal(harness.stats('backup-provider/backup-model').requests.length, 0);
 });
 
 test('cancelling the request during a stream aborts without falling back', async () => {
@@ -1142,46 +1125,29 @@ test('the session-log exclusion for auto-review is still registered', () => {
   assert.equal(harness.exclusions[0]({}), false);
 });
 
-test('chunks are forwarded before the terminal finish', async () => {
+test('a validated answer is forwarded in its original order, ahead of one finish', async () => {
   const harness = createHarness({
     routes: {
       'primary-provider/primary-model': {
-        steps: [{ chunk: text('{"risk":"low"') }, { hang: true }],
+        steps: [
+          { chunk: reasoning('thinking') },
+          { chunk: text('{"risk":"low",') },
+          { chunk: text('"decision":"allow"}') },
+          { chunk: STOP_FINISH },
+        ],
       },
     },
   });
-  const stream = harness.ctx.llm.stream(reviewOptions());
-  const iterator = stream[Symbol.asyncIterator]();
-
-  const first = await iterator.next();
-  assert.equal(first.done, false);
-  assert.equal((first.value as { type: string }).type, 'text-delta');
-  assert.equal((first.value as { text: string }).text, '{"risk":"low"');
-  assert.equal(
-    harness.stats('primary-provider/primary-model').requests.length,
-    1,
-    'the chunk reached the caller without waiting for a terminal finish',
+  const chunks = await collect(harness.ctx.llm.stream(reviewOptions()));
+  assert.deepEqual(
+    chunks.map(chunk => (chunk as { type: string }).type),
+    ['reasoning-delta', 'text-delta', 'text-delta', 'finish'],
+    'the buffered deltas keep their order once the answer validates',
   );
-  await iterator.return?.();
 });
 
-test('failover is only possible before the first emitted chunk', async () => {
-  const beforeChunks = createHarness({
-    config: {
-      fallbacks: [{ mode: 'route', provider: 'backup-provider', model: 'backup-model' }],
-    },
-    routes: {
-      'primary-provider/primary-model': { syncThrow: new Error('socket hang up') },
-      'backup-provider/backup-model': {
-        steps: [{ chunk: text('{"risk":"low","decision":"allow"}') }, { chunk: STOP_FINISH }],
-      },
-    },
-  });
-  const chunks = await collect(beforeChunks.ctx.llm.stream(reviewOptions()));
-  assert.deepEqual(chunks.map(chunk => (chunk as { type: string }).type), ['text-delta', 'finish']);
-  assert.equal(beforeChunks.stats('backup-provider/backup-model').requests.length, 1);
-
-  const afterChunks = createHarness({
+test('a failure after partial output fails over without leaking that partial answer', async () => {
+  const harness = createHarness({
     config: {
       fallbacks: [{ mode: 'route', provider: 'backup-provider', model: 'backup-model' }],
     },
@@ -1189,23 +1155,19 @@ test('failover is only possible before the first emitted chunk', async () => {
       'primary-provider/primary-model': {
         steps: [{ chunk: text('{"risk":"low"') }, { chunk: errorFinish('QUOTA') }],
       },
-      'backup-provider/backup-model': { steps: [{ chunk: STOP_FINISH }] },
+      'backup-provider/backup-model': {
+        steps: [{ chunk: text('{"risk":"low","decision":"allow"}') }, { chunk: STOP_FINISH }],
+      },
     },
   });
-  const stream = afterChunks.ctx.llm.stream(reviewOptions());
-  const iterator = stream[Symbol.asyncIterator]();
-  const first = await iterator.next();
-  assert.equal((first.value as { text: string }).text, '{"risk":"low"');
-  await assert.rejects(iterator.next(), (error: unknown) => {
-    assert.ok(error instanceof ReviewerRouteError, `expected ReviewerRouteError, got ${String(error)}`);
-    assert.equal((error as ReviewerRouteError).failureCode, 'QUOTA');
-    return true;
-  });
+  const chunks = await collect(harness.ctx.llm.stream(reviewOptions()));
+  assert.deepEqual(chunks.map(chunk => (chunk as { type: string }).type), ['text-delta', 'finish']);
   assert.equal(
-    afterChunks.stats('backup-provider/backup-model').requests.length,
-    0,
-    'a failure after the first emitted chunk must not switch routes',
+    (chunks[0] as { text: string }).text,
+    '{"risk":"low","decision":"allow"}',
+    'the failed route text is never forwarded',
   );
+  assert.equal(harness.stats('backup-provider/backup-model').requests.length, 1);
 });
 
 test('the winning route is yielded once and never duplicated', async () => {
@@ -1239,15 +1201,15 @@ test('route policy helpers normalize, order and de-duplicate exactly as document
   assert.equal(fallback.isLegacySessionEntry(null), false);
   assert.deepEqual(
     fallback.normalizeFallbackEntry({ mode: 'route', provider: ' p ', model: ' m ' }),
-    { enabled: true, provider: 'p', model: 'm', reasoningEffort: '' },
+    { enabled: true, weight: 0, provider: 'p', model: 'm', reasoningEffort: '' },
   );
   assert.deepEqual(
     fallback.normalizeFallbackEntry({ enabled: false, provider: 'p', model: 'm' }),
-    { enabled: false, provider: 'p', model: 'm', reasoningEffort: '' },
+    { enabled: false, weight: 0, provider: 'p', model: 'm', reasoningEffort: '' },
   );
   assert.deepEqual(
     fallback.normalizeFallbackEntry(null),
-    { enabled: true, provider: '', model: '', reasoningEffort: '' },
+    { enabled: true, weight: 0, provider: '', model: '', reasoningEffort: '' },
   );
   assert.deepEqual(
     fallback.readFallbackEntries({
@@ -1258,28 +1220,33 @@ test('route policy helpers normalize, order and de-duplicate exactly as document
       ],
     }),
     [
-      { enabled: false, provider: 'disabled', model: 'disabled', reasoningEffort: '' },
-      { enabled: true, provider: 'p', model: 'm', reasoningEffort: 'high' },
+      { enabled: false, weight: 0, provider: 'disabled', model: 'disabled', reasoningEffort: '' },
+      { enabled: true, weight: 0, provider: 'p', model: 'm', reasoningEffort: 'high' },
     ],
     'legacy session entries are ignored and disabled rows are preserved',
   );
 
-  // Row 1 (primary), then explicit fallbacks, then the implicit session route.
+  // The explicit routes, then the implicit session route.
   const ordered = fallback.buildReviewPlan(
-    { provider: 'p', model: 'm', reasoningEffort: 'high' },
-    [{ enabled: true, provider: 'b', model: 'bm', reasoningEffort: '' }],
+    [
+      { enabled: true, weight: 3, provider: 'p', model: 'm', reasoningEffort: 'high' },
+      { enabled: true, weight: 0, provider: 'b', model: 'bm', reasoningEffort: '' },
+    ],
     { provider: 'sp', model: 'sm' },
   );
   assert.deepEqual(
-    ordered.map((attempt: { label: string; reasoningEffort: string }) => [attempt.label, attempt.reasoningEffort]),
-    [['p/m', 'high'], ['b/bm', ''], ['sp/sm (session)', '']],
+    ordered.map((attempt: { label: string; reasoningEffort: string; weight: number }) => [
+      attempt.label,
+      attempt.reasoningEffort,
+      attempt.weight,
+    ]),
+    [['p/m', 'high', 3], ['b/bm', '', 0], ['sp/sm (session)', '', 0]],
   );
 
   // An explicit route equal to the request route suppresses the session attempt.
   assert.deepEqual(
     fallback.buildReviewPlan(
-      { provider: 'sp', model: 'sm', reasoningEffort: '' },
-      [],
+      [{ enabled: true, weight: 0, provider: 'sp', model: 'sm', reasoningEffort: '' }],
       { provider: 'sp', model: 'sm' },
     ).map((attempt: { label: string }) => attempt.label),
     ['sp/sm'],
@@ -1288,8 +1255,7 @@ test('route policy helpers normalize, order and de-duplicate exactly as document
   // No request route: the session attempt is not appended.
   assert.deepEqual(
     fallback.buildReviewPlan(
-      { provider: 'p', model: 'm', reasoningEffort: '' },
-      [],
+      [{ enabled: true, weight: 0, provider: 'p', model: 'm', reasoningEffort: '' }],
       { provider: '', model: '' },
     ).map((attempt: { label: string }) => attempt.label),
     ['p/m'],
@@ -1298,18 +1264,16 @@ test('route policy helpers normalize, order and de-duplicate exactly as document
   // No usable explicit route: nothing is rewritten at all.
   assert.deepEqual(
     fallback.buildReviewPlan(
-      { provider: '', model: '', reasoningEffort: '' },
-      [{ enabled: true, provider: '', model: 'incomplete', reasoningEffort: '' }],
+      [{ enabled: true, weight: 0, provider: '', model: 'incomplete', reasoningEffort: '' }],
       { provider: 'sp', model: 'sm' },
     ),
     [],
   );
 
-  // Disabled rows never enter the plan; disabling row 1 skips it.
+  // Disabled rows never enter the plan.
   assert.deepEqual(
     fallback.buildReviewPlan(
-      { primaryEnabled: false, provider: 'p', model: 'm', reasoningEffort: '' },
-      [{ enabled: false, provider: 'b', model: 'bm', reasoningEffort: '' }],
+      [{ enabled: false, weight: 2, provider: 'b', model: 'bm', reasoningEffort: '' }],
       { provider: 'sp', model: 'sm' },
     ),
     [],
@@ -1329,9 +1293,8 @@ test('route policy helpers normalize, order and de-duplicate exactly as document
   // Failure records carry the raw provider message; only classification codes
   // are normalized to the official taxonomy.
   const attempt = {
-    source: 'primary' as const,
     mode: 'route' as const,
-    index: -1,
+    weight: 0,
     provider: 'p',
     model: 'm',
     reasoningEffort: '',
@@ -1351,4 +1314,146 @@ test('route policy helpers normalize, order and de-duplicate exactly as document
   assert.equal(finish.detail, 'raw balance exhausted', 'the raw finish message is preserved verbatim');
   assert.equal(finish.code, 'QUOTA');
   assert.equal(finish.rawCode, 'QUOTA');
+});
+
+test('readRoutes migrates a legacy row-1 + fallbacks document and prefers a non-empty routes list', () => {
+  const { fallback } = __testing;
+
+  assert.deepEqual(fallback.readRoutes(undefined), []);
+  assert.deepEqual(fallback.readRoutes({}), []);
+
+  // Row 1 is enabled: it becomes the first route, fallbacks follow.
+  assert.deepEqual(
+    fallback.readRoutes({
+      primaryEnabled: true,
+      provider: ' p ',
+      model: ' m ',
+      reasoningEffort: ' max ',
+      fallbacks: [{ enabled: true, provider: 'b', model: 'bm', reasoningEffort: '' }],
+    }),
+    [
+      { enabled: true, weight: 0, provider: 'p', model: 'm', reasoningEffort: 'max' },
+      { enabled: true, weight: 0, provider: 'b', model: 'bm', reasoningEffort: '' },
+    ],
+  );
+
+  // Row 1 is disabled: only the fallbacks survive, and the disabled row is kept
+  // out of the plan instead of being silently re-enabled.
+  assert.deepEqual(
+    fallback.readRoutes({
+      primaryEnabled: false,
+      provider: 'p',
+      model: 'm',
+      reasoningEffort: '',
+      fallbacks: [{ enabled: false, provider: 'b', model: 'bm', reasoningEffort: '' }],
+    }),
+    [{ enabled: false, weight: 0, provider: 'b', model: 'bm', reasoningEffort: '' }],
+  );
+
+  // The schema fills a missing volatile list with `[]`, so an empty list must
+  // keep migrating instead of reading as "the user deleted every route".
+  assert.deepEqual(
+    fallback.readRoutes({
+      primaryEnabled: true,
+      provider: 'p',
+      model: 'm',
+      reasoningEffort: '',
+      routes: [],
+    }),
+    [{ enabled: true, weight: 0, provider: 'p', model: 'm', reasoningEffort: '' }],
+  );
+
+  // A config the settings page already rewrote has empty legacy fields, so an
+  // empty list still means "no explicit route".
+  assert.deepEqual(
+    fallback.readRoutes({ primaryEnabled: true, provider: '', model: '', routes: [] }),
+    [],
+  );
+
+  // A non-empty list is authoritative; legacy fields are ignored and legacy
+  // `{ mode: 'session' }` rows are dropped.
+  assert.deepEqual(
+    fallback.readRoutes({
+      primaryEnabled: true,
+      provider: 'stale',
+      model: 'stale',
+      routes: [
+        { enabled: true, weight: 4, provider: 'a', model: 'am', reasoningEffort: ' low ' },
+        { mode: 'session', provider: 'session', model: 'session' },
+      ],
+    }),
+    [{ enabled: true, weight: 4, provider: 'a', model: 'am', reasoningEffort: 'low' }],
+  );
+
+  // Weights are clamped to the documented 0-9 range; anything unusable is 0.
+  assert.equal(fallback.normalizeWeight(undefined), 0);
+  assert.equal(fallback.normalizeWeight(null), 0);
+  assert.equal(fallback.normalizeWeight('nope'), 0);
+  assert.equal(fallback.normalizeWeight(-1), 0);
+  assert.equal(fallback.normalizeWeight(10), 0);
+  assert.equal(fallback.normalizeWeight(3.9), 3);
+  assert.equal(fallback.normalizeWeight('7'), 7);
+});
+
+test('pickWeightedStart draws the session start by weight and keeps the rest in order', () => {
+  const { fallback } = __testing;
+  const route = (provider: string, weight: number) => ({
+    mode: 'route' as const,
+    weight,
+    provider,
+    model: `${provider}-model`,
+    reasoningEffort: '',
+    label: `${provider}/${provider}-model`,
+  });
+  const session = {
+    mode: 'session' as const,
+    weight: 0,
+    provider: 'session',
+    model: 'session-model',
+    reasoningEffort: '',
+    label: 'session/session-model (session)',
+  };
+  const plan = [route('a', 3), route('b', 1), route('c', 0), session];
+  const order = (random: number) => fallback.pickWeightedStart(plan, () => random)
+    .map((attempt: { label: string }) => attempt.label);
+
+  // The draw only decides the start; the remaining positive rows keep their
+  // configured order, zero-weight rows trail them, and the session is last.
+  assert.deepEqual(order(0), [
+    'a/a-model',
+    'b/b-model',
+    'c/c-model',
+    'session/session-model (session)',
+  ]);
+  assert.deepEqual(order(0.74), [
+    'a/a-model',
+    'b/b-model',
+    'c/c-model',
+    'session/session-model (session)',
+  ]);
+  assert.deepEqual(order(0.8), [
+    'b/b-model',
+    'a/a-model',
+    'c/c-model',
+    'session/session-model (session)',
+  ]);
+  assert.deepEqual(order(0.999), [
+    'b/b-model',
+    'a/a-model',
+    'c/c-model',
+    'session/session-model (session)',
+  ]);
+
+  // Defaults to zero weight everywhere: the configured order is untouched.
+  const flat = [route('a', 0), route('b', 0), session];
+  assert.deepEqual(
+    fallback.pickWeightedStart(flat, () => 0.5).map((attempt: { label: string }) => attempt.label),
+    ['a/a-model', 'b/b-model', 'session/session-model (session)'],
+  );
+  // One positive route always starts, whatever the draw picks.
+  const single = [route('a', 0), route('b', 5), route('c', 0), session];
+  assert.deepEqual(
+    fallback.pickWeightedStart(single, () => 0.99).map((attempt: { label: string }) => attempt.label),
+    ['b/b-model', 'a/a-model', 'c/c-model', 'session/session-model (session)'],
+  );
 });

@@ -212,6 +212,7 @@ test.before(() => {
 interface FallbackSetting {
   mode: string;
   enabled?: boolean;
+  weight?: number;
   provider: string;
   model: string;
   reasoningEffort: string;
@@ -224,6 +225,7 @@ interface SetupTestEnvOptions {
     model?: string;
     reasoningEffort?: string;
     fallbacks?: FallbackSetting[];
+    routes?: FallbackSetting[];
   };
   revision?: number;
   catalogAvailable?: boolean;
@@ -530,8 +532,10 @@ test('unknown saved effort is displayed and preserved when model catalog fails',
   const postSaveTree = await env.flush();
 
   assert.equal(env.writes.length, 1);
-  assert.equal(env.writes[0].nextSettings.reasoningEffort, 'high');
-  assert.equal(env.writes[0].nextSettings.primaryEnabled, false);
+  const written = env.writes[0].nextSettings;
+  assert.equal(written.routes.length, 1);
+  assert.equal(written.routes[0].reasoningEffort, 'high');
+  assert.equal(written.routes[0].enabled, false);
   const postSaveEffort = flattenNodes(postSaveTree).find((n) => n.props?.label === env.t('routeEffort') + ' 1');
   assert.ok(postSaveEffort);
   const postSaveHigh = (postSaveEffort.props.options as Array<{ value: string; label: string }>)
@@ -576,7 +580,7 @@ test('user can explicitly clear an unknown effort to default when catalog fails'
   findButton(flattenNodes(tree), env.t('save'))?.props.onClick();
   await env.flush();
   assert.equal(env.writes.length, 1);
-  assert.equal(env.writes[0].nextSettings.reasoningEffort, '');
+  assert.equal(env.writes[0].nextSettings.routes[0].reasoningEffort, '');
 });
 
 test('saved non-empty effort with empty model can be explicitly cleared in UI', async () => {
@@ -600,8 +604,8 @@ test('saved non-empty effort with empty model can be explicitly cleared in UI', 
   saveButton.props.onClick();
   await env.flush();
   assert.equal(env.writes.length, 1);
-  assert.equal(env.writes[0].nextSettings.reasoningEffort, '');
-  assert.equal(env.writes[0].nextSettings.model, '');
+  assert.equal(env.writes[0].nextSettings.routes[0].reasoningEffort, '');
+  assert.equal(env.writes[0].nextSettings.routes[0].model, '');
 });
 
 test('re-selecting current provider or model is a no-op and preserves dirty state', async () => {
@@ -659,9 +663,10 @@ test('an incomplete row is marked as skipped and save is still permitted', async
   saveButton.props.onClick();
   await env.flush();
   assert.equal(env.writes.length, 1);
-  assert.equal(env.writes[0].nextSettings.model, '');
-  assert.equal(env.writes[0].nextSettings.primaryEnabled, false);
-  assert.equal(env.writes[0].nextSettings.provider, 'provider-a');
+  const written = env.writes[0].nextSettings;
+  assert.equal(written.routes[0].model, '');
+  assert.equal(written.routes[0].enabled, false);
+  assert.equal(written.routes[0].provider, 'provider-a');
 });
 
 test('the English incomplete-row hint matches the Chinese meaning', async () => {
@@ -917,8 +922,9 @@ test('new rows default to the inherit effort and are saved enabled', async () =>
   findButton(nodes, env.t('save'))?.props.onClick();
   await env.flush();
   assert.equal(env.writes.length, 1);
-  assert.deepEqual(env.writes[0].nextSettings.fallbacks, [
-    { mode: 'route', enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'inherit' },
+  assert.deepEqual(env.writes[0].nextSettings.routes, [
+    { mode: 'route', enabled: true, weight: 0, provider: 'provider-a', model: 'model-a1', reasoningEffort: '' },
+    { mode: 'route', enabled: true, weight: 0, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'inherit' },
   ]);
 });
 
@@ -963,17 +969,18 @@ test('rows can be reordered, removed and saved with their enable flags', async (
   await env.flush();
   assert.equal(env.writes.length, 1);
   assert.deepEqual(env.writes[0].nextSettings, {
-    primaryEnabled: false,
-    provider: 'provider-a',
-    model: 'model-a1',
-    reasoningEffort: 'inherit',
-    fallbacks: [
-      { mode: 'route', enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'inherit' },
+    primaryEnabled: true,
+    provider: '',
+    model: '',
+    reasoningEffort: '',
+    routes: [
+      { mode: 'route', enabled: false, weight: 0, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'inherit' },
+      { mode: 'route', enabled: true, weight: 0, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'inherit' },
     ],
   });
 });
 
-test('removing the first of two rows promotes the second into row 1', async () => {
+test('removing the first of two rows leaves the second as the only route', async () => {
   const env = await setupComponent({
     savedSettings: {
       primaryEnabled: true,
@@ -995,9 +1002,12 @@ test('removing the first of two rows promotes the second into row 1', async () =
   await env.flush();
   assert.deepEqual(env.writes[0].nextSettings, {
     primaryEnabled: true,
-    provider: 'provider-b',
-    model: 'model-b1',
+    provider: '',
+    model: '',
     reasoningEffort: '',
+    routes: [
+      { mode: 'route', enabled: true, weight: 0, provider: 'provider-b', model: 'model-b1', reasoningEffort: '' },
+    ],
   });
 });
 
@@ -1023,6 +1033,31 @@ test('the route list is capped at ten rows', async () => {
   assert.equal(routeRows(nodes).length, 10);
   assert.equal(findByAction(nodes, 'route-add')?.props.disabled, true);
   assert.ok(nodes.some((node) => node.props?.children === env.t('routeCapHint')));
+});
+
+test('a legacy section whose live value carries an empty routes list still shows its rows', async () => {
+  // `settings.describe()` projects the live config, where schemastery has already
+  // turned an absent volatile array into `[]`. The table must not read that as
+  // "all routes were deleted" and go blank.
+  const env = await setupComponent({
+    savedSettings: { ...SAVED_ROUTE, routes: [] },
+    catalogGroups: ROUTE_CATALOG,
+  });
+  env.render();
+  const nodes = flattenNodes(await env.flush());
+  assert.equal(routeRows(nodes).length, 1, 'the migrated legacy row must still be listed');
+  assert.equal(findByTestId(nodes, 'route-0-provider')?.props.value, 'provider-a');
+  assert.equal(findByTestId(nodes, 'route-0-model')?.props.value, 'model-a1');
+  assert.equal(findByTestId(nodes, 'route-0-effort')?.props.value, 'high');
+  assert.equal(findByAction(nodes, 'route-0-weight')?.props.value, '0');
+
+  // A weight edit is a normal dirty edit and is saved as a declared weight.
+  findByAction(nodes, 'route-0-weight')?.props.onChange({ target: { value: '5' } });
+  const edited = flattenNodes(await env.flush());
+  assert.ok(findNodeByClass(edited, 'dsh_arm_unsaved'), 'a weight edit must mark the form dirty');
+  findButton(edited, env.t('save'))?.props.onClick();
+  await env.flush();
+  assert.equal(env.writes[0].nextSettings.routes[0].weight, 5);
 });
 
 test('legacy { mode: session } rows are ignored and dropped on the next save', async () => {
@@ -1051,8 +1086,9 @@ test('legacy { mode: session } rows are ignored and dropped on the next save', a
   findButton(nodes, env.t('save'))?.props.onClick();
   await env.flush();
   assert.equal(env.writes.length, 1);
-  assert.deepEqual(env.writes[0].nextSettings.fallbacks, [
-    { mode: 'route', enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: '' },
+  assert.deepEqual(env.writes[0].nextSettings.routes, [
+    { mode: 'route', enabled: false, weight: 0, provider: 'provider-a', model: 'model-a1', reasoningEffort: '' },
+    { mode: 'route', enabled: true, weight: 0, provider: 'provider-b', model: 'model-b1', reasoningEffort: '' },
   ]);
   assert.ok(!JSON.stringify(env.writes[0].nextSettings).includes('session'));
 });

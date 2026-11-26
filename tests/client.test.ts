@@ -92,6 +92,8 @@ try {
 interface FallbackEntry {
   mode: 'route';
   enabled: boolean;
+  /** Declared 0-9 start weight; 0 means "only after every positive route". */
+  weight: number;
   provider: string;
   model: string;
   reasoningEffort: string;
@@ -100,6 +102,8 @@ interface FallbackEntry {
 /** One editable row of the ordered review-route list. */
 interface ReviewRoute {
   enabled: boolean;
+  /** Declared 0-9 start weight; 0 means "only after every positive route". */
+  weight: number;
   provider: string;
   model: string;
   reasoningEffort: string;
@@ -111,6 +115,7 @@ interface ReviewerSettings {
   model: string;
   reasoningEffort: string;
   fallbacks?: FallbackEntry[];
+  routes?: FallbackEntry[];
 }
 
 interface EffortInfo {
@@ -861,15 +866,17 @@ test('effortsFor normalizes advertised reasoning efforts to id/name entries', ()
 });
 
 test('routeAfterProvider clears model and effort on switch, but is a no-op when selecting the current provider', () => {
-  const route: ReviewRoute = { enabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' };
+  const route: ReviewRoute = { enabled: true, weight: 4, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' };
   assert.deepEqual(testing().routeAfterProvider(route, 'provider-b'), {
     enabled: true,
+    weight: 4,
     provider: 'provider-b',
     model: '',
     reasoningEffort: '',
   });
   assert.deepEqual(testing().routeAfterProvider(route, ''), {
     enabled: true,
+    weight: 4,
     provider: '',
     model: '',
     reasoningEffort: '',
@@ -878,11 +885,12 @@ test('routeAfterProvider clears model and effort on switch, but is a no-op when 
   assert.deepEqual(testing().routeAfterProvider(route, '  provider-a  '), route);
   assert.deepEqual(
     testing().routeAfterProvider({ ...route, reasoningEffort: 'inherit' }, 'provider-b'),
-    { enabled: true, provider: 'provider-b', model: '', reasoningEffort: 'inherit' },
+    { enabled: true, weight: 4, provider: 'provider-b', model: '', reasoningEffort: 'inherit' },
     'the route-independent inherit sentinel survives a provider change',
   );
   assert.deepEqual(route, {
     enabled: true,
+    weight: 4,
     provider: 'provider-a',
     model: 'model-a1',
     reasoningEffort: 'high',
@@ -890,15 +898,17 @@ test('routeAfterProvider clears model and effort on switch, but is a no-op when 
 });
 
 test('routeAfterModel drops effort when switching model, but is a no-op when selecting the current model', () => {
-  const route: ReviewRoute = { enabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' };
+  const route: ReviewRoute = { enabled: true, weight: 2, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' };
   assert.deepEqual(testing().routeAfterModel(route, 'model-a2', GROUPS), {
     enabled: true,
+    weight: 2,
     provider: 'provider-a',
     model: 'model-a2',
     reasoningEffort: '',
   });
   assert.deepEqual(testing().routeAfterModel(route, 'model-a3', GROUPS), {
     enabled: true,
+    weight: 2,
     provider: 'provider-a',
     model: 'model-a3',
     reasoningEffort: '',
@@ -906,7 +916,7 @@ test('routeAfterModel drops effort when switching model, but is a no-op when sel
   assert.deepEqual(testing().routeAfterModel(route, 'model-a1', GROUPS), route);
   assert.deepEqual(testing().routeAfterModel(route, '  model-a1  ', GROUPS), route);
 
-  const unknown: ReviewRoute = { enabled: true, provider: 'provider-a', model: 'model-unknown-not-in-catalog', reasoningEffort: 'high' };
+  const unknown: ReviewRoute = { enabled: true, weight: 2, provider: 'provider-a', model: 'model-unknown-not-in-catalog', reasoningEffort: 'high' };
   assert.deepEqual(
     testing().routeAfterModel(unknown, 'model-unknown-not-in-catalog', GROUPS),
     unknown,
@@ -1142,6 +1152,7 @@ test('saveReviewerSettings writes row 1 with primaryEnabled and no deprecated en
 const SAVED_FALLBACK: FallbackEntry = {
   mode: 'route',
   enabled: true,
+  weight: 0,
   provider: 'provider-b',
   model: 'model-b1',
   reasoningEffort: 'high',
@@ -1150,6 +1161,7 @@ const SAVED_FALLBACK: FallbackEntry = {
 /** One enabled explicit row in the catalog shared with the fallback rows. */
 const ROUTE_A_ROW: ReviewRoute = {
   enabled: true,
+  weight: 0,
   provider: 'provider-a',
   model: 'model-a1',
   reasoningEffort: 'high',
@@ -1179,15 +1191,15 @@ test('normalizeSettings drops legacy { mode: session } rows and keeps per-row en
     reasoningEffort: '',
     fallbacks: [
       { mode: 'session', provider: 'stale', model: 'stale', reasoningEffort: '' },
-      { mode: ' ROUTE ', enabled: false, provider: ' provider-b ', model: ' model-b1 ', reasoningEffort: ' high ' },
+      { mode: ' ROUTE ', enabled: false, weight: ' 7 ', provider: ' provider-b ', model: ' model-b1 ', reasoningEffort: ' high ' },
       { mode: 'nonsense', provider: 'provider-a', model: 'model-a1' },
       'not-an-object',
     ],
   });
   assert.deepEqual(normalized.fallbacks, [
-    { mode: 'route', enabled: false, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'high' },
-    { mode: 'route', enabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: '' },
-    { mode: 'route', enabled: true, provider: '', model: '', reasoningEffort: '' },
+    { mode: 'route', enabled: false, weight: 7, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'high' },
+    { mode: 'route', enabled: true, weight: 0, provider: 'provider-a', model: 'model-a1', reasoningEffort: '' },
+    { mode: 'route', enabled: true, weight: 0, provider: '', model: '', reasoningEffort: '' },
   ], 'only the legacy session row is dropped');
 
   assert.equal(testing().isLegacySessionEntry({ mode: 'SESSION' }), true);
@@ -1197,7 +1209,7 @@ test('normalizeSettings drops legacy { mode: session } rows and keeps per-row en
   assert.deepEqual(testing().normalizeRoutes('nope'), []);
 });
 
-test('rowsFromSettings maps row 1 and keeps incomplete or disabled rows visible', () => {
+test('rowsFromSettings shows the saved routes list and migrates a legacy section', () => {
   assert.deepEqual(
     testing().rowsFromSettings({ primaryEnabled: true, provider: '', model: '', reasoningEffort: '' }),
     [],
@@ -1210,7 +1222,7 @@ test('rowsFromSettings maps row 1 and keeps incomplete or disabled rows visible'
       model: '',
       reasoningEffort: '',
     }),
-    [{ enabled: false, provider: '', model: '', reasoningEffort: '' }],
+    [{ enabled: false, weight: 0, provider: '', model: '', reasoningEffort: '' }],
     'an explicitly disabled empty row 1 stays visible',
   );
   assert.deepEqual(
@@ -1222,9 +1234,10 @@ test('rowsFromSettings maps row 1 and keeps incomplete or disabled rows visible'
       fallbacks: [SAVED_FALLBACK],
     }),
     [
-      { enabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' },
-      { enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'high' },
+      { enabled: true, weight: 0, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' },
+      { enabled: true, weight: 0, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'high' },
     ],
+    'a legacy section renders row 1 followed by its fallbacks, all with weight 0',
   );
   assert.deepEqual(
     testing().rowsFromSettings({
@@ -1235,60 +1248,120 @@ test('rowsFromSettings maps row 1 and keeps incomplete or disabled rows visible'
       fallbacks: [SAVED_FALLBACK],
     }),
     [
-      { enabled: true, provider: 'provider-a', model: '', reasoningEffort: '' },
-      { enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'high' },
+      { enabled: true, weight: 0, provider: 'provider-a', model: '', reasoningEffort: '' },
+      { enabled: true, weight: 0, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'high' },
     ],
     'an incomplete saved row 1 must stay visible',
   );
-});
 
-test('settingsFromRows splits row 1 and keeps per-row enable flags', () => {
+  // The schema fills a missing volatile list with `[]`, so a legacy section's
+  // live value is `routes: []`. Reading that as authoritative would blank the
+  // whole table even though the saved rows are still there.
   assert.deepEqual(
-    testing().settingsFromRows([
-      { enabled: false, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' },
-      { enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: '' },
-    ]),
-    {
+    testing().rowsFromSettings({
       primaryEnabled: false,
       provider: 'provider-a',
       model: 'model-a1',
-      reasoningEffort: 'high',
-      fallbacks: [{ mode: 'route', enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: '' }],
+      reasoningEffort: 'inherit',
+      fallbacks: [SAVED_FALLBACK],
+      routes: [],
+    }),
+    [
+      { enabled: false, weight: 0, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'inherit' },
+      { enabled: true, weight: 0, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'high' },
+    ],
+    'an empty schema-filled routes list must fall through to the legacy rows',
+  );
+
+  // A non-empty list is authoritative and keeps its declared weights.
+  assert.deepEqual(
+    testing().rowsFromSettings({
+      primaryEnabled: false,
+      provider: 'stale',
+      model: 'stale',
+      reasoningEffort: '',
+      routes: [
+        { mode: 'route', enabled: true, weight: 5, provider: ' provider-a ', model: ' model-a1 ', reasoningEffort: ' high ' },
+        { mode: 'route', enabled: false, weight: 0, provider: 'provider-b', model: 'model-b1', reasoningEffort: '' },
+      ],
+    }),
+    [
+      { enabled: true, weight: 5, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' },
+      { enabled: false, weight: 0, provider: 'provider-b', model: 'model-b1', reasoningEffort: '' },
+    ],
+    'the saved list wins and the legacy row 1 is ignored',
+  );
+
+  // A section the page itself saved with no rows has empty legacy fields too.
+  assert.deepEqual(
+    testing().rowsFromSettings({ primaryEnabled: true, provider: '', model: '', reasoningEffort: '', routes: [] }),
+    [],
+    'an empty list with no legacy rows is genuinely empty',
+  );
+});
+
+test('settingsFromRows writes one unified routes list', () => {
+  assert.deepEqual(
+    testing().settingsFromRows([
+      { enabled: false, weight: 0, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' },
+      { enabled: true, weight: 3, provider: 'provider-b', model: 'model-b1', reasoningEffort: '' },
+    ]),
+    {
+      primaryEnabled: true,
+      provider: '',
+      model: '',
+      reasoningEffort: '',
+      routes: [
+        { mode: 'route', enabled: false, weight: 0, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'high' },
+        { mode: 'route', enabled: true, weight: 3, provider: 'provider-b', model: 'model-b1', reasoningEffort: '' },
+      ],
     },
+    'every row is one entry of the unified list, and the legacy fields stay empty',
   );
   assert.deepEqual(
     testing().settingsFromRows([]),
-    { primaryEnabled: true, provider: '', model: '', reasoningEffort: '' },
-    'an empty list keeps the legacy shape without a fallbacks key',
+    { primaryEnabled: true, provider: '', model: '', reasoningEffort: '', routes: [] },
+    'an empty list is still an explicit empty routes list',
   );
   assert.deepEqual(
-    testing().settingsFromRows([{ enabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: '' }]),
-    { primaryEnabled: true, provider: 'provider-a', model: 'model-a1', reasoningEffort: '' },
-    'a single row needs no fallbacks key',
+    testing().settingsFromRows([
+      { enabled: true, weight: 9, provider: 'provider-a', model: 'model-a1', reasoningEffort: '' },
+    ]),
+    {
+      primaryEnabled: true,
+      provider: '',
+      model: '',
+      reasoningEffort: '',
+      routes: [
+        { mode: 'route', enabled: true, weight: 9, provider: 'provider-a', model: 'model-a1', reasoningEffort: '' },
+      ],
+    },
+    'a single row is written to the unified list too',
   );
 });
 
 test('settingsFromRows and rowsFromSettings round-trip the whole ordered list', () => {
   const rows: ReviewRoute[] = [
-    { enabled: true, provider: 'p1', model: 'm1', reasoningEffort: 'inherit' },
-    { enabled: false, provider: 'p2', model: 'm2', reasoningEffort: '' },
-    { enabled: true, provider: '', model: '', reasoningEffort: '' },
+    { enabled: true, weight: 4, provider: 'p1', model: 'm1', reasoningEffort: 'inherit' },
+    { enabled: false, weight: 0, provider: 'p2', model: 'm2', reasoningEffort: '' },
+    { enabled: true, weight: 0, provider: '', model: '', reasoningEffort: '' },
   ];
   assert.deepEqual(testing().rowsFromSettings(testing().settingsFromRows(rows)), rows);
 });
 
 test('routesEqual detects enable changes and every meaningful list change', () => {
   const { routesEqual } = testing();
-  const a: ReviewRoute[] = [ROUTE_A_ROW, { enabled: true, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'high' }];
+  const a: ReviewRoute[] = [ROUTE_A_ROW, { enabled: true, weight: 0, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'high' }];
   const b = [
-    { reasoningEffort: 'high', model: 'model-a1', provider: 'provider-a', enabled: true },
-    { reasoningEffort: 'high', model: 'model-b1', provider: 'provider-b', enabled: true },
+    { reasoningEffort: 'high', model: 'model-a1', provider: 'provider-a', enabled: true, weight: 0 },
+    { reasoningEffort: 'high', model: 'model-b1', provider: 'provider-b', enabled: true, weight: 0 },
   ];
   assert.equal(routesEqual(a, b), true);
   assert.equal(routesEqual(undefined, []), true);
   assert.equal(routesEqual(a, [b[1], b[0]]), false, 'order must matter');
   assert.equal(routesEqual(a, [{ ...b[0], enabled: false }, b[1]]), false, 'enable flags must matter');
   assert.equal(routesEqual(a, [{ ...b[0], model: 'model-a2' }, b[1]]), false);
+  assert.equal(routesEqual(a, [{ ...b[0], weight: 3 }, b[1]]), false, 'weights must matter');
 });
 
 test('route row helpers keep the list immutable, ordered and capped at ten rows', () => {
@@ -1298,9 +1371,9 @@ test('route row helpers keep the list immutable, ordered and capped at ten rows'
   assert.equal(MAX_ROUTES, 10);
   assert.equal(INHERIT_EFFORT, 'inherit');
   const base: ReviewRoute[] = [
-    { enabled: true, provider: 'p1', model: 'm1', reasoningEffort: '' },
-    { enabled: true, provider: 'p2', model: 'm2', reasoningEffort: '' },
-    { enabled: true, provider: 'p3', model: 'm3', reasoningEffort: '' },
+    { enabled: true, weight: 1, provider: 'p1', model: 'm1', reasoningEffort: '' },
+    { enabled: true, weight: 0, provider: 'p2', model: 'm2', reasoningEffort: '' },
+    { enabled: true, weight: 0, provider: 'p3', model: 'm3', reasoningEffort: '' },
   ];
   const snapshot = structuredClone(base);
 
@@ -1308,10 +1381,11 @@ test('route row helpers keep the list immutable, ordered and capped at ten rows'
   assert.equal(added.length, 4);
   assert.deepEqual(added[3], {
     enabled: true,
+    weight: 0,
     provider: '',
     model: '',
     reasoningEffort: 'inherit',
-  }, 'a new row defaults to the inherit effort');
+  }, 'a new row defaults to the inherit effort and weight 0');
   assert.deepEqual(base, snapshot, 'the input list must not be mutated');
 
   assert.deepEqual(removeRoute(base, 1).map((route) => route.provider), ['p1', 'p3']);
@@ -1321,10 +1395,10 @@ test('route row helpers keep the list immutable, ordered and capped at ten rows'
   assert.deepEqual(moveRoute(base, 0, -1), base);
   assert.deepEqual(moveRoute(base, 2, 1), base);
   assert.deepEqual(
-    replaceRoute(base, 1, { enabled: false, provider: 'px', model: 'mx', reasoningEffort: 'low' }),
+    replaceRoute(base, 1, { enabled: false, weight: 6, provider: 'px', model: 'mx', reasoningEffort: 'low' }),
     [
       base[0],
-      { enabled: false, provider: 'px', model: 'mx', reasoningEffort: 'low' },
+      { enabled: false, weight: 6, provider: 'px', model: 'mx', reasoningEffort: 'low' },
       base[2],
     ],
   );
@@ -1332,6 +1406,7 @@ test('route row helpers keep the list immutable, ordered and capped at ten rows'
 
   const full: ReviewRoute[] = Array.from({ length: MAX_ROUTES }, () => ({
     enabled: true,
+    weight: 0,
     provider: 'p',
     model: 'm',
     reasoningEffort: '',
@@ -1339,7 +1414,7 @@ test('route row helpers keep the list immutable, ordered and capped at ten rows'
   assert.equal(addRoute(full).length, MAX_ROUTES, 'the whole explicit list is capped at 10 rows');
 });
 
-test('saveReviewerSettings persists enable flags with the split list', async () => {
+test('saveReviewerSettings persists the unified routes list with weights', async () => {
   let replaceArgs: unknown[] | null = null;
   const remote = {
     settings: {
@@ -1354,35 +1429,32 @@ test('saveReviewerSettings persists enable flags with the split list', async () 
   const saved = await testing().saveReviewerSettings(
     remote,
     SETTINGS_NS,
-    {
-      primaryEnabled: false,
-      provider: 'provider-a',
-      model: 'model-a1',
-      reasoningEffort: 'inherit',
-      fallbacks: [
-        { mode: 'route', enabled: false, provider: ' provider-b ', model: ' model-b1 ', reasoningEffort: 'high' },
-        { mode: 'route', enabled: true, provider: '', model: '', reasoningEffort: '' },
-      ],
-    },
+    testing().settingsFromRows([
+      { enabled: false, weight: 0, provider: ' provider-a ', model: ' model-a1 ', reasoningEffort: 'inherit' },
+      { enabled: true, weight: 8, provider: ' provider-b ', model: ' model-b1 ', reasoningEffort: 'high' },
+      { enabled: true, weight: 0, provider: '', model: '', reasoningEffort: '' },
+    ]),
     7,
   );
   assert.deepEqual(saved, { ok: true });
   assert.deepEqual(replaceArgs, [
     SETTINGS_NS,
     {
-      primaryEnabled: false,
-      provider: 'provider-a',
-      model: 'model-a1',
-      reasoningEffort: 'inherit',
-      fallbacks: [
-        { mode: 'route', enabled: false, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'high' },
-        { mode: 'route', enabled: true, provider: '', model: '', reasoningEffort: '' },
+      primaryEnabled: true,
+      provider: '',
+      model: '',
+      reasoningEffort: '',
+      routes: [
+        { mode: 'route', enabled: false, weight: 0, provider: 'provider-a', model: 'model-a1', reasoningEffort: 'inherit' },
+        { mode: 'route', enabled: true, weight: 8, provider: 'provider-b', model: 'model-b1', reasoningEffort: 'high' },
+        { mode: 'route', enabled: true, weight: 0, provider: '', model: '', reasoningEffort: '' },
       ],
     },
     7,
   ]);
   const payload = (replaceArgs as unknown[])[1] as Record<string, unknown>;
   assert.ok(!('enabled' in payload), 'the deprecated knob is never written');
+  assert.ok(!('fallbacks' in payload), 'the legacy list is never written once routes exist');
 });
 
 test('summaryLine counts only enabled later rows', () => {
