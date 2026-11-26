@@ -98,11 +98,11 @@ export const ROUTE_TEST_MAX_TOKENS = 16;
 /** Deterministic sampling temperature for the harmless probe. */
 export const ROUTE_TEST_TEMPERATURE = 0;
 
-/** Largest number of model text characters the probe consumes. */
-export const ROUTE_TEST_MAX_OUTPUT_CHARS = 64;
+/** Largest number of model text characters a probe consumes before it gives up. */
+export const ROUTE_TEST_MAX_OUTPUT_CHARS = 1_024;
 
-/** Largest number of stream chunks the probe consumes. */
-export const ROUTE_TEST_MAX_OUTPUT_CHUNKS = 32;
+/** Largest number of stream chunks a probe consumes before it gives up. */
+export const ROUTE_TEST_MAX_OUTPUT_CHUNKS = 256;
 
 /**
  * Grace period for closing a model stream whose `return()` ignores completion.
@@ -112,11 +112,16 @@ export const ROUTE_TEST_MAX_OUTPUT_CHUNKS = 32;
  */
 export const ROUTE_TEST_CLOSE_GRACE_MS = 250;
 
+const REVIEW_CASE_OVERSIZE_DETAIL = 'The answer never settled inside the bounded review buffer, so this case was abandoned.';
+
 /** Output-token budget of one scripted review case. */
-export const REVIEW_CASE_MAX_TOKENS = 512;
+export const REVIEW_CASE_MAX_TOKENS = 2_048;
 
 /** Largest number of model characters one scripted review case may assemble. */
-const REVIEW_CASE_MAX_CHARS = 4_096;
+const REVIEW_CASE_MAX_CHARS = 32_768;
+
+/** Largest number of stream chunks one scripted review case may consume. */
+const REVIEW_CASE_MAX_CHUNKS = 8_192;
 
 /** One scripted pending call the review test replays through a route. */
 interface ReviewCaseSpec {
@@ -451,7 +456,7 @@ type RouteTestStreamOutcome =
   | { readonly kind: 'finish'; readonly reason: unknown; readonly sawContent: boolean; readonly text: string }
   | { readonly kind: 'cancelled' }
   | { readonly kind: 'timeout' }
-  | { readonly kind: 'oversize' }
+  | { readonly kind: 'oversize'; readonly sawContent: boolean }
   | { readonly kind: 'failure'; readonly failure: RouteTestFailureFacts };
 
 /** Mutable builder state shared by every result path of one probe. */
@@ -531,9 +536,8 @@ interface RouteTestContentMeasure {
  * @param value - arbitrary chunk field that may carry model content.
  * @returns measured size plus whether it already exceeds the probe bound.
  */
-function measureModelContent(value: unknown): RouteTestContentMeasure {
+function measureModelContent(value: unknown, limit: number = ROUTE_TEST_MAX_OUTPUT_CHARS): RouteTestContentMeasure {
   const seen = { chars: 0, nodes: 0, exceeded: false };
-  const limit = ROUTE_TEST_MAX_OUTPUT_CHARS;
 
   const visit = (current: unknown): void => {
     if (seen.exceeded) return;
@@ -599,8 +603,8 @@ function measureModelContent(value: unknown): RouteTestContentMeasure {
  * @param value - candidate model field.
  * @returns measured characters and whether the bound was exceeded.
  */
-function measureModelField(value: unknown): RouteTestContentMeasure {
-  return typeof value === 'string' ? { chars: value.length, exceeded: value.length > ROUTE_TEST_MAX_OUTPUT_CHARS } : measureModelContent(value);
+function measureModelField(value: unknown, limit: number = ROUTE_TEST_MAX_OUTPUT_CHARS): RouteTestContentMeasure {
+  return typeof value === 'string' ? { chars: value.length, exceeded: value.length > limit } : measureModelContent(value, limit);
 }
 
 
@@ -1018,12 +1022,12 @@ async function closeRouteTestIterator(
  * @param block - assembled content block carried by a `block-end` chunk.
  * @returns measured size and whether the bound was already exceeded.
  */
-function measureBlockEnd(block: unknown): RouteTestContentMeasure {
-  if (!isRecord(block)) return measureModelContent(block);
+function measureBlockEnd(block: unknown, limit: number): RouteTestContentMeasure {
+  if (!isRecord(block)) return measureModelContent(block, limit);
   const type = typeof block.type === 'string' ? block.type : '';
-  if (type === 'text' || type === 'reasoning') return measureModelField(block.text);
-  if (type === 'tool-call') return measureModelContent([block.id, block.name, block.arguments]);
-  return measureModelContent(block);
+  if (type === 'text' || type === 'reasoning') return measureModelField(block.text, limit);
+  if (type === 'tool-call') return measureModelContent([block.id, block.name, block.arguments], limit);
+  return measureModelContent(block, limit);
 }
 
 /** Maximum number of nodes the bounded content-presence walk visits. */
@@ -1146,6 +1150,7 @@ async function consumeRouteTestStream(
   deadline: RouteTestDeadline,
   tracker: RouteTestOperationTracker,
   maxChars: number = ROUTE_TEST_MAX_OUTPUT_CHARS,
+  maxChunks: number = ROUTE_TEST_MAX_OUTPUT_CHUNKS,
 ): Promise<RouteTestStreamOutcome> {
   let iterable: AsyncIterable<unknown>;
   try {
@@ -1178,6 +1183,9 @@ async function consumeRouteTestStream(
   const deltaCharsByIndex = new Map<number, number>();
   const totalChars = (): number => completedChars + openDeltaChars + miscChars;
   const exceedsContentBound = (): boolean => totalChars() > maxChars;
+  // An oversize stop still reports whether real model content was seen before
+  // the bound tripped: a liveness probe already proved the route answers.
+  const oversize = (): RouteTestStreamOutcome => ({ kind: 'oversize', sawContent });
   // The assembled answer is kept only so a review test can decide whether the
   // route followed the risk/decision protocol; it is bounded by the same limit.
   let answer = '';
@@ -1235,12 +1243,12 @@ async function consumeRouteTestStream(
       }
 
       chunks += 1;
-      if (chunks > ROUTE_TEST_MAX_OUTPUT_CHUNKS) return { kind: 'oversize' };
+      if (chunks > maxChunks) return oversize();
 
       const chunk = step.value;
       if (!isRecord(chunk)) {
         if (hasContentValue(chunk)) sawContent = true;
-        if (addMisc(measureModelContent(chunk))) return { kind: 'oversize' };
+        if (addMisc(measureModelContent(chunk, maxChars))) return oversize();
         continue;
       }
       const type = typeof chunk.type === 'string' ? chunk.type : '';
@@ -1252,12 +1260,12 @@ async function consumeRouteTestStream(
         // The provider reported its terminal result even if the content bound
         // rejects what was assembled: the stream itself is finished.
         terminal = true;
-        if (exceedsContentBound()) return { kind: 'oversize' };
+        if (exceedsContentBound()) return oversize();
         return { kind: 'finish', reason: chunk.reason, sawContent, text: answer };
       }
       if (type === 'text-delta' || type === 'reasoning-delta') {
         if (deltaHasContent(chunk.text)) sawContent = true;
-        if (addDelta(index, measureModelField(chunk.text))) return { kind: 'oversize' };
+        if (addDelta(index, measureModelField(chunk.text, maxChars))) return oversize();
         if (type === 'text-delta' && typeof chunk.text === 'string' && answer.length < maxChars) {
           answer += chunk.text;
         }
@@ -1265,14 +1273,14 @@ async function consumeRouteTestStream(
       }
       if (type === 'tool-call-delta') {
         if (toolCallDeltaHasContent(chunk)) sawContent = true;
-        if (addDelta(index, measureModelContent([chunk.id, chunk.name, chunk.argumentsDelta]))) {
-          return { kind: 'oversize' };
+        if (addDelta(index, measureModelContent([chunk.id, chunk.name, chunk.argumentsDelta], maxChars))) {
+          return oversize();
         }
         continue;
       }
       if (type === 'block-end') {
         if (blockHasContent(chunk.block)) sawContent = true;
-        if (closeBlock(index, measureBlockEnd(chunk.block))) return { kind: 'oversize' };
+        if (closeBlock(index, measureBlockEnd(chunk.block, maxChars))) return oversize();
         continue;
       }
       if (type === 'block-start') {
@@ -1282,7 +1290,7 @@ async function consumeRouteTestStream(
       if (type === 'usage') continue;
       // Future merge-extensible chunks may carry content: measure them too.
       if (hasContentValue(chunk)) sawContent = true;
-      if (addMisc(measureModelContent(chunk))) return { kind: 'oversize' };
+      if (addMisc(measureModelContent(chunk, maxChars))) return oversize();
     }
   } finally {
     const hadReturn = typeof iterator.return === 'function';
@@ -1751,15 +1759,24 @@ export function installRouteTestEndpoint(
               deadline,
               tracker,
               REVIEW_CASE_MAX_CHARS,
+              REVIEW_CASE_MAX_CHUNKS,
             );
             if (outcome.kind === 'cancelled') return refuse('CANCELLED');
             if (outcome.kind === 'timeout') return refuse('TIMEOUT');
             if (outcome.kind === 'oversize') {
-              return buildRouteTestFailure(
-                stats,
-                { code: '' },
-                { startedAt, now, code: 'UNKNOWN', detail: ROUTE_TEST_OVERSIZE_DETAIL },
-              );
+              // A reviewer that never stops is a failed case, not a failed run:
+              // the other case still tells the page something useful.
+              cases.push({
+                case: spec.case,
+                expected: spec.expected,
+                actual: '',
+                risk: '',
+                ok: false,
+                failureCode: '',
+                latencyMs: Math.max(0, Math.round(now() - caseStartedAt)),
+                detail: REVIEW_CASE_OVERSIZE_DETAIL,
+              });
+              continue;
             }
             if (outcome.kind === 'failure') {
               const aborted = abortOutcome(deadline);
@@ -1806,6 +1823,12 @@ export function installRouteTestEndpoint(
           case 'timeout':
             return refuse('TIMEOUT');
           case 'oversize':
+            // A route that produced real content already answered the probe;
+            // the reading bound only stops the probe from consuming more. It is
+            // a failure only when nothing arrived before the bound tripped.
+            if (outcome.sawContent) {
+              return buildRouteTestResult({ code: 'OK', stats, startedAt, now });
+            }
             return buildRouteTestFailure(
               stats,
               { code: '' },

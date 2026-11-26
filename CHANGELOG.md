@@ -21,6 +21,9 @@ All notable changes to `@aghost-prj/dsh-auto-review-model`. The package is pre-1
 
 ### Fixed
 
+- **The review test no longer fails on a normal reasoning-heavy answer.** The bounded stream walker carried the liveness probe's 64-character / 32-chunk ceiling as a hard per-field limit, so the first review case (512 tokens, reasoning at `max` effort) tripped it immediately and reported "unknown failure" with the probe's oversize text. The walker now takes the active bound, review cases get 2,048 tokens and a 32 KiB / 8,192-chunk buffer, and a review case that never settles is recorded as a failed case rather than aborting the run.
+- **A probe that already saw model content before its reading bound reports the route as healthy.** Truncating a verbose route is not a route failure; only a bound hit with no content remains an oversize diagnostic.
+
 - **The route table no longer blanks out for a legacy section.** Schemastery fills a missing volatile array with `[]`, so `settings.describe()` projects `routes: []` for every configuration written before the list existed. The client treated any array as authoritative and rendered zero rows, which made a perfectly saved review configuration look deleted; only a non-empty list wins now and an empty one falls through to the legacy migration, matching the Host.
 - **The test suite compiles and runs again.** It still described the pre-`routes` API (`buildReviewPlan(row1, fallbacks, request)`, attempts with `source`/`index`, rows without a weight) and the old "only fail over before the first emitted chunk" policy; it is updated to the unified list, the weighted draw, the buffered stream and the two new modes (200 tests).
 

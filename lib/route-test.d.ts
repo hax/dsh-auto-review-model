@@ -14,10 +14,10 @@ export declare const ROUTE_TEST_MAX_PER_WINDOW = 5;
 export declare const ROUTE_TEST_MAX_TOKENS = 16;
 /** Deterministic sampling temperature for the harmless probe. */
 export declare const ROUTE_TEST_TEMPERATURE = 0;
-/** Largest number of model text characters the probe consumes. */
-export declare const ROUTE_TEST_MAX_OUTPUT_CHARS = 64;
-/** Largest number of stream chunks the probe consumes. */
-export declare const ROUTE_TEST_MAX_OUTPUT_CHUNKS = 32;
+/** Largest number of model text characters a probe consumes before it gives up. */
+export declare const ROUTE_TEST_MAX_OUTPUT_CHARS = 1024;
+/** Largest number of stream chunks a probe consumes before it gives up. */
+export declare const ROUTE_TEST_MAX_OUTPUT_CHUNKS = 256;
 /**
  * Grace period for closing a model stream whose `return()` ignores completion.
  *
@@ -26,7 +26,7 @@ export declare const ROUTE_TEST_MAX_OUTPUT_CHUNKS = 32;
  */
 export declare const ROUTE_TEST_CLOSE_GRACE_MS = 250;
 /** Output-token budget of one scripted review case. */
-export declare const REVIEW_CASE_MAX_TOKENS = 512;
+export declare const REVIEW_CASE_MAX_TOKENS = 2048;
 /** One scripted pending call the review test replays through a route. */
 interface ReviewCaseSpec {
     /** Stable case id carried on the wire. */

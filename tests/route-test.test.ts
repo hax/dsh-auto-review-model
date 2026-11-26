@@ -313,7 +313,9 @@ function oversizeNoReturnStream(): AsyncIterable<TestChunk> {
           if (step === 1) {
             return Promise.resolve({
               done: false,
-              value: { type: 'text-delta', index: 0, text: 'x'.repeat(100) },
+              // Always larger than the active probe bound, so this repro stays
+              // an oversize early exit if the bound is tuned later.
+              value: { type: 'text-delta', index: 0, text: 'x'.repeat(__testing.ROUTE_TEST_MAX_OUTPUT_CHARS + 1) },
             });
           }
           return new Promise<IteratorResult<TestChunk>>(() => {});
@@ -1093,7 +1095,9 @@ test('model output is bounded even when a provider streams far too much', async 
   const tracker = { closed: false, consumed: 0 };
   const harness = createHarness({ stream: trackedStream(chunks, tracker) });
   const result = await harness.invoke();
-  assertResultCode(result, 'UNKNOWN', 'error');
+  // Real content arrived before the reading bound tripped, so the route counts
+  // as alive; the probe stops reading instead of failing the route.
+  assertResultCode(result, 'OK', 'ok');
   assert.ok(!JSON.stringify(result).includes('MODEL_PROSE_MARKER'));
   assert.ok(
     tracker.consumed <= __testing.ROUTE_TEST_MAX_OUTPUT_CHUNKS + 1,
@@ -1154,7 +1158,9 @@ test('assembled blocks and tool-call payloads are bounded, not just deltas', asy
     const tracker = { closed: false, consumed: 0 };
     const harness = createHarness({ stream: trackedStream(entry.chunks, tracker) });
     const result = await harness.invoke();
-    assertResultCode(result, 'UNKNOWN', 'error');
+    // Every case here carries real model content, so the bounded stop reports a
+    // live route (OK) while still refusing to read or echo the huge value.
+    assertResultCode(result, 'OK', 'ok');
     const wire = JSON.stringify(result);
     assert.ok(!wire.includes(marker), `${entry.name}: model prose must not reach the result`);
     assert.ok(wire.length < 2_000, `${entry.name}: result must stay small`);
@@ -1304,7 +1310,7 @@ test('a non-terminal early exit on a stream without return() abandons the slot',
   });
 
   const first = await harness.invoke();
-  assertResultCode(first, 'UNKNOWN', 'error');
+  assertResultCode(first, 'OK', 'ok');
   assert.equal(providerCalls, 1);
   assert.equal(signals.length, 1);
   assert.equal(harness.streamCalls.length, 1);
@@ -1635,4 +1641,37 @@ test('review mode refuses without a captured prompt', async () => {
   assert.equal(result.status, 'blocked');
   assert.equal(result.code, 'NO_REVIEW_PROMPT');
   assert.equal(harness.streamCalls.length, 0);
+});
+
+test('review mode accepts a realistic reasoning-heavy answer instead of failing its buffer', async () => {
+  const prompt = { system: 'REVIEW_POLICY', environment: 'ENVIRONMENT\n{}', capturedAt: 1 };
+  // A real reviewer at `max` effort reasons first: hundreds of deltas and a few
+  // kilobytes of text arrive before the small risk/decision object. The review
+  // buffer must hold that, while the liveness probe keeps its own tight bound.
+  const stream: StreamFactory = (generate) => {
+    const pending = String(generate?.messages?.at(-1)?.content?.[0]?.text ?? '');
+    const answer = pending.includes('credentials.yaml')
+      ? '{"risk":"high","decision":"deny"}'
+      : '{"risk":"low","decision":"allow"}';
+    const chunks: TestChunk[] = [{ type: 'block-start', index: 0, blockType: 'text' }];
+    for (let step = 0; step < 300; step += 1) {
+      chunks.push({ type: 'reasoning-delta', index: 0, text: `reasoning step ${step}: weigh the evidence. ` });
+    }
+    chunks.push({ type: 'text-delta', index: 0, text: answer });
+    chunks.push({ type: 'block-end', index: 0, block: { type: 'text', text: answer } });
+    chunks.push({ type: 'finish', reason: { kind: 'stop' } });
+    return streamOf(chunks);
+  };
+  const harness = createHarness({ stream, endpointOptions: { reviewPrompt: () => prompt } });
+  const result = await harness.invoke({ input: { mode: 'review', provider: 'deepseek-account', model: 'deepseek-flash' } });
+  assert.equal(result.code, 'OK');
+  assert.deepEqual(result.cases?.map((entry) => entry.ok), [true, true]);
+  // The same answer shape through the liveness probe stops at the probe's own
+  // (much tighter) reading bound, but it already saw real content, so the route
+  // is reported as healthy instead of failing with an oversize diagnostic.
+  const probe = createHarness({ stream });
+  const probed = await probe.invoke({ input: { mode: 'probe', provider: 'deepseek-account', model: 'deepseek-flash' } });
+  assert.equal(probed.code, 'OK');
+  assert.equal(probed.detail, '');
+  assert.equal(probed.status, 'ok');
 });
