@@ -657,6 +657,10 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
    * `enabled` knob is never read or written. Legacy `{ mode: 'session' }`
    * fallback rows are dropped: the session model is the implicit final fallback
    * now and must never be a configurable row.
+   *
+   * The unified `routes` list wins only when it is non-empty: the schema fills a
+   * missing volatile array with `[]`, so a legacy section must still be read
+   * through the row-1/fallbacks path instead of rendering as "no routes".
    * @param {unknown} raw - the namespace value, possibly absent or malformed.
    * @returns {ReviewerSettings} the normalized route rows' storage shape.
    */
@@ -664,7 +668,14 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     const source = raw !== null && typeof raw === 'object'
       ? (raw as Record<string, unknown>)
       : {};
-    if (Array.isArray(source.routes)) {
+    // An empty list is not proof that the user deleted every route: schemastery
+    // fills a missing volatile array with `[]`, so every section written before
+    // `routes` existed reads back as "present but empty". Only a non-empty list
+    // wins; anything else falls through to the legacy row-1/fallbacks migration,
+    // which is exactly what the Host's readRoutes() does. A section the page
+    // itself saved with no rows carries empty legacy fields too, so it still
+    // resolves to an empty list.
+    if (Array.isArray(source.routes) && source.routes.length > 0) {
       return {
         primaryEnabled: true,
         provider: '',
