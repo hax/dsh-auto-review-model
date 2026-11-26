@@ -18,6 +18,8 @@ export type RouteMode = 'route' | 'session';
 export interface FallbackEntry {
     /** Whether this row is eligible; disabled rows are skipped, never deleted. */
     enabled: boolean;
+    /** Relative share for weighted new-session starts. */
+    weight: number;
     /** Configured provider id. */
     provider: string;
     /** Configured model id. */
@@ -29,6 +31,8 @@ export interface FallbackEntry {
 export interface ReviewRouteAttempt {
     /** How the route was resolved: an explicit entry or the implicit session route. */
     mode: RouteMode;
+    /** Configured weight, zero for implicit session attempts. */
+    weight: number;
     /** Provider id to send. */
     provider: string;
     /** Model id to send. */
@@ -65,16 +69,6 @@ export interface ReviewerRouteFailure {
  * @returns true when the entry was a legacy "follow session" row.
  */
 export declare function isLegacySessionEntry(raw: unknown): boolean;
-/**
- * Normalize one configured fallback entry into an explicit route.
- *
- * Only provider/model/reasoningEffort matter: the removed `mode` field is not
- * forwarded. Callers that read the config should use {@link readFallbackEntries}
- * so legacy `session` entries are discarded before normalization.
- *
- * @param raw - one array element from the volatile config.
- * @returns a normalized explicit entry.
- */
 export declare function normalizeFallbackEntry(raw: unknown): FallbackEntry;
 /**
  * Read the live ordered fallback list from the plugin config.
@@ -120,6 +114,8 @@ export declare function routeAttemptLabel(provider: string, model: string, mode:
  * @param request - provider/model of the intercepted review request.
  * @returns the ordered attempts; empty when nothing may be routed.
  */
+/** Draw a weighted start for one fresh session, leaving zero weights last. */
+export declare function pickWeightedStart(plan: readonly ReviewRouteAttempt[], random?: () => number): ReviewRouteAttempt[];
 export declare function buildReviewPlan(routes: readonly FallbackEntry[], request: {
     provider: string;
     model: string;
@@ -216,6 +212,7 @@ export declare const __testing: {
     readFallbackEntries: typeof readFallbackEntries;
     readRoutes: typeof readRoutes;
     buildReviewPlan: typeof buildReviewPlan;
+    pickWeightedStart: typeof pickWeightedStart;
     isFallbackEligibleFailure: typeof isFallbackEligibleFailure;
     failureFromThrown: typeof failureFromThrown;
     failureFromFinish: typeof failureFromFinish;

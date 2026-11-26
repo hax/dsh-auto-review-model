@@ -356,6 +356,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     routeModel: '模型',
     routeModelPlaceholder: '选择模型（先选提供商）',
     routeEffort: '推理等级',
+    routeWeight: '权重',
     routeIncompleteHint: '提供商或模型未选择完整；启用后此路由会在审查时被跳过。',
     routeMoveUp: '上移',
     routeMoveDown: '下移',
@@ -464,6 +465,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
     routeModel: 'Model',
     routeModelPlaceholder: 'Select a model (provider first)',
     routeEffort: 'Reasoning effort',
+    routeWeight: 'Weight',
     routeIncompleteHint: 'Provider or model is incomplete; once enabled, this route is skipped during review.',
     routeMoveUp: 'Move up',
     routeMoveDown: 'Move down',
@@ -582,6 +584,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
 .dsh_arm_colProvider{width:22%}
 .dsh_arm_colModel{width:27%}
 .dsh_arm_colEffort{width:16%}
+.dsh_arm_colWeight{width:64px}
 .dsh_arm_colTest{width:84px}
 .dsh_arm_colActions{width:124px}
 .dsh_arm_cellEnable{text-align:center}
@@ -590,6 +593,8 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
 .dsh_arm_cellSelect .dsh_arm_select{width:100%;min-width:0}
 .dsh_arm_cellTest{white-space:nowrap}
 .dsh_arm_testButton{height:28px;padding:0 10px;font-size:12px;line-height:18px}
+.dsh_arm_cellWeight{white-space:nowrap;text-align:center}
+.dsh_arm_weightInput{box-sizing:border-box;width:44px;height:32px;padding:0 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-family:inherit;font-size:13px;line-height:20px;text-align:center}
 .dsh_arm_cellActions{white-space:nowrap}
 .dsh_arm_cellActions .dsh_arm_iconButton{width:28px;height:28px;margin:0 2px 0 0}
 .dsh_arm_rowDisabled{background:transparent}
@@ -1965,6 +1970,25 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
             testId: 'route-' + String(index) + '-effort',
           }),
         ),
+        React.createElement('td', { className: 'dsh_arm_cellWeight' },
+          React.createElement('input', {
+            type: 'number',
+            className: 'dsh_arm_weightInput',
+            min: 0,
+            max: 9,
+            step: 1,
+            value: String(route.weight),
+            disabled: rowDisabled,
+            'aria-label': t('routeWeight') + ' ' + rowLabel,
+            'data-arm-action': 'route-' + String(index) + '-weight',
+            onChange: (event: { target: { value: string } }) => {
+              const parsed = normalizeRouteWeight(event.target.value);
+              updateRoutes((list) => list.map((entry, at) => (
+                at === index ? { ...entry, weight: parsed } : entry
+              )));
+            },
+          }),
+        ),
         React.createElement('td', { className: 'dsh_arm_cellTest' },
           React.createElement('button', {
             type: 'button',
@@ -2071,6 +2095,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
             React.createElement('col', { className: 'dsh_arm_colProvider', key: 'provider' }),
             React.createElement('col', { className: 'dsh_arm_colModel', key: 'model' }),
             React.createElement('col', { className: 'dsh_arm_colEffort', key: 'effort' }),
+            React.createElement('col', { className: 'dsh_arm_colWeight', key: 'weight' }),
             React.createElement('col', { className: 'dsh_arm_colTest', key: 'test' }),
             React.createElement('col', { className: 'dsh_arm_colActions', key: 'actions' }),
           ),
@@ -2080,6 +2105,7 @@ window.__ModuleLoader__.load({ id: '@aghost-prj/dsh-auto-review-model', factory:
               React.createElement('th', { scope: 'col' }, t('routeProvider')),
               React.createElement('th', { scope: 'col' }, t('routeModel')),
               React.createElement('th', { scope: 'col' }, t('routeEffort')),
+              React.createElement('th', { scope: 'col', className: 'dsh_arm_thWeight' }, t('routeWeight')),
               React.createElement('th', { scope: 'col' }, t('test')),
               React.createElement('th', { scope: 'col' }, t('routeActions')),
             ),

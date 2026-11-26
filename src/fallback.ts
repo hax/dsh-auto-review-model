@@ -70,6 +70,8 @@ export type RouteMode = 'route' | 'session';
 export interface FallbackEntry {
   /** Whether this row is eligible; disabled rows are skipped, never deleted. */
   enabled: boolean;
+  /** Relative share for weighted new-session starts. */
+  weight: number;
   /** Configured provider id. */
   provider: string;
   /** Configured model id. */
@@ -82,6 +84,8 @@ export interface FallbackEntry {
 export interface ReviewRouteAttempt {
   /** How the route was resolved: an explicit entry or the implicit session route. */
   mode: RouteMode;
+  /** Configured weight, zero for implicit session attempts. */
+  weight: number;
   /** Provider id to send. */
   provider: string;
   /** Model id to send. */
@@ -193,12 +197,22 @@ export function isLegacySessionEntry(raw: unknown): boolean {
  * @param raw - one array element from the volatile config.
  * @returns a normalized explicit entry.
  */
+/** Normalize a route weight to the supported 0-9 range. */
+function normalizeWeight(value: unknown): number {
+  if (value === undefined || value === null) return 0;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 0;
+  const clamped = Math.trunc(numeric);
+  return clamped >= 0 && clamped <= 9 ? clamped : 0;
+}
+
 export function normalizeFallbackEntry(raw: unknown): FallbackEntry {
   const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw)
     ? raw as Record<string, unknown>
     : {};
   return {
     enabled: readConfigValue(source.enabled) !== false,
+    weight: normalizeWeight(readConfigValue(source.weight)),
     provider: configText(readConfigValue(source.provider)),
     model: configText(readConfigValue(source.model)),
     reasoningEffort: normalizeEffort(readConfigValue(source.reasoningEffort)),
@@ -260,6 +274,7 @@ export function readRoutes(config: ReviewerConfig | undefined): FallbackEntry[] 
   if (primaryEnabled && trimmedProvider !== '' && trimmedModel !== '') {
     legacy.push({
       enabled: true,
+      weight: 0,
       provider: trimmedProvider,
       model: trimmedModel,
       reasoningEffort: normalizeEffort(readConfigValue(source.reasoningEffort)),
@@ -292,6 +307,26 @@ export function routeAttemptLabel(provider: string, model: string, mode: RouteMo
  * @param request - provider/model of the intercepted review request.
  * @returns the ordered attempts; empty when nothing may be routed.
  */
+/** Draw a weighted start for one fresh session, leaving zero weights last. */
+export function pickWeightedStart(
+  plan: readonly ReviewRouteAttempt[],
+  random: () => number = Math.random,
+): ReviewRouteAttempt[] {
+  const explicit = plan.filter(attempt => attempt.mode === 'route');
+  const positive = explicit.filter(attempt => attempt.weight > 0);
+  const rest = explicit.filter(attempt => attempt.weight === 0);
+  const session = plan.filter(attempt => attempt.mode === 'session');
+  if (positive.length <= 1) return [...positive, ...rest, ...session];
+  const total = positive.reduce((sum, attempt) => sum + attempt.weight, 0);
+  let roll = random() * total;
+  let picked = positive[positive.length - 1]!;
+  for (const attempt of positive) {
+    roll -= attempt.weight;
+    if (roll <= 0) { picked = attempt; break; }
+  }
+  return [picked, ...positive.filter(attempt => attempt !== picked), ...rest, ...session];
+}
+
 export function buildReviewPlan(
   routes: readonly FallbackEntry[],
   request: { provider: string; model: string },
@@ -302,6 +337,7 @@ export function buildReviewPlan(
     if (entry.provider === '' || entry.model === '') continue;
     plan.push({
       mode: 'route',
+      weight: entry.weight,
       provider: entry.provider,
       model: entry.model,
       reasoningEffort: entry.reasoningEffort,
@@ -316,6 +352,7 @@ export function buildReviewPlan(
   ) {
     plan.push({
       mode: 'session',
+      weight: 0,
       provider: request.provider,
       model: request.model,
       reasoningEffort: '',
@@ -536,6 +573,7 @@ export const __testing = {
   readFallbackEntries,
   readRoutes,
   buildReviewPlan,
+  pickWeightedStart,
   isFallbackEligibleFailure,
   failureFromThrown,
   failureFromFinish,

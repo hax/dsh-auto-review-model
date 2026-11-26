@@ -72,6 +72,7 @@ import {
   ReviewerRouteError,
   ReviewerRoutesError,
   buildReviewPlan,
+  pickWeightedStart,
   failureFromFinish,
   failureFromThrown,
   isAsyncIterable,
@@ -949,7 +950,7 @@ export function apply(ctx: HostContext, config: ReviewerConfig): void {
       const hasSticky = options.sessionId !== undefined
         && options.sessionId !== ''
         && stickyReviewRoutes.has(options.sessionId);
-      const plan = hasSticky ? preferStickyRoute(basePlan, options.sessionId) : basePlan;
+      const plan = hasSticky ? preferStickyRoute(basePlan, options.sessionId) : pickWeightedStart(basePlan);
       // No usable explicit route: reviews already use the native session model,
       // so there is nothing to rewrite (the session route is implicit).
       if (plan.length === 0) return next();
