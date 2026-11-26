@@ -797,6 +797,29 @@ function routeFailureFromThrown(attempt: ReviewRouteAttempt, error: unknown): Re
   return failureFromThrown(attempt, error);
 }
 
+/** Session-scoped preferred route, learned only from a usable answer. */
+const stickyReviewRoutes = new Map<string, string>();
+
+function reviewRouteKey(attempt: ReviewRouteAttempt): string {
+  return `${attempt.provider}\u0000${attempt.model}\u0000${attempt.reasoningEffort}`;
+}
+
+function noteReviewRoute(sessionId: string | undefined, attempt: ReviewRouteAttempt, answered: boolean): void {
+  if (sessionId === undefined || sessionId === '') return;
+  const key = reviewRouteKey(attempt);
+  if (answered) stickyReviewRoutes.set(sessionId, key);
+  else if (stickyReviewRoutes.get(sessionId) === key) stickyReviewRoutes.delete(sessionId);
+}
+
+function preferStickyRoute(plan: readonly ReviewRouteAttempt[], sessionId: string | undefined): readonly ReviewRouteAttempt[] {
+  if (sessionId === undefined || sessionId === '') return plan;
+  const sticky = stickyReviewRoutes.get(sessionId);
+  if (sticky === undefined) return plan;
+  const index = plan.findIndex(attempt => reviewRouteKey(attempt) === sticky);
+  if (index <= 0) return plan;
+  return [plan[index]!, ...plan.slice(0, index), ...plan.slice(index + 1)];
+}
+
 /** Try one route without forwarding until the complete answer is validated. */
 async function tryReviewRoute(
   ctx: HostContext,
@@ -839,12 +862,34 @@ async function* streamReviewWithFallback(
   effortCache: CapabilityCache,
 ): AsyncGenerator<unknown> {
   const failures: ReviewerRouteFailure[] = [];
-  for (const attempt of plan) {
-    const outcome = await tryReviewRoute(ctx, options, attempt, patchedRequests, effortCache);
-    if (!outcome.ok) { failures.push(outcome.failure); continue; }
-    for (const chunk of outcome.chunks) yield chunk;
-    yield outcome.finish;
-    return;
+  const sessionId = options.sessionId;
+  const sticky = sessionId === undefined || sessionId === '' ? undefined : stickyReviewRoutes.get(sessionId);
+  const tried = new Set<string>();
+  let candidates: readonly ReviewRouteAttempt[] = preferStickyRoute(plan, sessionId);
+  let restartedFromTop = false;
+  for (;;) {
+    let restart = false;
+    for (const attempt of candidates) {
+      const key = reviewRouteKey(attempt);
+      if (tried.has(key)) continue;
+      tried.add(key);
+      const outcome = await tryReviewRoute(ctx, options, attempt, patchedRequests, effortCache);
+      if (outcome.ok) {
+        noteReviewRoute(sessionId, attempt, true);
+        for (const chunk of outcome.chunks) yield chunk;
+        yield outcome.finish;
+        return;
+      }
+      noteReviewRoute(sessionId, attempt, false);
+      failures.push(outcome.failure);
+      if (!restartedFromTop && sticky !== undefined && key === sticky) {
+        restartedFromTop = true;
+        restart = true;
+        candidates = plan;
+        break;
+      }
+    }
+    if (!restart) break;
   }
   throw new ReviewerRoutesError(failures);
 }
@@ -900,7 +945,11 @@ export function apply(ctx: HostContext, config: ReviewerConfig): void {
         provider: typeof options.provider === 'string' ? options.provider.trim() : '',
         model: typeof options.model === 'string' ? options.model.trim() : '',
       };
-      const plan = buildReviewPlan(readRoutes(config), requestRoute);
+      const basePlan = buildReviewPlan(readRoutes(config), requestRoute);
+      const hasSticky = options.sessionId !== undefined
+        && options.sessionId !== ''
+        && stickyReviewRoutes.has(options.sessionId);
+      const plan = hasSticky ? preferStickyRoute(basePlan, options.sessionId) : basePlan;
       // No usable explicit route: reviews already use the native session model,
       // so there is nothing to rewrite (the session route is implicit).
       if (plan.length === 0) return next();
