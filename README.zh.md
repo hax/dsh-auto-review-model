@@ -51,7 +51,7 @@ dsh plugin --profile web add /path/to/dsh-auto-review-model
 
 安装插件或重新构建客户端后，需要按 DSH 常规方式重新加载 Web profile 并刷新页面，配置页才会出现。保存设置本身对下一次审查生效，不需要重启会话。
 
-宿主侧接口由 Typert Loader 从包的 `./typert` export 自动发现。`link:` 依赖的包直接读磁盘，因此包文件变化后**只需重载该插件条目**（Plugin Manager，或任意一次 profile 重新组合）：HMR 会重新 import 变化的文件、重新注册 Typert face 并重新读取浏览器 bundle。只有条目本身无法重载（例如 import 失败）或 HMR 被关闭时，才需要重启整个 DSH——仅因为文件变了并不需要。设置页加载时浏览器侧会自动挂载 `./remote` contribution。
+宿主侧接口由 Typert Loader 从包的 `./typert` export 自动发现，而 Loader **按包名缓存已 import 的 manifest，并在整个进程生命周期内不再重读**。因此重载分两种情况：**只改实现**（manifest、方法标识与线上 schema 都不变）时，`link:` 依赖的包直接读磁盘，重载插件条目（HMR 重新组合）即可重新 import 文件并重读浏览器 bundle；**改了 `./typert` manifest 本身**（新增入参字段、新增模式、结果结构变化）则**必须重启 DSH**，因为 Gateway 一直在用它启动时注册的描述符校验。设置页加载时浏览器侧会自动挂载 `./remote` contribution。
 
 ## 配置
 
@@ -200,7 +200,7 @@ routes:
 **验证边界**：
 - **自动化测试使用内存 fake adapter**：单元测试不会调用真实 LLM API 或网络；真实行为在重启 DSH web host 后另行验证（见下）。
 - **浏览器行为为人工检查，非自动化**：表格布局、逐行测试按钮、行内结果与明暗外观已在运行中的设置页检查；自动化测试使用确定性的 hook driver，不使用真实浏览器，也不包含视觉回归测试。
-- **真实 Gateway 分发已在重启后验证**：此前所有「测试」按钮失败，是因为 DSH web host 进程早于可选 `input` 参数存在；重启该 host 后，重建客户端的逐行「测试」按钮通过已安装的 Typert Loader + Gateway RPC 链路返回了真实分类结果，同时已保存第 1 行的探测路径也正常。修改 `./typert` 契约后请重载插件条目；只有无法重载时才重启 DSH。
+- **真实 Gateway 分发已在重启后验证**：此前所有「测试」按钮失败，是因为 DSH web host 进程早于可选 `input` 参数存在；重启该 host 后，重建客户端的逐行「测试」按钮通过已安装的 Typert Loader + Gateway RPC 链路返回了真实分类结果，同时已保存第 1 行的探测路径也正常。修改 `./typert` 契约后必须重启 DSH：Loader 按包名缓存 import 过的 manifest 且永不重读，重载插件条目仍会用旧描述符，Gateway 会对新字段返回 `gateway/input-invalid`，直到进程重启。
 
 ## 开发
 

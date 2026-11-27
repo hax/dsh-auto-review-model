@@ -21,6 +21,7 @@ All notable changes to `@aghost-prj/dsh-auto-review-model`. The package is pre-1
 
 ### Fixed
 
+- **Docs claimed a plugin-entry reload refreshes the Typert contract.** It does not: the Typert Loader caches one imported manifest per package for the process lifetime, so a new input field or mode is rejected with `gateway/input-invalid` until DSH restarts. Implementation-only changes still need just a plugin-entry reload; both READMEs now say which is which.
 - **The review test no longer fails on a normal reasoning-heavy answer.** The bounded stream walker carried the liveness probe's 64-character / 32-chunk ceiling as a hard per-field limit, so the first review case (512 tokens, reasoning at `max` effort) tripped it immediately and reported "unknown failure" with the probe's oversize text. The walker now takes the active bound, review cases get 2,048 tokens and a 32 KiB / 8,192-chunk buffer, and a review case that never settles is recorded as a failed case rather than aborting the run.
 - **A probe that already saw model content before its reading bound reports the route as healthy.** Truncating a verbose route is not a route failure; only a bound hit with no content remains an oversize diagnostic.
 
